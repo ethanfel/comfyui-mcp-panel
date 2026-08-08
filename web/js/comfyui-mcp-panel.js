@@ -70,6 +70,7 @@ import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing
 import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
+import { codexLiveCanvasConnection } from "./lib/codex-live-connect.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
@@ -863,6 +864,9 @@ const PANEL_VERSION = "0.11.44";
 // null until a `backends` message with both fields has landed.
 let cmcpConsoleUrl = null;
 let cmcpConsoleToken = null;
+// Authenticated external panel-MCP advertisement from the connected
+// orchestrator. Contains a base URL and token ENV NAME, never the token value.
+let cmcpPanelMcp = null;
 
 // Known in-panel OAuth providers (mirrors the orchestrator's OAUTH_PROVIDERS —
 // see oauth-flow.ts in the comfyui-mcp package). The panel needs this catalog
@@ -17698,7 +17702,64 @@ function buildPanel() {
   sbText.textContent = "Show the agent a storyboard of generated videos";
   sbWrap.append(sbToggle, sbText);
 
-  advWrap.append(urlLabel, urlInput, sbWrap);
+  // Surface the exact tab-scoped streamable-HTTP MCP URL so a normal Codex
+  // session can attach to THIS canvas. A local bridge derives its loopback
+  // sibling port; a remote orchestrator must explicitly advertise a
+  // bearer-authenticated public base URL.
+  const codexLiveWrap = document.createElement("div");
+  codexLiveWrap.style.cssText =
+    "display:flex;flex-direction:column;gap:0.35rem;margin-top:0.55rem;padding-top:0.55rem;border-top:1px solid var(--p-content-border-color,#3f3f46);";
+  const codexLiveLabel = document.createElement("label");
+  codexLiveLabel.className = "cmcp-label";
+  codexLiveLabel.textContent = "Use this canvas from Codex";
+  const codexLiveHelp = document.createElement("div");
+  codexLiveHelp.className = "cmcp-help";
+  const codexLiveCode = document.createElement("code");
+  codexLiveCode.className = "cmcp-cmd";
+  codexLiveCode.style.cursor = "pointer";
+  codexLiveCode.title = "Click to copy";
+  const codexLiveCopy = document.createElement("button");
+  codexLiveCopy.type = "button";
+  codexLiveCopy.className = "cmcp-btn";
+  codexLiveCopy.textContent = "Copy Codex command";
+  codexLiveCopy.style.cssText = "align-self:flex-start;font-size:0.75rem;";
+  let codexLiveCommand = null;
+
+  function refreshCodexLiveCanvas(connected = false) {
+    const details = codexLiveCanvasConnection({
+      bridgeUrl: urlInput.value.trim(),
+      // Do not mint/resolve a workflow route merely because the disconnected
+      // settings popover rendered. The established wire route matters only
+      // after the bridge is live.
+      routeId: connected ? bridgeRouteId() : null,
+      connected,
+      panelMcp: cmcpPanelMcp,
+    });
+    codexLiveCommand = details.command;
+    codexLiveCopy.disabled = !details.available;
+    codexLiveCopy.style.opacity = details.available ? "1" : "0.5";
+    codexLiveCode.textContent = details.command || "Codex connection unavailable";
+    codexLiveHelp.textContent = details.available
+      ? details.remote
+        ? `On the Codex host, set ${details.tokenEnvVar} to the same secret configured on the orchestrator. Then run this command and start a new Codex session. Keep this panel connected; copy a fresh command after switching workflow tabs.`
+        : "Run this once in a terminal, then start a new Codex session. Keep this panel connected. The URL is scoped to this workflow tab; copy a fresh command after switching or closing it."
+      : details.reason;
+  }
+
+  function copyCodexLiveCommand() {
+    if (!codexLiveCommand) return;
+    navigator.clipboard?.writeText(codexLiveCommand).then(() => {
+      codexLiveCopy.textContent = "Copied ✓";
+      setTimeout(() => { codexLiveCopy.textContent = "Copy Codex command"; }, 1000);
+    }, () => {});
+  }
+  codexLiveCopy.addEventListener("click", copyCodexLiveCommand);
+  codexLiveCode.addEventListener("click", copyCodexLiveCommand);
+  urlInput.addEventListener("input", () => refreshCodexLiveCanvas(client.isConnected()));
+  codexLiveWrap.append(codexLiveLabel, codexLiveHelp, codexLiveCode, codexLiveCopy);
+  refreshCodexLiveCanvas(false);
+
+  advWrap.append(urlLabel, urlInput, sbWrap, codexLiveWrap);
   advWrap.hidden = true;
   const advToggle = document.createElement("button");
   advToggle.type = "button";
@@ -17709,6 +17770,7 @@ function buildPanel() {
   advToggle.addEventListener("click", () => {
     advWrap.hidden = !advWrap.hidden;
     advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+    if (!advWrap.hidden) refreshCodexLiveCanvas(client.isConnected());
   });
 
   // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
@@ -17724,7 +17786,10 @@ function buildPanel() {
     histPop.hidden = true;
     settingsBox.hidden = !settingsBox.hidden;
     // Refresh the backend chips (running status) each time settings open.
-    if (!settingsBox.hidden) void loadBackends();
+    if (!settingsBox.hidden) {
+      void loadBackends();
+      refreshCodexLiveCanvas(client.isConnected());
+    }
   });
 
   // ---- Message log + empty state ----
@@ -22289,10 +22354,12 @@ function buildPanel() {
       // (clicking Disconnect, or trying to send while disconnected) and live
       // at those call sites.
       const connected = state === "connected";
+      if (!connected) cmcpPanelMcp = null;
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      refreshCodexLiveCanvas(connected);
       // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
       // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
       // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
@@ -22872,6 +22939,10 @@ function buildPanel() {
       // cmcpOpenCredentialsFrame) — sent alongside backends/any_ready.
       if (data && typeof data.console_url === "string") cmcpConsoleUrl = data.console_url;
       if (data && typeof data.console_token === "string") cmcpConsoleToken = data.console_token;
+      cmcpPanelMcp = data && data.panel_mcp && typeof data.panel_mcp === "object"
+        ? data.panel_mcp
+        : null;
+      refreshCodexLiveCanvas(client.isConnected());
       // This callback runs only for a real bridge `backends` frame with an array
       // payload. From now on a ready ack may refine that authoritative Pi state.
       piBackendsReadinessReceived = true;
