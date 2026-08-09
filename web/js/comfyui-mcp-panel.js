@@ -67,8 +67,10 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
-import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
+import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
+import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { codexLiveCanvasConnection } from "./lib/codex-live-connect.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
@@ -138,7 +140,14 @@ import {
   findVisibleNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
-import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
+import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { saveReplyIdentity } from "./lib/save-reply-identity.js";
+import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
+import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
+import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
+import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
+import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -260,6 +269,7 @@ import {
   getEffectiveClipboard,
 } from "./lib/clipboard-store.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
+import { createMediaCollapseStore } from "./lib/media-collapse.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
   vueNodesActive,
@@ -350,6 +360,7 @@ import {
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
+  rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -857,7 +868,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.44";
+const PANEL_VERSION = "0.11.51";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -2345,7 +2356,12 @@ function findAgentTabIcon() {
   // ComfyUI stamps the toolbar button with `${tabId}-tab-button` — the precise
   // hook (attribute selector: the id contains a dot). Fall back to the chat
   // glyph inside a sidebar container for older frontends.
-  const btn = document.querySelector(`button[class~="${SIDEBAR_TAB_ID}-tab-button"]`);
+  // #779 — 1.50 moved this id from the CLASS to data-testid. That break blanked
+  // the panel at the guard; HERE it only degraded, because the toolbar scan below
+  // still found our glyph. That is why it went unnoticed — and why it is worth
+  // closing: on 1.50 the fallback is no longer a fallback, and it matches
+  // `.pi-comments`, which another extension is free to use.
+  const btn = findSidebarTabButton(document, SIDEBAR_TAB_ID);
   if (btn) {
     const icon = btn.querySelector("[data-cmcp-agent-icon]") || btn.querySelector(".pi");
     if (icon) {
@@ -3716,6 +3732,12 @@ async function programmaticSave(name) {
     canvasBinding: describeLiveCanvasBinding,
     details,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
+    // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
+    // 400 that blames the FILENAME, and logs the real cause a line earlier. This
+    // reads that line back so the caller is told what actually failed instead of
+    // being sent to audit a filename that was never the problem. Read-only, and it
+    // runs only once the 400 shape is already recognised.
+    readSaveFailureCause: (path) => readSaveFailureCause(path, api),
   });
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
@@ -5090,6 +5112,28 @@ function assertGraphBoundToActiveWorkflow(
   // drifted binding the tracker cannot prove is panel_open_workflow's proven
   // repaint re-stamp. The ONE exception is the both-empty stale tag below
   // (#565): with zero nodes on either side there is no content to protect.
+  // #817 — the exclusivity proof is computed HERE, above the rebind, because BOTH
+  // decisions below need it: the stale-tag rebind and the unstamped-root seal ask
+  // the same question (is this canvas provably the active workflow's?) and must not
+  // answer it differently.
+  let sealProofExclusive = false;
+  try {
+    const others = app?.extensionManager?.workflow?.openWorkflows;
+    if (Array.isArray(others)) {
+      sealProofExclusive = true;
+      for (const other of others) {
+        if (!other || sameWorkflowObject(other, activeWorkflow)) continue;
+        if (other.isModified === true) continue; // unprovable — not evidence of ambiguity
+        const otherState = other.changeTracker?.activeState ?? other.activeState;
+        if (graphRootMatchesState({ rootGraph, state: otherState })) {
+          sealProofExclusive = false; // a proven identical twin — binding is ambiguous
+          break;
+        }
+      }
+    }
+  } catch {
+    sealProofExclusive = false; // enumeration failed → exclusivity unproven → no seal
+  }
   let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
   if (rootUuidMismatch) {
     const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
@@ -5116,8 +5160,24 @@ function assertGraphBoundToActiveWorkflow(
     // guard below.
     const staleTagOnEmptyCanvas =
       graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
+    // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
+    // app.graph, so a canvas that IS the active workflow's was refused where an
+    // untagged copy of it was allowed, and nothing self-healed it: the seal below
+    // declines a root that already carries a tag. Same proof the seal accepts.
+    const contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
+      rootGraph,
+      activeWorkflow,
+      inSubgraph,
+      proofExclusive: sealProofExclusive,
+    });
     if (
-      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow, staleTagOnEmptyCanvas }) === "rebind"
+      resolveGraphRootUuidRebind({
+        rootGraph,
+        activeWorkflowUuid,
+        rootTagClaimedByActiveWorkflow,
+        staleTagOnEmptyCanvas,
+        contentProvesActiveWorkflow,
+      }) === "rebind"
     ) {
       try {
         stampGraphRootWorkflowUuid(rootGraph, activeWorkflowUuid, activeWorkflow);
@@ -5146,24 +5206,6 @@ function assertGraphBoundToActiveWorkflow(
   // exclusivity check itself cannot run — the seal stays off and the command
   // keeps the pre-seal fail-closed behaviour. A DIRTY twin cannot prove a match
   // (its tracker may lag) and does not block the seal.
-  let sealProofExclusive = false;
-  try {
-    const others = app?.extensionManager?.workflow?.openWorkflows;
-    if (Array.isArray(others)) {
-      sealProofExclusive = true;
-      for (const other of others) {
-        if (!other || sameWorkflowObject(other, activeWorkflow)) continue;
-        if (other.isModified === true) continue; // unprovable — not evidence of ambiguity
-        const otherState = other.changeTracker?.activeState ?? other.activeState;
-        if (graphRootMatchesState({ rootGraph, state: otherState })) {
-          sealProofExclusive = false; // a proven identical twin — binding is ambiguous
-          break;
-        }
-      }
-    }
-  } catch {
-    sealProofExclusive = false; // enumeration failed → exclusivity unproven → no seal
-  }
   sealProvenRootBinding({
     rootGraph,
     activeWorkflow,
@@ -7273,12 +7315,33 @@ async function awaitRequiredCustomWidgetRegistration(
   knownSocketTypes,
   currentDef,
   classType,
+  widenSocketProof,
 ) {
   const startedAt = Date.now();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  let socketTypes = knownSocketTypes;
   const check = () =>
-    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, knownSocketTypes, currentDef);
+    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, socketTypes, currentDef);
   let unavailable = check();
+  // #821 — the socket proof may have been read off a single-class /object_info, which is
+  // silent about every type a SIBLING node outputs. Widen it once against the whole
+  // schema, BEFORE the wait rather than after it: a link-proven input has nothing to wait
+  // FOR (no constructor is ever registered for a link datatype), so waiting first would
+  // spend the full 5 s on every such add and still reach the same answer. A widen that
+  // throws or yields nothing leaves the original proof in place and the guard fails closed
+  // exactly as it does today — #580's protection does not depend on this succeeding.
+  if (unavailable.length && typeof widenSocketProof === "function") {
+    let widened = null;
+    try {
+      widened = await widenSocketProof();
+    } catch {
+      widened = null;
+    }
+    if (widened && typeof widened.has === "function") {
+      socketTypes = widened;
+      unavailable = check();
+    }
+  }
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
@@ -8582,17 +8645,56 @@ const GRAPH_TOOL_EXECUTORS = {
     // upload loader whose class the refresh had just registered.
     let freshDefs = null;
     let currentDef;
+    // #821 — freshDefs answers TWO different questions, and the #767/#780 fast path
+    // below can only answer one of them. "Does the live backend still provide
+    // `class_type`?" needs exactly ONE entry. "Which datatypes does some installed node
+    // declare as an OUTPUT?" (registeredSocketTypes, the socket proof) needs the WHOLE
+    // schema — a sibling class is where a custom link datatype is produced. Remember
+    // which payload we got, because a single-class map is not evidence about siblings.
+    let freshDefsAreSingleClass = false;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
+        // #767 — ask about ONE type instead of re-downloading the whole schema.
+        // Measured on a 63-pack install: /object_info is 5,413,770 bytes / 167 ms,
+        // /object_info/KSampler is 3,246 bytes / 1.2 ms. A burst of adds pulled
+        // ~54 MB and blew through the 30 s reply deadline, which is how the report's
+        // "ghost" nodes appeared — the adds landed after the timeout had already
+        // been reported as a failure.
+        //
+        // GATED ON ALREADY-REGISTERED, and not for speed. The resolver hands
+        // `freshDefs` to refreshComfyNodeDefs() when a type still needs
+        // registering, and a single-class payload reaching a whole-schema refresh
+        // could deregister everything else. When the type is already registered
+        // that branch is unreachable, so the hazard is removed by construction
+        // rather than by remembering not to trip it.
+        //
+        // The fast path only ever CONFIRMS. Any doubt — an empty {}, a non-200, an
+        // older build without the route, an unparseable body — returns null and
+        // falls through to the identical full fetch below, so no refusal, removal
+        // verdict or history check is decided on anything new.
+        if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
+          const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
+          if (one) {
+            freshDefs = recordObjectInfoTypes(one);
+            freshDefsAreSingleClass = true;
+            currentDef = snapshotBackendDef(freshDefs, class_type);
+            return freshDefs;
+          }
+        }
         freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
         );
+        freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
       },
       refresh: (defs) => refreshComfyNodeDefs(defs),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
+      // #775 — consulted ONLY when the type is about to be refused, so a healthy
+      // add never pays for it. A pack that failed to import looks exactly like a
+      // pack that is not installed, and the refusal used to name only the latter.
+      readImportFailures: () => readPackImportFailures(api),
     });
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
@@ -8613,6 +8715,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // registry, whose nodeData.output keeps stale positives for removed or
     // schema-changed packs and would wrongly waive the guard.
     const knownSocketTypes = registeredSocketTypes(freshDefs);
+    // #821 — when the proof above came from a SINGLE-CLASS payload it can only see this
+    // class's own outputs, so every custom link datatype produced by a SIBLING node reads
+    // as unproven. That is how `SeedVR2VideoUpscaler` was refused with "no installed node
+    // outputs SEEDVR2_DIT" while `SeedVR2LoadDiTModel` — which outputs exactly that — sat
+    // on the canvas. Widen against the whole schema, but ONLY on the path that is about to
+    // refuse: same idiom as #775's readImportFailures, so a healthy add still pays nothing
+    // and #780's 1,667x saving is kept for every add that does not need it.
+    const widenSocketProof = freshDefsAreSingleClass
+      ? async () => {
+          const whole = typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null;
+          // "I did not find out" is not "nothing outputs anything", and the difference
+          // matters because the caller REPLACES its proof with whatever comes back.
+          // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is
+          // strictly weaker than the single-class proof already in hand: the refusal would
+          // then name types that payload had already proven — the class's OWN outputs —
+          // and say no installed node produces them. That is the false-cause message #695
+          // and #700 were about. Any doubt returns null and leaves the proof we have,
+          // which is the same answer-shape fetchSingleNodeDef gives for the same reason.
+          if (!whole || typeof whole !== "object" || Array.isArray(whole)) return null;
+          if (Object.keys(whole).length === 0) return null;
+          return registeredSocketTypes(recordObjectInfoTypes(whole));
+        }
+      : null;
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
     // required constructors before creating anything, or fail retryably before
@@ -8623,6 +8748,7 @@ const GRAPH_TOOL_EXECUTORS = {
       knownSocketTypes,
       currentDef,
       class_type,
+      widenSocketProof,
     );
     const node = LG.createNode(class_type);
     if (!node) {
@@ -8784,19 +8910,53 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!data || typeof data !== "object") {
       throw new Error("graph (object or JSON string) is required");
     }
-    // Validate UI/litegraph format. The live canvas loads UI-format graphs
-    // (top-level `nodes` array); API/prompt format (top-level numeric keys, each
-    // an object with `class_type`) is NOT loadable here.
+    // #775 — API/prompt format IS loadable, through the frontend's own importer.
+    // This branch used to refuse it outright and tell the caller to "provide the
+    // UI workflow JSON (the pack workflow.json is UI format)". Both halves were
+    // wrong: ComfyUI ships `app.loadApiJson` and uses it on its own file-drop
+    // path, and the pack that prompted the report ships API format — as does its
+    // upstream source — so the file it pointed at does not exist.
+    //
+    // Verified against the live rig (ComfyUI 0.30.2 / frontend 1.47.12) with that
+    // exact workflow: 59 API entries loaded as 56 nodes and 70 links with no
+    // throw, rgthree's Power Lora Loader included. The frontend instantiates real
+    // node classes, so widget/link separation is done by the nodes themselves
+    // rather than by a converter guessing from /object_info.
     if (!Array.isArray(data.nodes)) {
-      const keys = Object.keys(data);
-      const looksLikeApi =
-        keys.length > 0 &&
-        keys.every((k) => /^\d+$/.test(k)) &&
-        keys.some((k) => data[k] && typeof data[k] === "object" && "class_type" in data[k]);
-      if (looksLikeApi) {
-        throw new Error(
-          "workflow is in API/prompt format; provide the UI workflow JSON (the pack workflow.json is UI format)",
-        );
+      if (looksLikeApiWorkflow(data)) {
+        if (typeof app.loadApiJson !== "function") {
+          throw new Error(
+            "workflow is in API/prompt format and this frontend has no app.loadApiJson to " +
+              "import it. Provide a UI workflow JSON (one with a top-level `nodes` array), " +
+              "or open the API JSON in the ComfyUI tab by hand.",
+          );
+        }
+        const apiClone = JSON.parse(JSON.stringify(data));
+        // Snapshot first, exactly like the UI path — an API import replaces the
+        // canvas too, and must be as undoable as any other graph edit this turn.
+        captureGraphSnapshot(null, "before loading an API-format workflow");
+        await app.loadApiJson(apiClone, "graph_load.json");
+        // COMPARE WHAT ARRIVED. A missing node type is an uninstalled pack, and a
+        // load that quietly drops nodes and reports success is the exact failure
+        // this codebase keeps fixing — the graph then fails at QUEUE time, with a
+        // disconnected input, far from the call that caused it.
+        const landed = app?.graph?._nodes ?? [];
+        const shortfall = apiLoadShortfall(apiClone, landed);
+        // #775 — a missing node type is not proof of a missing PACK. Only asked
+        // when something IS missing: a clean load must not pay for a log fetch,
+        // and there would be nothing for the note to say.
+        const importFailures = shortfall.length
+          ? await readPackImportFailures(api)
+          : [];
+        return {
+          loaded: true,
+          format: "api",
+          node_count: landed.length,
+          entries_in: Object.keys(apiClone).length,
+          ...(shortfall.length ? { missing_node_types: shortfall } : {}),
+          ...(importFailures.length ? { packs_failed_to_import: importFailures } : {}),
+          note: apiLoadNote(shortfall, importFailures),
+        };
       }
       throw new Error(
         "graph is not a UI workflow (missing a `nodes` array). Provide the UI workflow JSON.",
@@ -9293,12 +9453,25 @@ const GRAPH_TOOL_EXECUTORS = {
       // payload falls back to the full frontend refresh (refreshComfyNodeDefs →
       // refreshComboInNodes), which re-fetches /object_info.
       refreshCombos: (defs, target, concreteType, nameMap) => {
-        if (defs) {
+        // A payload that does not CONTAIN the type we are keying on cannot refresh
+        // anything: refreshComboOptionsFromDefs looks up `defsByType[type]` and
+        // returns 0 on a miss, silently. The caller then treats the retry as
+        // having seen the authoritative list, so a value that IS valid stays
+        // rejected — "I could not look it up" behaving as "I looked and it is not
+        // there" (#796). Falling back to the full refresh is exactly what a
+        // MISSING payload already does, so this only ever replaces a silent no-op
+        // with the refresh that was intended.
+        //
+        // `concreteType` is resolved through the promotion chain, so it is not
+        // always the target's own type — which is how a payload can be present and
+        // still be the wrong one.
+        const keyType = concreteType ?? target?.type ?? target?.comfyClass;
+        if (defs && keyType && Object.prototype.hasOwnProperty.call(defs, keyType)) {
           // Key the combo options on the ULTIMATE CONCRETE type (resolved through the
           // promotion chain), not the intermediate virtual node's type, and bridge a
           // RENAMED nested promotion via nameMap, so a nested promoted combo is refreshed
           // from the real backend def under the right input name (#458×#366).
-          refreshComboOptionsFromDefs(target, defs, concreteType, nameMap);
+          refreshComboOptionsFromDefs(target, defs, keyType, nameMap);
           return;
         }
         return refreshComfyNodeDefs();
@@ -10376,13 +10549,33 @@ const GRAPH_TOOL_EXECUTORS = {
         `partial_execution_targets into this run's own request and confirmed it was ` +
         `there before dispatch. OBSERVED: the request ComfyUI received names ONLY ` +
         `node ${to_node_id} as an execution root, so only that branch executes. ` +
+        // #752 — say what the body DID contain. Three reports stalled on this note
+        // because "the scope did not reach the request" does not distinguish a
+        // frontend that dropped the field from one that renamed it or moved it,
+        // and every reporter (and I) went off inspecting argument shapes that turn
+        // out to be fine. The key list is the cheap discriminator, and the guard
+        // was already computing it — it just was not printed.
+        (Array.isArray(runScopeResult?.repairedFromKeys) && runScopeResult.repairedFromKeys.length
+          ? `The request the frontend produced carried these keys and no ` +
+            `partial_execution_targets: ${runScopeResult.repairedFromKeys.join(", ")}. ` +
+            `If a key there looks like it should have carried the scope, that name is ` +
+            `the useful part of a report. `
+          : "") +
         `NOT OBSERVED: whether the frontend also treated this as a partial execution ` +
         `internally — the panel can see the request body but not the frontend's queue ` +
         `loop. If it did not, its queue-time widget hooks ran as they would for a full ` +
         `run, so a control_after_generate widget may have advanced its value ` +
         `differently than a natively scoped run would. This does not change which ` +
-        `nodes execute. Please report this build (#556) — this path is not ` +
-        `reproducible against ComfyUI_frontend 1.42-1.50.`;
+        `nodes execute. ` +
+        // #752 — the removed sentence claimed this path was "not reproducible
+        // against ComfyUI_frontend 1.42-1.50". Three field reports on 1.45.21 are
+        // INSIDE that range and reproduced it, so the claim was false and it cost
+        // real time: it told reporters their own evidence could not be happening.
+        // A version range is a claim about builds nobody here has measured, and
+        // this note has no way to earn one — so it no longer makes it.
+        `Please report this build (#556), including your ComfyUI_frontend version — ` +
+        `which builds take which argument shape is not something the panel can ` +
+        `determine from inside one of them.`;
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
@@ -10527,6 +10720,30 @@ const GRAPH_TOOL_EXECUTORS = {
         errorsStepBudget(GET_ERRORS_STEP_CAP_MS),
       );
     }
+    // #745 — the load-time missing-asset stores never see a node added since the
+    // load, so ask the SERVER about the widget values actually on the canvas now.
+    // Per-class /object_info (5,694 bytes vs 5,413,770 for the whole document), so
+    // this is a handful of small reads, deduped per node type.
+    //
+    // Shares the same budget as every other elective server wait here and fails
+    // CLOSED: with no budget left the scan is skipped, and whatever it did not
+    // reach is reported as UNCHECKED rather than as clean. Overrunning would be a
+    // "did not reply" that leaves the agent no error surface at all (#589) —
+    // worse than the omission this closes.
+    let liveScan = null;
+    try {
+      const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      if (scanBudgetMs > 0) {
+        liveScan = await scanComboAvailability(
+          nodes,
+          (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
+          { budgetMs: scanBudgetMs },
+        );
+      }
+    } catch {
+      liveScan = null; // never let the scan take down the error report
+    }
+
     let postProbeRootGraph = null;
     try {
       postProbeRootGraph = getGraphCtx().rootGraph ?? null;
@@ -10735,6 +10952,20 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingAssetScanMayBeStale(activeWorkflowRef())
         ? { missing_asset_scope: missingAssetScopeNote() }
         : {}),
+      // #745 — the LIVE half. Named separately from missing_models because it was
+      // established differently: the server's current /object_info, not the scan
+      // ComfyUI ran at load. unchecked_nodes is emitted whenever the scan could
+      // not judge something, so an empty unavailable list is never mistaken for a
+      // clean canvas.
+      ...(liveScan?.unavailable?.length
+        ? {
+            unavailable_widget_values: liveScan.unavailable,
+            unavailable_widget_values_note: comboAvailabilityNote(liveScan.unavailable),
+          }
+        : {}),
+      ...(liveScan?.unknown?.length ? { unchecked_nodes: liveScan.unknown } : {}),
+      ...(liveScan?.unchecked_budget_exhausted ? { unchecked_budget_exhausted: true } : {}),
+      ...(liveScan?.unchecked_class_limit ? { unchecked_class_limit: liveScan.unchecked_class_limit } : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
@@ -10756,13 +10987,20 @@ const GRAPH_TOOL_EXECUTORS = {
     const { name: workflow, ...outcome } = await programmaticSave(name);
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
-    return { saved: true, workflow, ...outcome };
+    //
+    // #747 — and report WHICH workflow instance is active now. A Save-As makes a
+    // DIFFERENT workflow active, which fences the very session that asked for the
+    // save; without an identity in this reply the caller has nothing to re-fence
+    // to, and every call that could tell it is itself refused.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
     const { name: workflow, ...outcome } = await programmaticSave(name);
-    return { saved: true, workflow, ...outcome };
+    // #747 — this path ALWAYS changes which workflow is active, so it is the one
+    // that strands a caller. Report the new instance identity here.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: true }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
@@ -11363,7 +11601,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 // which is the expensive part of the whole proof. It feeds the MESSAGE
                 // only — it decides nothing.
                 const contentDiff = contentMatches
-                  ? { comparable: true, surfaces: [] }
+                  ? { comparable: true, surfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
                 rebindFailed = new Error(
                   describeOpenRebindOutcome(verdict, {
@@ -11375,6 +11613,10 @@ const GRAPH_TOOL_EXECUTORS = {
                     observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
                     contentComparable: contentDiff.comparable,
                     contentSurfaces: contentDiff.surfaces,
+                    // #825 — within the `nodes` surface, whether anything was LOST
+                    // or the frontend merely re-measured the boxes. Same three
+                    // words otherwise, opposite meanings for the reader.
+                    contentNodeDifference: contentDiff.nodeDifference,
                   }),
                 );
               }
@@ -13113,6 +13355,10 @@ const GRAPH_TOOL_EXECUTORS = {
         ? (vueToggled ? "vue-nodes (forced litegraph paint for capture)" : "vue-nodes (could not force litegraph paint)")
         : "litegraph",
       viewing: describeActiveGraph(app?.canvas?.graph ?? graph),
+      // #754(2) — the reply reported size, renderer and which graph, but never the
+      // FRAMING, which is the one thing that explains three identical captures after
+      // moving the canvas. The reporter had to discover it by experiment.
+      framing: describeScreenshotFraming({ nodes: nodes.length, groups: groups.length }),
     };
   },
 
@@ -13797,16 +14043,24 @@ const GRAPH_TOOL_EXECUTORS = {
     let methodRejected = false;
     for (;;) {
       if (dialect === "v2") {
-        const params = {
-          // The Manager's update task keys off node_name; include id too for
-          // correlation parity with install (harmless if the server ignores it).
-          node_name: id,
-          id,
-          selected_version: sel,
-          version: sel,
-          mode: mode || "remote",
-          channel: channel || "default",
-        };
+        // panel#809 — those "harmless for correlation" extras are not harmless.
+        // Manager v4's QueueTaskItem.params is an UNTAGGED Pydantic union with
+        // InstallPackParams listed FIRST. InstallPackParams needs exactly
+        // {id, selected_version, mode, channel} — every field this used to send
+        // alongside node_name — so it validated as an INSTALL, Pydantic silently
+        // dropped node_name as an unknown field, and `kind: "update"` was never
+        // consulted for which model to pick. do_update then read
+        // params.node_name off an InstallPackParams object and crashed:
+        //
+        //   AttributeError: 'InstallPackParams' object has no attribute 'node_name'
+        //
+        // UpdatePackParams is exactly {node_name, node_ver?} and nothing else —
+        // sending ONLY those two is what makes it the sole match. If `id` is
+        // ever needed for correlation, `ui_id` already carries it at the
+        // envelope level, outside the union — verified against a local Manager
+        // 4.2.2 install. The orchestrator's own update path already sends
+        // {node_name} alone and was never affected.
+        const params = { node_name: id, node_ver: sel };
         let enqueued = false;
         try {
           await managerV2("manager/queue/task", {
@@ -14899,8 +15153,25 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // flow (SOFT_RELOAD_KEY) continues the conversation afterward.
             if (!onReload) throw new Error("This panel build can't soft-reload.");
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
-            result = `soft reload (${scope}) scheduled`;
-            setTimeout(() => onReload(scope), 60);
+            // #701 — decide BEFORE replying. The guard that stops a doomed
+            // frontend reload runs 60ms later inside onReload, by which point
+            // this command has already told the agent "scheduled". Live-verified
+            // on the rig: the tab correctly did NOT navigate and its socket
+            // survived, and the agent was still told the reload was scheduled —
+            // so it has no reason to look, and the panel-side notice it does
+            // emit is not something the agent can read.
+            //
+            // Report what will actually happen, on the reply the caller gets.
+            const reloadBlockers =
+              scope === "frontend"
+                ? unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows)
+                : [];
+            if (reloadBlockers.length) {
+              result = reloadWouldBeBlockedMessage(reloadBlockers);
+            } else {
+              result = `soft reload (${scope}) scheduled`;
+              setTimeout(() => onReload(scope), 60);
+            }
           } else if (msg.cmd === "set_todo") {
             // Render/update the agent's live TODO checklist in the footer tray.
             const items = Array.isArray(msg.items) ? msg.items : [];
@@ -16241,18 +16512,57 @@ const PANEL_CSS = `
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-lightbox-open:hover { border-color: var(--p-primary-color, #60a5fa); color: var(--p-primary-color, #60a5fa); }
-/* Expand affordance on video cards — images open on click, but a video's own
-   surface is owned by its native controls, so it gets a dedicated button. */
+/* Media-card controls. Two buttons that must never be confused for each other:
+   .cmcp-media-expand (⛶) makes the media BIGGER — it opens the lightbox (#163);
+   .cmcp-media-collapse (a disclosure chevron) makes the card SMALLER in place
+   (#818). Images open the lightbox on click, but a video's own surface is owned
+   by its native controls, so only videos carry the ⛶ button. */
 .cmcp-imgcard { position: relative; }
-.cmcp-media-expand {
+.cmcp-media-tools {
   position: absolute; top: 0.4rem; right: 0.4rem; z-index: 2;
+  display: flex; gap: 0.25rem;
+}
+.cmcp-media-expand, .cmcp-media-collapse {
   width: 1.8rem; height: 1.8rem; border-radius: 6px; cursor: pointer;
   font-size: 0.95rem; line-height: 1; display: flex; align-items: center; justify-content: center;
   color: #fff; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25);
   opacity: 0; transition: opacity 0.12s ease;
 }
-.cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible { opacity: 1; }
-.cmcp-media-expand:hover { background: var(--p-primary-color, #3a7bd5); }
+.cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible,
+.cmcp-imgcard:hover .cmcp-media-collapse, .cmcp-media-collapse:focus-visible { opacity: 1; }
+.cmcp-media-expand:hover, .cmcp-media-collapse:hover { background: var(--p-primary-color, #3a7bd5); }
+/* The cluster is a hover target over the top-right corner of every card, and an
+   image card is click-to-zoom — so the box itself must not take clicks meant for
+   the picture. Only the buttons in it do. */
+.cmcp-media-tools { pointer-events: none; }
+.cmcp-media-tools > button { pointer-events: auto; }
+/* A media card's img takes its display FROM HERE and not from an inline style,
+   because an inline "display:block" outranks any stylesheet rule — the collapsed
+   rule below would then be silently ignored and the picture would stay on screen
+   under its own "hidden" stub (codex, #818). The video holder sets no inline
+   display, so it needs no equivalent. */
+.cmcp-imgcard > img { display: block; }
+/* Collapsed (#818). The media element is display:none rather than height-0 —
+   that is what makes the video observer unmount the live <video> instead of
+   leaving a decoding, looping element behind an invisible box. The stub is the
+   only thing left, so its own toggle can NOT be hover-revealed: a control the
+   user cannot find is a card they cannot get back. */
+.cmcp-imgcard.cmcp-media-collapsed > img,
+.cmcp-imgcard.cmcp-media-collapsed > .cmcp-video-holder { display: none; }
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-expand { display: none; }
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-collapse { opacity: 1; }
+.cmcp-media-stub {
+  display: none; align-items: center; gap: 0.4rem; cursor: pointer;
+  min-height: 1.8rem; padding: 0.35rem 2.6rem 0.35rem 0.55rem; border-radius: 6px;
+  font-size: 0.7rem; color: var(--p-text-muted-color, #a1a1aa);
+  background: var(--p-content-hover-background, #2a2a2e);
+  border: 1px dashed var(--p-content-border-color, #3f3f46);
+}
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-stub { display: flex; }
+/* The stub already names the file — a caption under it would say it twice. */
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-caption { display: none; }
+.cmcp-media-stub:hover { color: var(--p-text-color, #fafafa); border-color: var(--p-primary-color, #60a5fa); }
+.cmcp-media-stub-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Audio cards (#710) — a real <audio controls> player, and a link card for a
    kind the panel can neither draw nor play. Neither is a .cmcp-imgcard: the
    lightbox gallery collects those and renders every member as image/video. */
@@ -20084,6 +20394,12 @@ function buildPanel() {
     mediaRecorder.record(mkind, url, caption);
   }
 
+  // Per-item media collapse state (#818). sessionStorage-backed via ssGet/ssSet,
+  // so a collapse survives a reload and a thread switch inside this tab and is
+  // gone when the tab closes — the "for the session" semantics the issue asked
+  // for. See lib/media-collapse.js for why the key is a hash and not the url.
+  const mediaCollapse = createMediaCollapseStore({ getItem: ssGet, setItem: ssSet });
+
   /** Bind the agent's current session id to the open thread (for reload/resume). */
   function bindSession(sessionId) {
     const previousSessionId = thread?.sessionId || null;
@@ -20393,6 +20709,119 @@ function buildPanel() {
     openMediaLightbox(items, index);
   }
 
+  /** The absolutely-positioned control cluster on a media card. Both buttons
+   *  live here so a video's ⛶ and ▾ sit side by side instead of on top of each
+   *  other. */
+  function mediaToolsFor(card) {
+    const tools = document.createElement("div");
+    tools.className = "cmcp-media-tools";
+    card.appendChild(tools);
+    return tools;
+  }
+
+  /**
+   * Give one media card its inline collapse control (#818).
+   *
+   * WHAT COLLAPSING IS, AND WHAT IT IS NOT. This shrinks the card IN PLACE, in
+   * the transcript. It is the opposite of `.cmcp-media-expand` (⛶), which opens
+   * the lightbox — the two must not read as variations of one control, which is
+   * why one is a framing glyph and the other a disclosure chevron.
+   *
+   * HOW IT COMPOSES WITH THE VIDEO OBSERVER. `videoObserver()` swaps a
+   * `.cmcp-video-holder` between a live `<video>` and a gray placeholder as it
+   * scrolls in and out of view, and collapsing must not fight that:
+   *
+   *  - Collapsed media is `display:none`, so a collapsed holder has NO box and
+   *    the observer reports it as non-intersecting → the live `<video>` is
+   *    released exactly the way scrolling away releases it. The eager
+   *    `onCollapse` unmount here is the SAME operation done a frame earlier, so
+   *    a clip stops the instant the user hides it rather than on the next
+   *    observer cycle.
+   *  - Nothing here ever MOUNTS. Un-collapsing restores the box and the observer
+   *    decides — so expanding a card that is scrolled off-screen leaves it a
+   *    placeholder, instead of resurrecting a decoding video nobody can see.
+   *
+   * The state is applied at PAINT time, which is what makes it survive a reload
+   * and a thread switch for free: `paintThread` replays stored media through
+   * these same painters.
+   */
+  function attachMediaCollapse(card, { url, kind, name, tools, onCollapse }) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cmcp-media-collapse";
+    tools.appendChild(btn);
+
+    // The only thing left in the card when collapsed, so it has to say what is
+    // hidden AND be a way back on its own — the chevron is a 1.8rem target the
+    // user has to already know about.
+    const stub = document.createElement("div");
+    stub.className = "cmcp-media-stub";
+    stub.setAttribute("role", "button");
+    stub.tabIndex = 0;
+    stub.title = `Show this ${kind}`;
+    const icon = document.createElement("span");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = kind === "video" ? "🎬" : "🖼";
+    const label = document.createElement("span");
+    label.className = "cmcp-media-stub-name";
+    label.textContent = name || (kind === "video" ? "Video" : "Image");
+    const hint = document.createElement("span");
+    hint.textContent = "· hidden, click to show";
+    stub.append(icon, label, hint);
+    card.appendChild(stub);
+
+    const apply = (collapsed) => {
+      card.classList.toggle("cmcp-media-collapsed", collapsed);
+      btn.textContent = collapsed ? "▸" : "▾";
+      const verb = collapsed ? "Show" : "Hide";
+      btn.title = `${verb} this ${kind}`;
+      btn.setAttribute("aria-label", `${verb} this ${kind}`);
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (collapsed) {
+        try {
+          onCollapse?.();
+        } catch {
+          // Releasing the <video> early is an optimisation; the observer still
+          // does it. It must never cost the user the toggle they just clicked.
+        }
+      }
+    };
+    // Re-applied when ANOTHER card showing the same media is toggled, so two
+    // cards of one output can't disagree about whether it is hidden.
+    card._cmcpApplyCollapse = apply;
+
+    // Drive the DOM from the DOM, and tell the store afterwards. A url the store
+    // cannot key on (or storage that refuses to write) then costs the user
+    // persistence only — never the ability to expand a card they collapsed.
+    const set = (collapsed) => {
+      mediaCollapse.setCollapsed(url, collapsed);
+      for (const other of log.querySelectorAll(".cmcp-imgcard")) {
+        if (other === card || other._cmcpMedia?.url !== url) continue;
+        try {
+          other._cmcpApplyCollapse?.(collapsed);
+        } catch {
+          /* one stale card must not break the toggle */
+        }
+      }
+      apply(collapsed);
+    };
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      set(!card.classList.contains("cmcp-media-collapsed"));
+    });
+    stub.addEventListener("click", (e) => { e.stopPropagation(); set(false); });
+    stub.addEventListener("keydown", (e) => {
+      if (isImeComposing(e)) return;
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      e.stopPropagation();
+      set(false);
+    });
+
+    apply(mediaCollapse.isCollapsed(url));
+  }
+
   function paintImage(url, name) {
     // Coerce the caption at the painter boundary — a structured/persisted caption
     // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
@@ -20401,15 +20830,20 @@ function buildPanel() {
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
     card._cmcpMedia = { url, type: "image", caption: name || "" };
+    const tools = mediaToolsFor(card);
     const img = document.createElement("img");
     img.src = url;
     img.alt = name || "output";
     img.loading = "lazy";
-    img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
+    // NO inline `display` — it would outrank the collapsed rule in the stylesheet
+    // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
+    img.style.cssText = "max-width:100%;border-radius:6px;cursor:zoom-in;";
     img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     card.appendChild(img);
+    attachMediaCollapse(card, { url, kind: "image", name, tools });
     if (name) {
       const cap = document.createElement("div");
+      cap.className = "cmcp-media-caption";
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
@@ -20491,6 +20925,7 @@ function buildPanel() {
     // A video's own surface is owned by its native controls, so it can't be
     // "click to zoom" like an image — give it a dedicated expand button that opens
     // the same in-panel lightbox (#163). The video still plays inline in the chat.
+    const tools = mediaToolsFor(card);
     const expandBtn = document.createElement("button");
     expandBtn.type = "button";
     expandBtn.className = "cmcp-media-expand";
@@ -20498,9 +20933,19 @@ function buildPanel() {
     expandBtn.setAttribute("aria-label", "View full size");
     expandBtn.innerHTML = "⛶";
     expandBtn.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
-    card.appendChild(expandBtn);
+    tools.appendChild(expandBtn);
+    // Release the decoded <video> the moment it is hidden rather than waiting for
+    // the observer's next cycle (#818) — see attachMediaCollapse.
+    attachMediaCollapse(card, {
+      url,
+      kind: "video",
+      name,
+      tools,
+      onCollapse: () => unmountHolderVideo(holder),
+    });
     if (name) {
       const cap = document.createElement("div");
+      cap.className = "cmcp-media-caption";
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
@@ -20620,6 +21065,13 @@ function buildPanel() {
   // the registry is mount-local on purpose — a workflow switch re-mounts and
   // replays cards INERT from the thread (live handles don't survive, by design).
   const liveA2uiCards = new Map(); // cardId -> { handle, rec }
+  // panel#832 (codex) — TRUE only during the synchronous pre-hydration restore paint.
+  // That pass declares itself "paint-only": settings are not hydrated yet, so the thread
+  // it paints comes from a tab pointer and may not be the authoritative one. Replaying a
+  // card INERT there was harmless; mounting it LIVE would register a card belonging to a
+  // thread that is about to be replaced, and an update could then land on it. Liveness
+  // waits until the real thread has been chosen.
+  let a2uiPaintProvisional = false;
 
   /** Round-trip: a card interaction becomes a normal, visible user message. */
   function sendCardReply(text) {
@@ -20634,11 +21086,17 @@ function buildPanel() {
     if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
-  /** Paint + record + register one live A2UI card. Returns its card_id. */
-  function appendA2UICard(spec) {
-    clearEmpty();
-    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
-    const handle = renderA2UICard(spec, {
+  /**
+   * Render one A2UI record as a LIVE card and put it in the live registry.
+   *
+   * panel#832 — shared by the first paint and by a repaint of an unresolved record,
+   * deliberately: the resolve/dismiss handlers retire the card from `liveA2uiCards`
+   * and persist the choice, and two copies of that would be two chances to drift.
+   * `reuseId` is what makes a repaint the SAME card rather than a new one.
+   */
+  function mountLiveA2UICard(rec, reuseId) {
+    const handle = renderA2UICard(rec.spec, {
+      ...(reuseId ? { cardId: reuseId } : {}),
       onAction(text) {
         rec.resolved = true;
         rec.choice = text;
@@ -20656,21 +21114,58 @@ function buildPanel() {
         setChatSurfaceForCards();
       },
     });
-    record(rec);
+    // panel#832 — the id the AGENT holds now lives on the record, not only on the
+    // transient handle. Without it a repaint could re-render the card live and still
+    // register it under a freshly minted id, so panel_ui_update would keep failing —
+    // for a new reason instead of the old one. Identity is the half that was missing.
+    rec.cardId = handle.cardId;
     liveA2uiCards.set(handle.cardId, { handle, rec });
     log.appendChild(handle.el);
+    if (rec.spec?.surface === "wide") setChatSurfaceForCards();
+    return handle;
+  }
+
+  /** Paint + record + register one live A2UI card. Returns its card_id. */
+  function appendA2UICard(spec) {
+    clearEmpty();
+    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+    // RECORD BEFORE MOUNTING, deliberately — this preserves the original ordering and
+    // it is load-bearing: record() can reach detachInvalidCurrentThread(), which calls
+    // resetFeed() and repaints. A card placed in the DOM and in `liveA2uiCards` BEFORE
+    // that would be wiped by the repaint it triggered, and — not yet being in any
+    // thread — would not come back. Recording first means the repaint happens while the
+    // card is still an unplaced value, and the mount below lands on the settled feed.
+    record(rec);
+    const handle = mountLiveA2UICard(rec);
     scrollLog();
-    if (spec.surface === "wide") setChatSurfaceForCards();
     return handle.cardId;
   }
 
-  /** Replay one persisted a2ui record inert (reload / thread switch). */
+  /**
+   * Replay one persisted a2ui record (reload / thread switch / same-thread repaint).
+   *
+   * panel#832 — an UNRESOLVED record comes back LIVE, under its original card_id.
+   * It used to be replayed inert unconditionally, and `resetFeed()` clears
+   * `liveA2uiCards`, so a repaint landing between `panel_ui_render` and
+   * `panel_ui_update` silently killed a card the agent had just been handed — no
+   * click, no dismissal, no view switch, just `no live card "…"`.
+   *
+   * A RESOLVED record (answered or dismissed) stays inert exactly as before: it is
+   * finished, and bringing it back would offer the user buttons for a question that
+   * has already been answered. The thread/view guard is untouched — repaint only ever
+   * replays the records of the thread being painted, so this cannot resurrect a card
+   * into a view it does not belong to.
+   */
   function paintA2UIRecord(m) {
     clearEmpty();
     try {
+      if (m && m.resolved !== true && !a2uiPaintProvisional) {
+        mountLiveA2UICard(m, typeof m.cardId === "string" ? m.cardId : undefined);
+        return;
+      }
       log.appendChild(renderA2UIInert(m.spec, m.choice));
     } catch {
-      log.appendChild(renderA2UIFailCard(m.spec, ["stored card failed to render"]));
+      log.appendChild(renderA2UIFailCard(m?.spec, ["stored card failed to render"]));
     }
   }
 
@@ -21401,7 +21896,16 @@ function buildPanel() {
     // a ui_update against a card from a previous view would silently repaint a
     // DETACHED element (and mutate+persist the background thread's record) while
     // claiming success; and a stale unresolved surface:"wide" entry would keep
-    // the sidebar wide forever. Cards replay INERT from the thread instead.
+    // the sidebar wide forever.
+    //
+    // #832 — this used to end "Cards replay INERT from the thread instead", which
+    // is no longer true and was the whole bug: an UNRESOLVED card now replays LIVE
+    // under its original card_id (see paintA2UIRecord), because clearing here and
+    // replaying inert killed a card the agent had just been handed, mid-turn, with
+    // no user action. The protection above is unaffected: only the thread being
+    // painted is replayed, and every element was just removed, so nothing from a
+    // previous view can come back and no card can end up with two DOM nodes. A
+    // RESOLVED card still replays inert.
     liveA2uiCards.clear();
     // The thinking indicator lived in `log` and was just detached along with
     // everything else. Drop the stale refs — otherwise a later showThinking()
@@ -23137,7 +23641,7 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
-    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs }) => {
+    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia }) => {
       // #370: track whether the composed completion frame actually reached the
       // agent. sendFrame returns false when the bridge socket is down — in that
       // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
@@ -23153,7 +23657,11 @@ function buildPanel() {
       // it's async (metadata HEADs / frame sampling), but the batch is already
       // captured — a failure inside must never wedge the lifecycle.
       composeRunCompletionFrame(
-        { promptId, images: flImages, videos: flVideos, durationMs },
+        // #356 Bug 2 — `noMedia` marks a panel-queued run that finished producing
+        // no image or video. Without it the composer returns null, the call site
+        // below reads that as "empty batch ⇒ already delivered", and the agent that
+        // panel_run told to end its turn and wait is never told anything.
+        { promptId, images: flImages, videos: flVideos, durationMs, noMedia },
         {
           sendFrame: (frame) => {
             const ok = client.sendFrame(frame);
@@ -24762,6 +25270,23 @@ function buildPanel() {
       // session id persists in sessionStorage, so we reconnect + resume on load.
       // Arm the reopen flag so our sidebar tab re-activates after the reload
       // (ComfyUI won't, since our tab isn't registered yet when it restores).
+      // #701 defect (2) — an AGENT-commanded reload must not start something the
+      // browser will refuse to finish. With unsaved work open, `beforeunload`
+      // blocks the navigation, and it drops this tab's socket BEFORE raising the
+      // dialog: the tab ends up with no reload and no bridge, and nobody is at the
+      // keyboard to answer the prompt. Reproduced on the rig with 3 unsaved
+      // workflows — "soft reload (frontend) scheduled", then a disconnect, then
+      // nothing, with the page never navigating.
+      //
+      // A USER-initiated reload still proceeds: they are right there and can
+      // answer the dialog. Only the commanded path refuses.
+      if (origin === "agent") {
+        const blockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+        if (blockers.length) {
+          appendSystem(reloadWouldBeBlockedMessage(blockers));
+          return;
+        }
+      }
       ssSet(SIDEBAR_REOPEN_KEY, "1");
       appendSystem("Reloading the panel UI (new frontend code)…");
       // #584 — the cmcpReload page-URL param busts only the top document; the
@@ -26669,7 +27194,16 @@ function buildPanel() {
       const pointed = reloadThreadId
         ? threads.find((candidate) => candidate.id === reloadThreadId)
         : null;
-      if (pointed?.msgs?.length) paintThread(pointed);
+      if (pointed?.msgs?.length) {
+        // #832 — paint-only, as the comment above requires: cards replay inert here
+        // because the authoritative thread has not been selected yet.
+        a2uiPaintProvisional = true;
+        try {
+          paintThread(pointed);
+        } finally {
+          a2uiPaintProvisional = false;
+        }
+      }
     } catch {
       // Corrupt/absent state — start clean.
     }
@@ -27027,20 +27561,21 @@ function buildPanel() {
 // extensions (e.g. ComfyUI-Easy-Use's NodesMap) render elsewhere and never touch
 // the shared host — so our panel stays painted when another tab is active and the
 // panels visibly stack. `activeSidebarTabId` is unreliable in this frontend build,
-// so we read the active tab from the DOM: the selected rail button carries
-// `side-bar-button-selected` plus a unique `<tabId>-tab-button` class. When our tab
-// isn't selected we remove our own root; render() rebuilds it on re-entry. We guard
-// only OUR root, never another tab's.
+// so we read the active tab from the DOM: the selected rail button identifies its
+// tab, on 1.50+ via `data-testid="<tabId>-tab-button"` and on earlier builds via a
+// `<tabId>-tab-button` CLASS. When our tab isn't selected we remove our own root;
+// render() rebuilds it on re-entry. We guard only OUR root, never another tab's.
+//
+// #779 — reading ONLY the class blanked the panel on frontend 1.50.x. The id moved
+// to an attribute there, the class lookup found nothing, and "I cannot tell which
+// tab is active" was read as "some other tab is active" — so this removed
+// `.cmcp-root` the instant render() attached it. An unidentifiable selection now
+// changes nothing, which is what keeps this cosmetic the next time the marker moves.
 function installSidebarTabGuard(tabId, getRoot, onDetach) {
-  const activeTabId = () => {
-    const b = document.querySelector(".side-bar-button-selected");
-    if (!b) return null;
-    const t = [...b.classList].find((c) => c.endsWith("-tab-button"));
-    return t ? t.slice(0, -"-tab-button".length) : null;
-  };
   const enforce = () => {
-    if (activeTabId() === tabId) return;             // our tab active → keep content
-    const r = getRoot();                              // inactive → drop our stray content
+    const active = readActiveSidebarTab(document.querySelector(".side-bar-button-selected"));
+    if (!shouldDetachPanelRoot(active, tabId)) return; // ours, or unknown → keep content
+    const r = getRoot();                               // provably elsewhere → drop our stray content
     if (r && r.isConnected) {
       // This is the OTHER path that detaches a live panel (the tab's own
       // destroy() is the first), so audio has to be paused here too — a
@@ -27233,16 +27768,39 @@ function registerExtensionWhenReady(tries = 0) {
         // switches to another sidebar tab) only DETACHES it — the agent keeps
         // working in the background and the sidebar-icon badge shows its state.
         render: (container) => {
-          if (!mounted) mounted = buildPanel();
-          // Make the tab content a full-height flex column so the panel's header
-          // and input pin to the edges and only the chat body scrolls (the
-          // container otherwise sizes to content and the whole panel scrolls).
-          container.style.height = "100%";
-          container.style.minHeight = "0";
-          container.style.display = "flex";
-          container.style.flexDirection = "column";
-          container.appendChild(mounted.root);
-          mounted.onShow?.();
+          // #779 — A BLANK TAB IS NOT AN ACCEPTABLE FAILURE STATE. ComfyUI mounts
+          // us with `mountCustomExtension = (e, t) => e.render(t)` and has no
+          // handler, so anything that throws in here leaves the container empty
+          // with nothing in the console attributed to us. A reporter could not
+          // tell "broken" from "not connected" from "not installed" and spent an
+          // hour reinstalling ComfyUI. Whatever fails, say so in the tab.
+          try {
+            if (!mounted) mounted = buildPanel();
+            // Make the tab content a full-height flex column so the panel's header
+            // and input pin to the edges and only the chat body scrolls (the
+            // container otherwise sizes to content and the whole panel scrolls).
+            container.style.height = "100%";
+            container.style.minHeight = "0";
+            container.style.display = "flex";
+            container.style.flexDirection = "column";
+            container.appendChild(mounted.root);
+            mounted.onShow?.();
+          } catch (err) {
+            // Do not leave a half-built root behind — it would be neither the
+            // panel nor the notice, and the next render() would append a second.
+            mounted = null;
+            try {
+              console.error("[comfyui-mcp-panel] panel construction failed", err);
+            } catch { /* a logger that throws must not also eat the notice */ }
+            const shell = buildPanelFailureShell(document, err, {
+              panelVersion: typeof PANEL_VERSION === "string" ? PANEL_VERSION : undefined,
+              frontendVersion:
+                window.__COMFYUI_FRONTEND_VERSION__ ??
+                app?.extensionManager?.frontendVersion ??
+                undefined,
+            });
+            if (shell) container.appendChild(shell);
+          }
         },
         destroy: () => {
           // Detach only — never mounted.destroy(). Tearing down here is what used

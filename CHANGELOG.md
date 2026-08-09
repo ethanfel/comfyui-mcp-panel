@@ -6,6 +6,188 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.51] - 2026-08-09
+
+> Covers changes since 0.11.50.
+
+### Fixed
+- Switching workflow tabs could leave every `panel_*` graph tool refusing the ACTIVE workflow
+  with `root-workflow-uuid-mismatch`, until the user re-opened the workflow that was already
+  open. ComfyUI reuses one canvas object across tabs and does not reset its metadata, so the
+  previous workflow's identity tag stays behind on a canvas that now holds the new one's graph.
+
+  The panel could already recover a canvas carrying NO tag — it proves the canvas is the active
+  workflow's by comparing content, then stamps it. It could not recover one carrying the WRONG
+  tag, because that stamp is never overwritten. A wrong tag was therefore stickier than no tag:
+  a byte-identical canvas was allowed in one case and refused in the other. The same content
+  proof now settles both.
+
+  Deliberately unchanged: a canvas that is genuinely a different workflow's still refuses, and
+  so does an ambiguous one — a second clean tab holding identical content, a tab with unsaved
+  edits (whose state can lag the real canvas), or a check that could not run at all (#817)
+
+## [0.11.50] - 2026-08-09
+
+> Covers changes since 0.11.49.
+
+### Fixed
+- An interactive card the agent had just created could stop responding to it mid-turn.
+  `panel_ui_render` returned a card_id and an immediate `panel_ui_update` failed with
+  "no live card" — no click, no dismissal, no view switch. Any repaint of the chat feed
+  between the two calls (which happens on its own) replayed the card as a finished, inert
+  one and dropped the handle the update needs. An unanswered card now comes back live
+  under the same id the agent was given; an answered or dismissed one still comes back
+  inert, so a question you already answered is never re-offered. Card ids are also now
+  collision-resistant across a page reload, and the provisional paint that runs before the
+  panel has decided which conversation is authoritative stays inert deliberately, so a
+  card can never come back live in a conversation that is about to be replaced
+  (#837, #832)
+
+## [0.11.49] - 2026-08-09
+
+> Covers changes since 0.11.48.
+
+### Fixed
+- An EMPTY (0-node) workflow no longer wedges every `panel_*` graph tool. A blank canvas is
+  exactly the state a user is in right before asking the agent to build something, and it was
+  the one state in which nothing could be read or edited — with no recovery: re-targeting
+  reported success without changing anything, `panel_new_workflow` made it worse, and
+  `panel_open_workflow` could not prove its rebind. A browser refresh was the only exit.
+
+  The panel proves a canvas genuinely empty before trusting a 0-node read, and that proof
+  required every value in the workflow's `extra` to be empty — which nothing on a real install
+  satisfies, because ComfyUI stamps `extra.frontendVersion` into every workflow it writes and
+  installed extensions add their own per-workflow flags. So no blank workflow was ever provably
+  empty, and the fallback (stamping the canvas with the workflow's identity) is refused when
+  another blank tab could equally explain the empty canvas. Two blank tabs therefore had no exit
+  at all — and `panel_new_workflow` creates the second one, which is why that step escalated it.
+
+  A version stamp is not a graph. Booleans and numbers in `extra` are now admitted (a graph
+  cannot be encoded in one), and named version strings are admitted when they look like version
+  strings. Anything structured — or any text carrying JSON delimiters, wherever it appears — is
+  still treated as content, so a canvas that actually holds something is never proven empty
+  (#833)
+
+## [0.11.48] - 2026-08-09
+
+> Covers changes since 0.11.47.
+
+### Fixed
+- A run that finished without producing an image or a video now tells the agent it
+  finished, instead of leaving it waiting forever. `panel_run` promises the agent it will
+  be notified automatically and instructs it not to poll — so for a run whose outputs are
+  text, or a cache hit that saves no file, that notification could never arrive and the
+  agent stalled silently until the user prompted again. The promise is what turned a quiet
+  completion into a wedged session. The completion is now delivered on the live path and
+  recovered by the `/history` reconcile, including when the bridge was down at the moment
+  it first fired. Only runs the panel itself queued are affected — a render you start on
+  the canvas yourself is still silent (#831, #356)
+- `panel_open_workflow` reported a repaint the ComfyUI frontend had performed FAITHFULLY as a
+  possible partial load. The content check names the graph SURFACES that disagreed, and `nodes`
+  is one surface holding the whole serialized node array — so "the graph differs on: nodes" came
+  out identically whether a node had vanished or the frontend had merely re-measured every box on
+  load, which it routinely does. A reporter read that after a healthy open and went looking for
+  work to redo that was never gone. The disclosure now says which of the two it observed: when
+  every loaded node is on the canvas with the same id and type and only presentation differs, it
+  says so and names the fields. A changed widget value, title, flag or mode is NOT presentation
+  and still gets the full warning, and the verdict itself is unchanged — the open still reports
+  the content as unconfirmed (#825, #830)
+- A stray NUL byte in `layout-engine.js` made git treat the file as binary, so it had no
+  reviewable diff; the edge-dedup key it separated is also now collision-proof, which it was not
+  (#825, #830)
+
+## [0.11.47] - 2026-08-09
+
+> Covers changes since 0.11.46.
+
+### Added
+- Large images and videos can be collapsed **in place** in the chat transcript. Every media
+  card gets a disclosure chevron; collapsed, it becomes a one-line stub naming the file that
+  is itself the way back (click, Enter or Space). This is the opposite of the existing `⛶`
+  button, which opens the lightbox — one goes smaller, one goes bigger. Collapse state is
+  remembered in `sessionStorage`, so it survives a reload and a thread switch inside the tab
+  and clears when the tab closes. Collapsing a video releases its decoded `<video>`
+  immediately instead of leaving it decoding behind a hidden box, and expanding an
+  off-screen card does not resurrect one (#818, #823)
+
+### Fixed
+- An EMPTY ComfyUI-Manager catalogue no longer renders as “no matches”. A `getmappings`
+  response with no packs in it came back as `count: 0` — exactly what a healthy catalogue
+  returns when a query matches nothing — so the two were indistinguishable, and a user
+  whose Manager had no catalogue at all concluded the pack did not exist and kept trying
+  variations of a search that could never succeed. A zero-pack catalogue is now reported as
+  its own state: nothing was searched, so nothing follows about whether the pack exists.
+  The message names the host the catalogue actually comes from (Manager’s default channel,
+  not the pack-install registry) and the causes ComfyUI-Manager really produces an empty
+  one from — offline mode with no cache yet, or missing/unreadable Manager data files.
+  Note that a network failure does NOT empty the catalogue: Manager falls back to the copy
+  bundled in its own package, so a blocked channel surfaces as a STALE list rather than an
+  empty one, and telling stale from current is a gap this does not close (#808, #826)
+
+## [0.11.46] - 2026-08-08
+
+> Covers changes since 0.11.45.
+
+### Fixed
+- `panel_add_node` refused a node whose input types ARE produced by nodes already on the
+  canvas. The socket proof — "which datatypes does some installed node output?" — was being
+  read off the single-class `/object_info` payload introduced in 0.11.45 for the cheap
+  per-class existence check, so any custom link datatype produced by a SIBLING node read as
+  unproven and the refusal claimed "no installed node outputs X" while the node producing X
+  sat on the canvas. Nothing could clear it: `panel_refresh_nodes` re-registers the class,
+  which is exactly what armed the fast path. The proof is now widened against the whole
+  schema on the path that is about to refuse, so the cheap path is kept for every add that
+  does not need it (#822, #821)
+- `panel_move_group` treated a restored node position as an unrestorable node, so a
+  rollback reported failure after it had in fact succeeded (#819)
+- `panel_update_node` sent extra fields that made Manager v4's untagged Pydantic union
+  match `InstallPackParams` instead of `UpdatePackParams` and crash (#816)
+
+## [0.11.45] - 2026-08-08
+
+> Covers changes since 0.11.44. Versions 0.11.42-0.11.44 shipped without CHANGELOG sections;
+> see their release commits (#709, #722, #743) until those are backfilled.
+
+### Added
+- show whether the QR's URL survives an orchestrator restart (#770)
+- return the workflow_uuid it just minted (#762)
+
+### Fixed
+- a value the widget's own grid explains is NOT a failed write (#806)
+- the soft_reload REPLY reports the refusal, not "scheduled" (#803)
+- refuse an agent reload that unsaved work will block (#801)
+- report the workflow instance a save leaves active (#800)
+- try the option key the api layer actually reads (#799)
+- scan the live graph for unavailable widget values (#745) (#798)
+- civitai_results reported an empty feed; e2e stubbed a retired endpoint (#796)
+- the internal-logs endpoint is NOT under /api — both readers were no-ops (#792)
+- an unknown node type may be a pack that FAILED TO IMPORT (#791)
+- a missing node type may be a pack that FAILED TO IMPORT (#790)
+- a union of PRIMITIVES needs no registered widget (#789)
+- find the tab button the way 1.50 marks it, at the SECOND site too (#786)
+- a blank tab is never an acceptable failure state (#785)
+- the sidebar guard must not destroy on an UNKNOWN active tab (#784)
+- say that a capture frames the WHOLE graph (#783)
+- read the reason ComfyUI logged instead of repeating the one it made up (#782)
+- a combo refresh that found nothing is not a refresh (#781)
+- API-format workflows ARE loadable — import them (#778)
+- drop the frontend version range, print what the body held (#777)
+- name the button the panel cannot press (#776)
+- disclose that missing-asset detection is load-time only (#774)
+- say when a commanded frontend reload did not happen (#773)
+- a userdata 400 says what it can mean, and where the real cause is (#772)
+- keep the upload status and the exception (#764)
+- report the comparison, not a cause the panel never observed (#763)
+- let an UNSAVED canvas publish its established identity (#761)
+- let the recovery probe through both target guards (#759)
+
+### Changed
+- give gotoStep the 15s its capability probe actually takes (#797)
+- recover 9 e2e tests — off-by-default flags and a routed mount probe (#795)
+- declare every reach into ComfyUI's own DOM (#787)
+- verify ONE node type, not the whole schema (#780)
+
+
 ## [0.11.41] - 2026-08-05
 
 ### Fixed
