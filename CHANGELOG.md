@@ -6,6 +6,788 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.87] - 2026-08-09
+
+### Fixed
+- **A failed install by git URL now points at the tool that can actually do it (#920).**
+  When you install a pack that is not in the node registry, ComfyUI-Manager cannot clone
+  your URL — it resolves installs from its own database, and the parameter that would
+  carry a URL is accepted and then ignored. The failure now tells you to use
+  `install_custom_node` instead: that one runs on the machine rather than in the browser,
+  so it clones the repository into `custom_nodes/` itself.
+
+  Worth saying explicitly because `panel_install_node`'s own description tells you to
+  prefer it over `install_custom_node` — which is backwards for this case, and following
+  it leaves you stuck. The message now says the preference does not apply here, and notes
+  where the fallback cannot help either: a remote ComfyUI has no local tree to clone into.
+
+
+## [0.11.86] - 2026-08-09
+
+> Covers changes since 0.11.85.
+
+### Changed
+
+- **Editing many widgets in a row is no longer slow (#716).** Every `panel_set_widget`
+  re-downloaded ComfyUI's entire node schema before writing — on an install with 63 custom
+  node packs that is 5.4 MB and roughly 170 ms, every single time. A prompt-editing task
+  that touched 29 widgets paid for it 29 times.
+
+  A burst of writes now shares one download instead of taking one each. Measured on the
+  test rig: 12 widget writes went from 12 downloads to 1.
+
+  The safety check those downloads exist for is unchanged. A write is still authorised
+  against the live backend's node list, and that list is re-read the moment anything the
+  panel can see could have changed it — a node refresh, an install, a completed download,
+  or a reconnect. The one case it cannot see is a pack uninstalled through ComfyUI's own
+  Manager while an agent is mid-edit, which leaves a window of up to 1.5 seconds; that is
+  written down in the code rather than left for someone to discover.
+
+### Fixed
+
+- **A changelog entry no longer repeats a release that already shipped.** Version tags here
+  lag the releases themselves, and the generator preferred the newest tag over the newest
+  release commit — so with `v0.11.84` tagged and 0.11.85 untagged, this entry initially
+  re-listed a fix 0.11.85 had already announced. It now takes whichever of the two is
+  actually newer, decided by ancestry rather than by date.
+
+
+## [0.11.85] - 2026-08-09
+
+> Covers changes since 0.11.84.
+
+### Fixed
+
+- **A refresh that lands while ComfyUI is reconnecting no longer reports a dead server
+  (#954).** Calling `panel_refresh_nodes` just after a restart-related operation could come
+  back `object_info_fetch_failed` — "Failed to fetch" — while other reads succeeded moments
+  later against the same server. Worse than the false failure was its advice: it told you to
+  check that the ComfyUI process was still running, sending you after something that was
+  never down.
+
+  The fetch now retries three times over about half a second before giving up, which is
+  enough to cross a reconnect blip. The panel already did this at startup, so the same
+  hiccup was survivable when the page loaded and fatal to an agent tool call a minute later.
+  A backend that really is gone still reports exactly what it reported before, with the same
+  detail — a retry that turned a real outage into a vaguer message would trade one wrong
+  answer for another.
+
+
+## [0.11.84] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.11.83] - 2026-08-09
+
+> Covers changes since 0.11.82.
+
+### Added
+
+- **The panel now tells you what changed when it updates under you (#758).** It installs
+  from the Comfy Registry and the orchestrator runs the latest agent, so the version can
+  move without you asking — and the first sign was usually something behaving differently
+  than you remembered, which reads as a bug rather than a release.
+
+  On the first load after an update the transcript shows what shipped between the version
+  this browser last saw and this one, each line tagged Added, Fixed or Changed. That
+  distinction is the point: "this used to work differently on purpose" is a different
+  message from "this was broken". It appears once, says nothing on a fresh install, and
+  says nothing if you roll back.
+
+  Settings → Comfy MCP Agent → About → **Show what is new** re-opens it whenever you want,
+  since a line in a transcript scrolls away and the request was for somewhere to look.
+
+### Fixed
+
+- **A failed install by git URL now says what is actually wrong (#920).** Passing a
+  repository URL for a pack that is not in the node registry failed with
+  *"Node '<name>@<version>' not found in [...]"* — a registry lookup naming an id you never
+  supplied, which reads like a lookup bug and sends you to re-check spelling and channels.
+  It now explains that this is a registry lookup, that ComfyUI-Manager's `repository`
+  parameter is accepted and then ignored by its install handler, and what does work: clone
+  into `custom_nodes/` and restart, ask the author to publish, or — two steps, not one —
+  run with `--enable-manager-legacy-ui` (which *replaces* the v2 Manager API) **and** set
+  `allow_git_url_install = true` in `config.ini`, without which that route answers 404.
+
+  Also **corrects the 0.11.75 entry**, which claimed installing from a GitHub URL "actually
+  clones it now". It does not, and that entry now says so.
+
+## [0.11.82] - 2026-08-09
+
+> Covers changes since 0.11.81.
+
+### Added
+
+- **`panel_open_workflow` now reports which workflow it observed to be active, beside the
+  one that was requested (refs #887).** The reply named only the target, so a caller could
+  not tell "the requested workflow is active" from "the requested workflow is what you
+  asked for" — and a Save-As taken on that reading writes the live canvas, which may be a
+  different workflow. The reply carries `active_routing_key` and `active_matches_target`
+  (true, false, or null when it could not be read), with a warning when they disagree.
+
+  This is groundwork, not the fix: the contradictory "you are NOT on the wrong workflow"
+  message is composed by the orchestrator, which does not read these fields yet, so nothing
+  user-visible changes until it does. #887 stays open.
+
+## [0.11.81] - 2026-08-09
+
+> Covers changes since 0.11.80.
+
+### Fixed
+
+- **A Save-As no longer strands the agent that performed it (#941).** `panel_save_workflow`
+  with a new name writes the copy and switches the active canvas to it — which fences the
+  very session that asked for the save, so every following `panel_*` graph call is refused.
+  That is survivable only if the reply says what to re-fence to, and it did not: it reported
+  the identity as unavailable, while the next call was refused *using* an identity the panel
+  had declined to publish one call earlier.
+
+  The identity read is deliberately pure — a fence refreshed from a value a read invented
+  would be agreeing with itself rather than observing anything — and a Save-As activates a
+  brand-new object nothing had established an identity for. So the read honestly found
+  nothing while the fence, whose own read mints, immediately found one. The identity is now
+  established as part of the save, from the record the save itself produced and proved
+  active, never from a later look at whichever canvas happens to be current. A Save-As that
+  cannot produce one still reports absence rather than substituting a different canvas.
+
+- Name the canvas swap point, from the canvas-rebuild side (#944).
+
+
+## [0.11.80] - 2026-08-09
+
+> Covers changes since 0.11.79.
+
+### Fixed
+
+- **Your first chat about a workflow no longer disappears when you filter to that
+  workflow (#847).** Chat, start a second chat, then tick "Current workflow only": the
+  first conversation vanished, even though both were held on the same canvas.
+
+  The panel saves an unsaved workflow before a turn ("grounding", #330), and ComfyUI
+  replaces the workflow object at that save. Every carrier that could hand the identity
+  to the successor is empty at that instant — the object maps are keyed on the object
+  that just went away, the embedded uuid is unreadable because the fields it is looked
+  for in are all absent on this frontend, and the path alias gets written from the new
+  id. So the successor minted a fresh identity and the conversation from seconds earlier
+  was left holding one that nothing answered to.
+
+  The tab's pre-save route id is now captured *inside* the grounding transaction and
+  filed under the path that save produced. That location matters: an observer watching
+  the change afterwards cannot prove the old id was this tab's past rather than a
+  workflow you switched away from, which is why the panel deliberately migrates nothing
+  there. The save knows by causation — it is the panel's own call, on its own active
+  workflow — so nothing is inferred.
+
+  Scope is small on purpose: these forms are consulted by the history filter alone.
+  They never resolve a workflow's identity, authorize a graph write, or restore a
+  session. One limit stays open and is documented rather than hidden — deleting a
+  workflow and creating a new one with the same name can show the old chats under the
+  new one, since a path is not proof of ownership.
+
+
+## [0.11.79] - 2026-08-09
+
+> Covers changes since 0.11.78.
+
+### Fixed
+
+- **The e2e suite stops leaving saved workflows in your library, and says so when it
+  cannot be sure (#907).** Specs that persist a workflow were leaving the file behind:
+  1272 of 1288 files in the dev workflow directory were test output. Per-spec cleanup
+  could not fix it, because it sat at the end of a test body and so never ran when a
+  test failed. Cleanup is now suite-level, and deletes only files that appeared during
+  the run AND carry the suite's own name prefix — ComfyUI names an unnamed save
+  `Untitled <date> <time>`, which is exactly what it names YOURS, so nothing keyed on
+  that name is safe to delete automatically. Anything else that appears is reported by
+  name rather than removed or ignored. Developer-facing only; nothing in the shipped
+  panel changes.
+
+## [0.11.78] - 2026-08-09
+
+> Covers changes since 0.11.77.
+
+### Fixed
+
+- **A tab now measures its own module cache instead of asking you to open DevTools
+  (#584).** This issue has had five fixes and keeps coming back, because each was built
+  on a hypothesis about the browser cache that nobody had measured — and the only way to
+  measure it was to ask someone whose tab was already wedged to read their Network tab.
+  The panel now reports, per module, whether it came from the server, from cache, or via
+  a 304 revalidation, and says so when the version check reads healthy but the modules
+  did not. That branch used to return silently, which is the shape this issue keeps
+  returning with: one version constant looking fine while the page it belongs to does
+  not behave like it. A healthy load stays silent. The same summary goes into the
+  diagnostics you copy into an issue, so the next report arrives with the measurement
+  already in it.
+
+## [0.11.77] - 2026-08-09
+
+> Covers changes since 0.11.76. The first entry this generator produced correctly.
+
+### Fixed
+
+- **Generating a changelog no longer replays the entire history into one release
+  (#932).** Every entry was built from the first commit onward, so a release claimed
+  ~200 commits of already-shipped work as its own. Both release matchers had been
+  written for commit shapes this repo has never produced: the base search grepped for
+  `release:` / `chore(release):`, which matched nothing and fell through to
+  `rev-list --max-parents=0` — the root commit — and the predicate that keeps release
+  commits *out* of an entry required the version to be the whole subject, so releases
+  were written into the entries announcing them. Releases here read
+  `0.11.76 — <description> (#930) (#931)`, and now both rules key on a version at the
+  start of the subject.
+
+  The fix is deliberately not a `git log --grep`. `--grep` searches the whole commit
+  message and matches per line, so `^<version>` also fires on a *body* line — in this
+  repo's own history it selects 7521519, an ordinary `fix(subgraph):` commit, which
+  would have anchored a release on itself and silently truncated the entry. Subjects
+  are read from `%s` and matched in JS, by the same predicate the generator already
+  used, so there is one rule rather than two that can drift.
+
+  This was worked around by hand for all fourteen releases from 0.11.63 to 0.11.76.
+  A silent workaround is how a broken tool survives that long.
+
+
+## [0.11.76] - 2026-08-09
+
+> Covers changes since 0.11.75.
+
+### Fixed
+
+- **A subgraph boundary rail is no longer reported as a node that doesn't exist
+  (comfyui-mcp#1294).** `panel_query_graph` hands out a subgraph's rails as
+  `rails.output.rail_node_id: "-20"`. Passing that back to an edit answered *"No node with
+  id -20 in the current graph … The id may be from a different workflow, or the node was
+  removed. Re-read with panel_graph_outline before retrying."* Every clause after the
+  first was false — the id came from that graph, from the panel's own read, one call
+  earlier — and the remedy re-read the surface that produced it, so following it looped.
+  The failure now names what the id actually is, notes that `panel_move_node` takes a rail
+  id (position only) while `panel_move_rail` addresses it by side, and says plainly that
+  no unexpose operation exists rather than implying one.
+
+## [0.11.75] - 2026-08-10
+
+> Covers changes since 0.11.74.
+
+### Fixed
+
+- **The install request now carries your repository URL (#920).** The panel used to reduce
+  a GitHub URL to just the repo's name and throw the rest away; it now sends the URL in the
+  `repository` field ComfyUI-Manager's API declares for it.
+
+  **This does not yet make such an install succeed, and this entry originally said it did —
+  that was wrong.** ComfyUI-Manager v4's v2 install handler accepts the field and then ignores it: it
+  reads only `id`, `selected_version`, `channel`, `mode` and `skip_post_install`,
+  and resolves the clone URL from its own database instead. A pack that is not in the
+  registry still cannot be installed by URL on a stock v4, and you will still see
+  *"Node '<name>@<version>' not found in [...]"*.
+
+  The change is kept because it is what the documented API asks for and it will start
+  working if Manager implements the field — but it is forward-compatibility, not a fix.
+
+  What works today for an unlisted pack, least effort first: `git clone` into
+  `custom_nodes/` and restart, or ask the pack author to publish to the registry. There is
+  a legacy git-URL route, but reaching it takes two steps — `--enable-manager-legacy-ui`
+  (which *replaces* the v2 Manager API rather than adding to it) **and**
+  `allow_git_url_install = true` in ComfyUI-Manager's `config.ini`; an unlisted pack is
+  rated "high+" risk and without that setting the route answers 404. Tracking in #920.
+
+## [0.11.74] - 2026-08-09
+
+> Covers changes since 0.11.73.
+
+### Fixed
+
+- **Saving a subgraph over a built-in name no longer sends you looking for a delete
+  button that isn't there (#636).** When the name clashes, the panel refuses and suggests
+  deleting the existing one from ComfyUI's library. But ComfyUI won't delete the
+  subgraphs it ships with — and on a stock install nearly all of them are its own, so the
+  clash you're most likely to hit is the one where that advice can't be followed.
+
+  It now recognises a built-in and says the name can't be freed, so the only thing left is
+  to pick a different one. Clashes with a subgraph you saved yourself still suggest
+  deleting it, and so does any case where the panel can't tell — withholding an option
+  that might work is worse than offering one you'd rule out in seconds.
+
+## [0.11.73] - 2026-08-09
+
+> Covers changes since 0.11.72.
+
+### Fixed
+
+- **The saved-subgraph list no longer claims every blueprint is yours (#636).** Listing
+  saved subgraphs reported `is_global: false` for all of them — including the ones
+  ComfyUI ships — because it read a property blueprints do not have. The agent had no way
+  to tell a bundled subgraph from one you saved.
+
+  It now asks ComfyUI, using the same call ComfyUI's own library menu uses. Where that
+  answer can't be trusted — an older frontend, or one that names blueprints in a shape
+  the panel doesn't recognise — the field is `null` rather than a guess. "I can't tell"
+  and "this one is yours" are different answers, and reporting the second in place of the
+  first is exactly what was wrong before.
+
+## [0.11.72] - 2026-08-09
+
+> Covers changes since 0.11.71.
+
+### Fixed
+
+- **You can add a saved subgraph by the name you see in the library (#636).** Asking for
+  one by its name failed with *"No saved subgraph blueprint"*, because current ComfyUI
+  stores them under a generated id and the panel only looked for that. The name shown in
+  the library — the only one you'd think to use — was the one thing that didn't work,
+  while the unreadable id did.
+
+  It now accepts either. The id is still tried first, so nothing that already worked
+  changes.
+
+  If two saved subgraphs share the same library name, it says so and asks for the id
+  instead of picking one. Adding the wrong graph quietly is worse than being asked to be
+  specific. And if the lookup itself fails, the error says that rather than claiming you
+  never saved it.
+
+  Same cause as the name-clash fix in 0.11.71. Updating an existing saved subgraph is
+  still not possible from the agent — that part of the report remains open.
+
+## [0.11.71] - 2026-08-09
+
+> Covers changes since 0.11.70.
+
+### Fixed
+
+- **Saving a subgraph under a name you've already used is caught again (#636).** The
+  panel refuses to save a reusable subgraph over an existing one, because replacing it
+  needs ComfyUI's own confirmation dialog — which an agent has no way to answer. On
+  current ComfyUI that check had stopped working: blueprints are now stored under a
+  generated id rather than the name you gave them, so the panel was comparing your name
+  against an id it could never equal, and saw no clash at all.
+
+  It now also compares the name shown in the library, which is where your name actually
+  lives. Older ComfyUI versions that store blueprints by name are unaffected, and a
+  different subgraph is still not treated as a clash.
+
+  Updating an existing saved subgraph is still not possible from the agent — that half
+  of the report is open.
+
+## [0.11.70] - 2026-08-09
+
+> Covers changes since 0.11.69.
+
+### Fixed
+
+- **A video your browser can't play now says so instead of showing a blank card (#909).**
+  Asking the agent to show a video reported success and displayed nothing, because the
+  tool answers for handing the video to the page — not for whether the browser could
+  actually decode it. An MP4 in an older format (MPEG-4 Part 2) is the reported case.
+
+  The card now says the format can't be played and suggests re-encoding as H.264 or
+  WebM, instead of leaving you to guess whether the video is broken, still loading, or
+  never arrived.
+
+  Two things it deliberately does not do: it does not report a failure when a working
+  video is simply scrolled out of view (tearing one down looks identical to a decode
+  error from the outside), and it does not keep retrying media it has already failed on,
+  which would make the message flicker away each time you scrolled back.
+
+## [0.11.69] - 2026-08-09
+
+> Covers changes since 0.11.68.
+
+### Security
+
+- **A workflow you open can no longer lie to the agent about your graph (#904).** The
+  graph outline the agent reads marks nodes with short status tags — `[bypass]` and
+  `[mute]` mean a node isn't running, `[after_gen=randomize]` means ComfyUI quietly
+  changes that value on every run. Node titles and widget values were written into that
+  same text as-is, so text containing one of those tags was indistinguishable from a tag
+  the panel had actually emitted.
+
+  This is reachable by **workflows you download**, not just by what you type: a prompt in
+  a shared JSON could make the agent believe a node was disabled, or that a value was
+  being rewritten behind its back, and act on it.
+
+  Values are not censored to fix it — bracket syntax like `[cat|dog]` is ordinary prompt
+  content, and deleting it would corrupt what you asked to see. Instead a value
+  containing brackets is now quoted, so a tag outside quotes is always the panel's own.
+  Ordinary values are unchanged. Titles, which were already quoted, can no longer end
+  their own quoting early.
+
+  Found while fixing #636 and verified against a live ComfyUI before and after.
+
+## [0.11.68] - 2026-08-09
+
+> Covers changes since 0.11.67.
+
+### Fixed
+
+- **The graph outline now shows widgets you've renamed (#636).** If you rename a
+  subgraph's promoted widgets, the canvas shows your new names — but the outline the
+  agent reads kept listing the original keys. One user was told their renames "hadn't
+  stuck" when they plainly had, and only a screenshot settled it.
+
+  The detailed reader was fixed for this in 0.11.42. The outline — the quick overview an
+  agent reaches for first — was not, so the misleading answer was still one call away. It
+  now shows both: `width=512 [renamed "Frame Width"]`. The original name stays first,
+  because that is the one you use to set the value; the name you gave it rides alongside.
+
+  Only renamed widgets are annotated, so an ordinary graph's outline is unchanged.
+
+### Security
+
+- **A renamed widget can no longer forge a status tag in the outline (#636).** The outline
+  is written for the agent to read, and marks widgets with tags like
+  `[after_gen=randomize]` — which means ComfyUI silently rewrites that value on every run.
+  Because widget names are yours to choose, a name containing the right punctuation could
+  close its own tag and invent one of those, describing behaviour the node does not have.
+  Names are now escaped so they cannot break out.
+
+## [0.11.67] - 2026-08-09
+
+> Covers changes since 0.11.66.
+
+### Fixed
+
+- **Adding a node no longer refuses a type your install can clearly handle (#636).**
+  Asking the agent to add `SaveVideo` failed with *"Required custom widget VIDEO have not
+  registered"* — on a canvas where a working `SaveVideo` was already sitting. Retrying
+  never helped, because nothing about the check could change.
+
+  The check asks whether a datatype could still be a widget that hasn't finished loading.
+  It answers that by looking at whether any installed node *produces* that type. On an
+  install where nothing happens to produce it, the answer is permanently "can't tell", and
+  the node becomes unaddable forever — even though ComfyUI builds it perfectly well.
+
+  The panel now also looks at the canvas. If a node of that same type is already there,
+  how ComfyUI actually built it is visible: an input wired as a connection is a
+  connection, and one shown as a widget already has what it needs. That is exactly the
+  evidence the reporter was staring at while being told the node couldn't be added.
+
+  This only ever lets an attempt proceed — the newly added node is still checked before
+  you're told it worked, so a genuinely missing widget still fails, and a still-loading
+  one still gets its full wait first. Nothing changes for a type the canvas can't vouch
+  for.
+
+  The other half of that report — `SaveVideo`'s `codec` input — was already fixed in
+  0.11.44. Verified here against a live ComfyUI: `SaveVideo` now adds cleanly.
+
+## [0.11.66] - 2026-08-09
+
+> Covers changes since 0.11.65.
+
+### Fixed
+
+- **Updating a node pack no longer dead-ends on some Manager builds (#367).** On certain
+  built-in Manager v4 installs, asking the agent to update a pack failed instantly with
+  `HTTP 405` — the Manager refuses that particular request on that build, even though
+  listing and installing work fine.
+
+  The panel already knows how to talk to those builds; it has a second route for exactly
+  this case. It just never tried it. There *was* a fallback, but it dropped to the old
+  3.x-style routes, which a modern Manager doesn't serve either — so the retry failed
+  too, and update was unusable while a perfectly good route sat unused.
+
+  Now it tries that route before giving up, and remembers which one worked so later
+  updates go straight there. On a build where the original request is fine, nothing
+  changes — verified against a live Manager here, which accepts it and doesn't serve the
+  alternative at all.
+
+  One honest caveat: on the builds this unblocks, the Manager reports no per-task
+  result, so the update is reported as *queued* rather than confirmed. Check
+  `panel_node_queue_status` and restart ComfyUI to load the updated pack. That is the
+  best answer that Manager can give — the bug was getting no answer at all.
+
+## [0.11.65] - 2026-08-09
+
+> Covers changes since 0.11.64.
+
+### Fixed
+
+- **Re-opening the current workflow no longer sends the agent in a circle (#702).**
+  Re-opening the tab that is already open answers "the canvas IS this workflow's, but I
+  can't call the contents byte-identical" — normal, and not a failure. What that answer
+  did not say is that it carries no refreshed workflow stamp, so the agent's *next*
+  command was rejected as belonging to a different workflow. And the answer ended by
+  recommending exactly that next command.
+
+  Two people followed that advice into the rejection and concluded the only way out was
+  reloading the whole panel. It wasn't: listing workflows re-publishes the current
+  identity and the read then goes through — one call, no reload. The reply now says so.
+
+  Nothing about how the panel decides which canvas it is bound to changed; the answer
+  was right and only its advice was wrong. All four phrasings of that outcome carry the
+  correction, and it stays off the case where the workflow genuinely *cannot* be
+  confirmed, because there reloading really is the remedy.
+
+## [0.11.64] - 2026-08-09
+
+> Covers changes since 0.11.63.
+
+### Fixed
+
+- **A blank canvas no longer refuses every graph tool (#833).** An empty canvas is the
+  ordinary state you are in right before asking the agent to build a workflow — and it
+  was the one state where the agent could not read the graph at all. Nothing cleared it:
+  re-targeting, creating a new workflow, and re-opening the tab all failed, and the
+  latest report adds that it survived both a hard refresh and a ComfyUI restart.
+
+  The guard was not treating "0 nodes" as a wrong canvas, as it appeared. It was
+  treating it as *unproven*, and on a blank canvas neither available proof can ever
+  succeed: identifying a canvas by its contents is impossible when there are none — every
+  blank canvas looks alike — and the other proof requires an unmodified tab, which a
+  blank one never is, because creating or clearing it is what marks it modified.
+
+  An empty canvas is now accepted as genuinely empty when both the canvas and the
+  workflow are independently shown to hold nothing. There is no content to attribute to
+  the wrong workflow, which is the same reasoning the panel already used elsewhere; it
+  simply could not be reached here. A canvas that merely *looks* empty because a
+  workflow is still loading is still refused, using ComfyUI's own loading signal.
+
+  **Reading works; building does not yet.** Adding nodes to a blank canvas is still
+  refused. Proving there is nothing to lose is enough to trust what a read returns, but
+  not enough to say *which* workflow an empty canvas belongs to — and a reconnect can
+  leave the canvas belonging to one blank tab while the panel is pointed at another, so
+  the first node could land on the wrong one. That half is tracked on #833 and needs a
+  real identity proof rather than a relaxation.
+
+## [0.11.63] - 2026-08-09
+
+> Covers changes since 0.11.62.
+
+### Fixed
+
+- **Closing a workflow no longer discards changes a node made (#882).** ComfyUI decides
+  whether a tab has unsaved work from a snapshot it takes when *you* type or click.
+  Anything a node set for you is invisible to it — an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets — so the tab kept
+  reporting itself as clean while the canvas already differed from the file.
+
+  Two guards exist precisely to stop work being thrown away, and both believed that
+  report. Closing a workflow refuses when there are unsaved changes, because closing
+  bypasses ComfyUI's own save prompt — it saw "clean" and closed, and the values were
+  gone. The confirmation before an operation overwrites the canvas was skipped the same
+  way, so the canvas was replaced without anyone being asked.
+
+  Measured: after a save the tab reads clean, correctly. After a node writes a value it
+  still reads clean — wrong. Refreshing the snapshot flips it to modified, which is the
+  truth.
+
+  Both guards now refresh the snapshot before trusting it, and — this is the part that
+  matters — they only trust the answer when the refresh can be shown to have actually
+  happened. ComfyUI silently skips it while a graph is loading, while an undo is
+  replaying, and in a few other moments, in a way that is indistinguishable from success
+  from the outside. When it cannot be established that the refresh landed, the close
+  refuses and the confirmation is shown, rather than assuming. `force: true` still
+  closes, so nothing becomes unclosable.
+
+  Fourth and last of a family: #696, #874 and #878 were the same stale snapshot read in
+  other places — this one was the guards meant to protect you from it.
+
+## [0.11.62] - 2026-08-09
+
+> Covers changes since 0.11.61.
+
+### Fixed
+
+- **Saving a workflow no longer writes stale values over your file (#878).** Saving
+  in place persisted ComfyUI's change snapshot rather than the live canvas, and that
+  snapshot only records what a *user* typed or clicked. So anything a node had set
+  for you was written out at its old value: an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets.
+
+  Measured: with 1337 on the canvas, the file on disk received the node's default of
+  512. Nothing errored, and the canvas still showed 1337 — a save does not repaint —
+  so the file quietly disagreed with the screen until the next reopen.
+
+  Saving under a *new* name already refreshed the canvas first; the route that
+  overwrites an existing file was the one that did not. It now does, and refuses the
+  save outright if that refresh fails rather than writing something it knows is
+  behind.
+
+
+## [0.11.61] - 2026-08-09
+
+> Covers changes since 0.11.60.
+
+### Fixed
+- Centring on a node now honours the zoom you asked for. `panel_canvas` with
+  `action:"center_on_node"` accepted a `scale` and quietly ignored it, so "centre on node
+  42 at 1.5x" centred at whatever zoom happened to be set — and the reply echoed the old
+  zoom back, so nothing said the request had been dropped. The zoom is applied before the
+  centring (applying it afterwards would slide the node straight back off-centre), the
+  reply reports the zoom that took effect, and a scale outside the accepted range is
+  refused rather than silently clamped — the same range `action:"zoom"` already enforced
+  (#876, #754)
+
+## [0.11.60] - 2026-08-09
+
+> Covers changes since 0.11.59.
+
+### Fixed
+
+- **Reopening a workflow no longer silently reverts values a node set for you
+  (#874).** Reopening an already-open workflow repaints the canvas from ComfyUI's
+  change snapshot rather than from the file — and that snapshot only records what
+  a *user* typed or clicked. So anything a node wrote by itself was quietly rolled
+  back: an ImpactWildcardEncode populate, a `control_after_generate` roll, a
+  subgraph's promoted widgets. Nothing errored, and the graph looked right
+  afterwards, which is why it read as "my edits didn't stick" rather than as a bug.
+
+  Measured: a value of 1337 on the canvas came back as the node's default of 512.
+  The panel now asks ComfyUI to capture the live canvas before it repaints, so what
+  is on screen is what gets restored.
+
+
+## [0.11.59] - 2026-08-09
+
+> Covers changes since 0.11.58.
+
+### Fixed
+
+- **An open Chat history pane now updates itself when you save a workflow
+  (#847, partial).** The list was painted once when the pane opened, so if you
+  saved a workflow while it was on screen it kept showing the pre-save answer
+  until you closed and reopened it.
+
+  This does not yet fix the related report that a chat held on a workflow *before*
+  its first save can drop out of "Current workflow only". That needs the panel to
+  prove an old identity belonged to the same tab, and it currently cannot — the
+  workflow object is replaced by the save, and "no other tab claims this id" is not
+  the same as "this tab owned it". Guessing there would attach one workflow's
+  conversations to another, so it stays unfixed and #847 stays open.
+
+
+## [0.11.58] - 2026-08-09
+
+> Covers changes since 0.11.57.
+
+### Fixed
+
+- **Reopening a workflow no longer reads as though work went missing (#696).** When
+  the canvas came back with an unfamiliar per-node field — a display toggle like
+  `showAdvanced` from rgthree or Impact, alongside the usual re-measured sizes —
+  `panel_open_workflow` said it could not tell whether "the load only partly
+  applied", which sent people hunting for work to redo that was never gone.
+
+  The panel had been deciding this by checking every differing field against a list
+  of names it considered harmless, so one flag it had never seen was enough. It now
+  reports what it actually proved: every node that was loaded is on the canvas with
+  the same id and type, so no node was lost — whatever fields differ, and without
+  needing to know what any of them mean. A difference confined to sizes, positions
+  and colours still gets the stronger answer, that the widget values and links
+  matched too.
+
+  Also stopped claiming the difference was something "the ComfyUI frontend
+  recomputes on load". Node colours are on that same list and nothing recomputes
+  them, so that was untrue whenever a colour differed.
+
+
+## [0.11.57] - 2026-08-09
+
+> Covers changes since 0.11.56.
+
+### Fixed
+
+- **The panel no longer eats the storage ComfyUI needs for your workflow tabs
+  (#861).** Chat history kept every pre-v3 transcript in `localStorage` in full,
+  forever. That budget belongs to the whole origin, not to the panel, so past a
+  point ComfyUI itself could not save workflow drafts — "Failed to save workflow
+  draft", and every open workflow tab gone on the next browser restart, with
+  nothing in any log pointing at the panel.
+
+  Those transcripts had nowhere else to live, which is why they were never
+  trimmed: capping them would have been deleting them. They now have a durable
+  home of their own, and only then is the local copy bounded — by size, since one
+  transcript full of pasted JSON outweighs hundreds of short ones. Nothing is
+  dropped that is not safely stored elsewhere first: if the durable copy cannot be
+  written, nothing is trimmed at all.
+
+  Deleting a chat now removes it for good, including from the new store, and a
+  delete that fails is retried rather than quietly forgotten.
+
+
+## [0.11.56] - 2026-08-09
+
+> Covers changes since 0.11.55.
+
+### Fixed
+
+- **A first save no longer hides the chat you had before it (#847).** "Current
+  workflow only" showed one of two conversations held on the same tab and the
+  same canvas, minutes apart. Saving a workflow migrates its route id
+  (`tmp:<uuid>` to `wf:<path>`) and re-mints its storage uuid at the same
+  moment, so a chat recorded before the save shared no identity with the live
+  workflow and dropped out of a filter named for the workflow it was actually
+  held on. The filter now also accepts the workflow's pre-save id, which the
+  panel already records — nothing about lineage is guessed, so another
+  workflow's conversation still cannot be pulled in. Threads written before a
+  save are matched within the session; carrying that across a reload needs the
+  stamps rewritten at the save boundary and is still open.
+
+
+## [0.11.55] - 2026-08-09
+
+> Covers changes since 0.11.54.
+
+### Fixed
+
+- **A deferred tool is no longer read as an absent one (#857).** The live-canvas
+  disclosure asked one binary question — is `panel_graph_outline` in your toolset
+  or not — and on a backend that defers tool schemas, neither answer is true. A
+  Codex session found nothing in its initially advertised tools, found
+  `mcp__panel__panel_graph_outline` in the lazy registry, called it, and got the
+  live 41-node graph; it had still been told to report the canvas unreachable and
+  hand the user three remedies for a healthy install. The lookup now comes first
+  and covers both surfaces — a tool you can call is present wherever it came from
+  — and it stops after one check, so a session that genuinely has no canvas tools
+  still reaches its remedies instead of searching forever.
+
+
+## [0.11.54] - 2026-08-09
+
+> Covers changes since 0.11.53.
+
+### Fixed
+
+- **The reboot reply now says WHICH ComfyUI it restarted (#851).** `comfy_reboot`
+  returned the route (`/v2/manager/reboot`) and never the host, so a caller could
+  not tell which server had just gone down. When the panel drives a ComfyUI that
+  is not the orchestrator's headless `COMFYUI_URL`, that gap sends a confirmation
+  timeout to a fallback aimed at the other machine — which answers "No ComfyUI
+  process found on port 8188" while the panel was operating on the live one all
+  along. Every branch now carries `target`, and the two failure messages name the
+  host in prose; an unknown target is omitted rather than reported blank. The
+  confirmation card and its timeout wording are orchestrator-side and unchanged.
+
+
+## [0.11.53] - 2026-08-09
+
+> Covers changes since 0.11.52.
+
+### Fixed
+- `panel_add_node`'s schema-drift refusal pointed at the wrong recovery. When a node class's
+  required inputs changed since the page loaded its schema — moving a model file between
+  folders is enough — the panel correctly refuses to build the stale shape, but it told you to
+  reload the whole ComfyUI tab. `panel_refresh_nodes` clears the same condition in place and
+  costs no canvas state: it re-fetches `/object_info` and re-registers the class, which is
+  exactly what the refusal is waiting for. The message now leads with that, keeps the tab reload
+  as the fallback, and says what the refresh does NOT fix — nodes already on the canvas keep the
+  shape they were created with (#852)
+
+## [0.11.52] - 2026-08-09
+
+> Covers changes since 0.11.51.
+
+### Added
+- **Panel UI scale.** A new setting in ComfyUI Settings (Comfy MCP Agent → General → "Panel UI
+  scale (%)") scales the whole Agent sidebar — text, icons and spacing together — from 100% to
+  250%. Reported by a user on Windows 11 for whom the panel text was barely readable.
+
+  Worth knowing if you tried to fix this yourself: overriding `.cmcp-root { font-size }` in a
+  user stylesheet does **not** work, and that is not your mistake. The panel's inner sizes are
+  `rem`, which resolve against the page root rather than against the panel, so most text ignores
+  the override. This setting is the supported way to scale the panel (#753)
+
 ## [0.11.51] - 2026-08-09
 
 > Covers changes since 0.11.50.

@@ -85,12 +85,14 @@ import {
   isManagerRouteMissing,
   isManagerUnreachable,
   isMethodNotAllowed,
+  assertBatchOk,
   legacyUpdateBody,
   parseTaskHistoryItem,
   queueDrained,
   rebootCandidates,
   searchNodesVia,
   taskFailureReason,
+  unlistedGitUrlAdvice,
   taskSucceeded,
 } from "./lib/manager-install.js";
 import {
@@ -123,6 +125,10 @@ import {
   shouldForkInPlaceReload,
   workflowAliasForPath,
   workflowIdentityForms,
+  rememberPreGroundingIdentity,
+  preGroundingIdentityForms,
+  pruneGroundingIdentities,
+  groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
@@ -142,7 +148,9 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
-import { saveReplyIdentity } from "./lib/save-reply-identity.js";
+import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
+import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
+import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -152,6 +160,8 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+import { createObjectInfoCache } from "./lib/object-info-cache.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -202,9 +212,13 @@ import {
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
-import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
+import {
+  threadMatchesCurrentWorkflow,
+  currentWorkflowIdentityKeys,
+  migratableRouteIds,
+} from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
-import { describeMissingNode } from "./lib/node-scope-locator.js";
+import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
@@ -245,6 +259,7 @@ import {
   registeredSocketTypes,
   unavailableRequiredWidgetMessage,
   unavailableRequiredWidgetReport,
+  unavailableEntriesLiveNodeCannotExplain,
 } from "./lib/node-widget-materialization.js";
 import {
   describeUnmaterializedRequiredWidgets,
@@ -270,6 +285,11 @@ import {
 } from "./lib/clipboard-store.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { createMediaCollapseStore } from "./lib/media-collapse.js";
+import {
+  PANEL_UI_SCALE_MIN,
+  PANEL_UI_SCALE_MAX,
+  panelUiScaleFraction,
+} from "./lib/ui-scale.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
   vueNodesActive,
@@ -360,6 +380,7 @@ import {
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
+  emptyCanvasBindingProven,
   rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -382,6 +403,7 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
+import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
 import { probeConsoleRoute, UNBUILT_ROUTE_TITLE } from "./lib/console-route-probe.js";
 import {
@@ -628,6 +650,8 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 // registerComfyNodeDefs: any observation taken after an unobserved window cannot support
 // the "never backend-defined this session" claim a baseline makes.
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
+// #716 — one /object_info per BURST of widget writes, instead of one per write.
+const objectInfoCache = createObjectInfoCache();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -700,6 +724,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboApiPresent = false;
   let comboRan = false;
   let phase = "fetch";
+  // #716 — drop the widget-write burst cache at the START of this run, not after it
+  // succeeds (codex). This function runs on exactly the events that change the schema —
+  // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
+  // when the schema is most likely to have moved. Invalidating only on success would leave
+  // the pre-change map authorizing writes for the rest of the TTL, where the old code would
+  // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
+  // be wrong in the dangerous direction.
+  objectInfoCache.invalidate();
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -715,7 +747,16 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // combo trust below. Decoupled from registerNodesFromDefs so the trust signal
     // doesn't hinge on that method existing (codex #2).
     if (!defs && typeof api?.getNodeDefs === "function") {
-      defs = await api.getNodeDefs();
+      // #954 — retry a TRANSIENT failure. A refresh issued just after a restart-related
+      // operation landed in a reconnect window and came back
+      // `object_info_fetch_failed / "Failed to fetch"` while other reads succeeded moments
+      // later against the same server, printing a remedy that sends the user to check a
+      // process that was never down. The startup baseline seed already retries getNodeDefs
+      // for this reason; this path did not, so the same blip was survivable at page load
+      // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
+      // and the LAST error is rethrown so a genuine outage still reports what it always did.
+      // (~800ms is the added WAITING; the three requests themselves are unbounded — codex.)
+      defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -868,7 +909,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.51";
+const PANEL_VERSION = "0.11.87";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -1464,6 +1505,7 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 // migration (the orchestrator moves the pin unchanged), so the guard must still
 // recognize it as naming this same instance (#186).
 const _priorTempWorkflowIds = new WeakMap();
+
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 
@@ -1508,6 +1550,39 @@ let _workflowUuidAliases = (() => {
     return {};
   }
 })();
+
+// #847 — path -> the identity forms the tab held immediately before the panel GROUNDED it
+// into that path. Durable (localStorage) because the in-memory carriers all die with the
+// workflow object the save replaces, so a reload would otherwise lose the lineage that a
+// WeakMap held for the session. Read only by the chat-history filter.
+const PRE_GROUNDING_IDENTITIES_KEY = "comfyui-mcp.panel.preGroundingIdentities";
+const _preGroundingIdentities = (() => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PRE_GROUNDING_IDENTITIES_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+})();
+
+/** Paths the workflow store currently lists, or null when it cannot be read (#847). */
+function knownWorkflowPaths() {
+  try {
+    const list = app?.extensionManager?.workflow?.workflows;
+    if (!Array.isArray(list)) return null;
+    return list.map((w) => w?.path).filter((p) => typeof p === "string" && p);
+  } catch {
+    return null;
+  }
+}
+
+function persistPreGroundingIdentities() {
+  try {
+    window.localStorage.setItem(PRE_GROUNDING_IDENTITIES_KEY, JSON.stringify(_preGroundingIdentities));
+  } catch {
+    // Quota/private-mode: the in-memory map still covers this session.
+  }
+}
 let workflowAliasMutationSink = null;
 // MODULE-scoped so they survive buildPanel re-mounts (the panel re-mounts on every
 // ComfyUI workflow switch). If these lived in the panel closure, each re-mount would
@@ -1518,6 +1593,177 @@ let currentWorkflowKey = null;
 // place on rename/Save-As (path and the derived .key getter both change), so the
 // instance is the only stable identity a rename leaves intact.
 let currentWorkflowRef = null;
+/**
+ * Flush the live canvas into a workflow's ChangeTracker, and say what happened (#882).
+ *
+ * ComfyUI captures on USER INPUT events only, and derives `isModified` from that same
+ * capture. So a value a NODE wrote — an ImpactWildcardEncode populate, a
+ * control_after_generate roll, a subgraph's promoted widgets — leaves the tab reading
+ * CLEAN while the canvas already differs from the file. Measured:
+ *
+ *     after save            isModified: false   (correct)
+ *     after a node writes   isModified: false   (WRONG)
+ *     after a capture       isModified: true    (correct)
+ *
+ * Anything about to DISCARD a canvas has to capture before it reads that flag, or it
+ * decides on a stale answer. Same family as #874 (reopen reverted the canvas) and #878
+ * (save wrote stale bytes); this one fools the data-loss guards themselves.
+ *
+ * Returns `{ verdict, settled }` rather than a boolean, because the callers need to
+ * tell apart "captured, the flag is now truthful" from "could not capture, so the flag
+ * proves nothing" — a guard that cannot distinguish those has to guess, which is how
+ * this bug reads in the first place. `settled` is present only for "pending", and is
+ * THE capture's own promise resolved to a final verdict:
+ *
+ *   "captured"    a snapshot demonstrably landed; the flag is now truthful
+ *   "unverified"  the call returned normally but may have been a silent NO-OP, so the
+ *                 flag is not known to be current. See `captureWasSuppressed`.
+ *   "pending"     the capture is asynchronous. `settled` resolves to the real verdict;
+ *                 a synchronous caller cannot wait, so its flag is still stale.
+ *   "failed"      it threw. The tracker is knowably behind the canvas.
+ *   "inactive"    not the active workflow — nothing to flush; see below.
+ *   "unavailable" no tracker/method (older frontend). Exactly today's position —
+ *                 not a new failure, and callers keep today's behaviour.
+ *
+ * ONLY the active workflow is flushed. Upstream `captureCanvasState()` returns early
+ * for a non-active tracker (`isActiveTracker` → `reportInactiveTrackerCall`), so asking
+ * would report a capture that never happened and log a spurious warning. An inactive
+ * tab is not exposed to this bug anyway: node writes land on the LIVE canvas, and
+ * ComfyUI's own `deactivate()` captures a tracker's state before its workflow goes
+ * inactive.
+ *
+ * A capture that returns normally has NOT necessarily snapshotted: upstream returns
+ * early — silently, with the same `undefined` — mid-undo, inside a change transaction,
+ * and while a graph is loading. Reporting those as "captured" would authorise a close
+ * on a stale flag, which is this very bug (codex). So "captured" is only claimed on
+ * EVIDENCE: either the snapshot object was replaced (proof it landed), or none of the
+ * documented suppression conditions holds. Otherwise the verdict is "unverified" and
+ * the destructive callers refuse, with `force` as the escape hatch.
+ *
+ * Why unchanged identity is not by itself a refusal: a capture that finds the canvas
+ * ALREADY equal to the snapshot legitimately leaves `activeState` untouched, and that
+ * is the ordinary state of every clean workflow. Refusing there would refuse every
+ * close of an unmodified tab and demand `force:true` for routine work — trading a
+ * data-loss bug for a cannot-close bug. So the no-change case is admitted, and the
+ * suppression windows are what separates it from a swallowed call.
+ *
+ * A frontend that RENAMES or drops one of those fields is detected, not assumed safe:
+ * `captureWasSuppressed` checks presence before value, so an unrecognised tracker is
+ * unproven. What is left cannot be distinguished from a clean no-change capture with
+ * the API upstream exposes — a new suppression condition built from fields that still
+ * exist, or, for an async capture, a window that both opens and closes between the two
+ * samples. Both land on today's behaviour, trusting `isModified`, so the residual is
+ * bounded by the status quo. Closing it properly needs an explicit capture outcome
+ * from upstream (something like `{ captured, changed }`); there is no panel-only proof.
+ */
+function captureCanvasIntoTracker(wf) {
+  if (!wf) return { verdict: "unverified" };
+  // A target may only be DISMISSED as inactive on a readable identity. `activeWorkflowRef()`
+  // answers null both when nothing is active and when the lookup itself threw, so null
+  // cannot be read as "inactive" — that would trust a stale flag on exactly the target
+  // that needed capturing (codex).
+  const active = activeWorkflowRef();
+  if (!active) return { verdict: "unverified" };
+  if (wf !== active) return { verdict: "inactive" };
+  const tracker = wf.changeTracker;
+  // `checkState` is DEPRECATED upstream — it warns, then delegates to this — so prefer
+  // the current name and keep the old one as the fallback for older frontends.
+  const capture = tracker?.captureCanvasState ?? tracker?.checkState;
+  if (typeof capture !== "function") return { verdict: "unavailable" };
+  // A capture that SEES a change assigns a brand-new state object. Identity change is
+  // therefore positive proof the snapshot landed, and needs no knowledge of internals.
+  // Read through a guard: `activeState` is a plain field today, but a version that
+  // makes it a throwing accessor must not blow past these callers (codex).
+  const readState = () => {
+    try {
+      return { ok: true, value: tracker.activeState };
+    } catch {
+      return { ok: false, value: undefined };
+    }
+  };
+  const before = readState();
+  if (!before.ok) return { verdict: "unverified" };
+  let result;
+  try {
+    result = capture.call(tracker);
+  } catch {
+    return { verdict: "failed" };
+  }
+  // Sample the suppression flags in the SAME tick as the call, before anything moves.
+  const suppressed = captureWasSuppressed(tracker);
+  const landed = () => {
+    const after = readState();
+    if (!after.ok) return "unverified";
+    if (after.value !== before.value) return "captured"; // proof: the snapshot landed
+    // Unchanged identity is the NO-CHANGE case — the snapshot already matches the
+    // canvas — unless a no-op window swallowed the call. Re-sample here as well as at
+    // call time: an asynchronous capture does its work later, so the window that
+    // matters may open after the first sample (codex).
+    return suppressed || captureWasSuppressed(tracker) ? "unverified" : "captured";
+  };
+  // Even asking whether the result is thenable can throw, if `then` is an accessor.
+  let isThenable = false;
+  try {
+    isThenable = !!result && typeof result.then === "function";
+  } catch {
+    return { verdict: "failed" };
+  }
+  if (!isThenable) return { verdict: landed() };
+  // Settle the capture's OWN promise. Starting a SECOND capture to await instead would
+  // run it twice — and a capture that sees a change is not a read: it pushes an undo
+  // entry and clears the redo queue. It would also leave this first promise unobserved.
+  //
+  // Normalised through `Promise.resolve` so `settled` is always a REAL promise: a
+  // callable thenable may return a non-promise from `.then()`, and awaiting that yields
+  // `undefined`, which matches no verdict and would slip past the refusal into the
+  // stale flag (codex). Assimilation failure rejects, and rejection means "failed".
+  let settled;
+  try {
+    settled = Promise.resolve(result).then(landed, () => "failed");
+  } catch {
+    return { verdict: "failed" };
+  }
+  return { verdict: "pending", settled };
+}
+
+/**
+ * Could the capture we just asked for have been a silent no-op? (#882)
+ *
+ * Upstream `captureCanvasState()` returns early — no throw, no return value, no signal
+ * of any kind — when a graph is loading, when an undo/redo is restoring, when a change
+ * transaction is open, or when there is no graph. A caller that reads `isModified`
+ * after one of those has a stale flag and cannot tell.
+ *
+ * These are the documented conditions, read defensively: a version that renames one is
+ * caught by the presence checks below rather than silently losing a refusal signal,
+ * and an unreadable tracker answers "suppressed" so the destructive callers confirm
+ * rather than assume. It is deliberately CONSERVATIVE —
+ * every condition here is transient (mid-undo, mid-load, mid-transaction), so the
+ * refusal it can cause is rare and clears on retry, which is the right side to err on
+ * for a guard that would otherwise discard a canvas.
+ */
+function captureWasSuppressed(tracker) {
+  try {
+    // SHAPE FIRST. Every field below is present on a real tracker (`changeCount = 0`,
+    // `_restoringState = false`, and the `isLoadingGraph` static). If one is missing,
+    // the frontend is not the shape these checks were validated against — and reading
+    // a renamed field's `undefined` as "not suppressed" would silently delete a
+    // refusal signal rather than degrade safely (codex). An unrecognised tracker is
+    // therefore SUPPRESSED: unproven, so the destructive callers confirm.
+    if (typeof tracker?._restoringState === "undefined") return true;
+    if (typeof tracker?.changeCount === "undefined") return true;
+    if (typeof tracker?.constructor?.isLoadingGraph === "undefined") return true;
+    if (tracker._restoringState) return true; // an undo/redo is restoring
+    if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
+    if (tracker.constructor.isLoadingGraph) return true; // a graph is loading
+    const graph =
+      window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
+    return !graph;
+  } catch {
+    return true; // cannot tell → do not claim a capture
+  }
+}
+
 function activeWorkflowRef() {
   try {
     return (
@@ -1603,6 +1849,41 @@ function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) 
 // tab-switch/reconnect race it can still be the prior tab's graph, so letting it
 // establish a previously-unseen workflow object's UUID would adopt that prior
 // tab before the graph-binding fence can reject it (#545 P1).
+/**
+ * #945 — RETURNS NULL ON EVERY FRONTEND OBSERVED HERE, and that is a finding
+ * rather than a bug in this function.
+ *
+ * The ComfyWorkflow class (0.31.1 / frontend 1.44.19) carries `changeTracker`,
+ * `_isModified`, `pendingWarnings`, `initialMode`, `activeMode`, `shareId` and
+ * getters for `activeState`/`initialState`. It has no `extra`, no `workflow` and
+ * no `data`, so no rung of this chain can match. The uuid IS on the object — via
+ * `activeState.extra` — one field away from where this looks.
+ *
+ * The chain has never been observed working HERE: it arrived in 525116a (#101)
+ * as a fallback "used by older builds", and no fixture in this repo has ever
+ * given a workflow OBJECT an `extra` to exercise it. That is not proof it was
+ * never real on some older release — nobody has one in hand to check (codex) —
+ * but no supported path currently reaches it.
+ *
+ * CONSEQUENCE, because the callers read as though they handle a real value:
+ * `embeddedWorkflowUuid(wf, { allowGraph: false })` is null on the observed
+ * frontend, so `shouldForkEmbeddedWorkflowUuid` and
+ * `shouldForkEmbeddedUuidForLiveOwner` short-circuit on their first line. They
+ * are UNREACHED THERE, not broken — given a value they still decide correctly,
+ * which is pinned in browser_tests/unit/embedded-uuid-carrier.test.mjs.
+ *
+ * THE SAME CHAIN APPEARS TWICE. It is also the fallback tail of
+ * `activeWorkflowExtra`, reached only if the ROOT graph's `extra` cannot be
+ * taken — which on this frontend always succeeds. That is precisely why
+ * `allowGraph: true` works and `allowGraph: false` does not: the graph carrier
+ * answers first, and the workflow-owned tail behind it has never had to.
+ *
+ * WHAT IS NOT BROKEN, and why this has stayed invisible: identity persistence
+ * does NOT depend on this chain. The loadGraphData wrapper stamps the uuid into
+ * `graphData.extra`, and `rootGraph.extra` carries it on the live canvas — which
+ * is what a save serializes into the file. The durable carrier works; it is this
+ * workflow-OBJECT-local one that does not (codex).
+ */
 function workflowOwnedExtra(wf = activeWorkflowRef()) {
   const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
   return candidate && typeof candidate === "object" ? candidate : null;
@@ -1882,6 +2163,33 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
+      // #945 — THIS WRITE DOES NOT LAND ON THE OBSERVED COMFYUI, though the
+      // guarantee above it is still met by another path. `workflowOwnedExtra` reads
+      // `wf.extra || wf.workflow.extra || wf.data.extra`, and the ComfyWorkflow
+      // class (0.31.1 / frontend 1.44.19) has none of them — it carries
+      // `changeTracker`, `_isModified`, `pendingWarnings`, `initialMode`,
+      // `activeMode`, `shareId`, and getters for `activeState`/`initialState`.
+      // So `extra` is null, the guard below is false, and nothing is written HERE.
+      //
+      // BUT THE IDENTITY IS STILL PERSISTED, by the loadGraphData wrapper stamping
+      // `graphData.extra` and by `rootGraph.extra` on the live canvas — which is
+      // what a save serializes. The promise above is kept by that path, not by
+      // this one. An earlier version of this comment said neither guarantee held;
+      // that was wrong, and the difference is exactly why #945 has no user-visible
+      // symptom (codex).
+      //
+      // The chain was never observed working: it arrived in 525116a (#101) as a
+      // fallback "used by older builds" — a guess about frontends nobody had in
+      // hand — and no fixture in this repo has ever given a workflow OBJECT an
+      // `extra` to exercise it.
+      //
+      // Left in place deliberately rather than deleted or repointed:
+      // `activeState.extra` is the field that actually holds the uuid, but
+      // writing there MOVES where identity persists (it stops reaching
+      // `app.graph.extra`), which is a real behaviour change and was reverted
+      // once already for exactly that reason. The carrier decision belongs with
+      // whoever owns #945; this comment exists so the next reader is not told a
+      // guarantee that does not happen.
       try {
         const extra = workflowOwnedExtra(wf);
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
@@ -2167,6 +2475,44 @@ function isCanonicalWorkflowInstanceUuid(value) {
 // a real workflow. Accept only an already-established UUID on a persisted,
 // canonical workflow. A tmp: routing handle is intentionally not durable enough
 // to publish as a command-fence refresh source.
+/**
+ * #941 — the identity to report for the workflow a save just produced.
+ *
+ * A Save-As activates a brand-new object that nothing has established an identity for, so
+ * `establishedWorkflowReplyIdentity` — a deliberate pure read (#716) — found none and the
+ * reply said "unavailable", while the very next command was refused BY that identity,
+ * because the fence's own read mints. The panel knew the value and would not publish it,
+ * and a caller fenced to the pre-save workflow had nothing to recover with.
+ *
+ * Minting here does not weaken #716. That rule stops a READ from deciding what the canvas
+ * is. This runs inside `workflow_save`, a mutation whose job is to change which canvas is
+ * active, and it establishes for the object the SAVE ITSELF produced — never for whatever
+ * happens to be active afterwards, which a tab switch during the save's awaits could make
+ * a different workflow entirely (codex).
+ */
+function saveProducedIdentity(savedRecord, savedAs) {
+  try {
+    if (!savedRecord || typeof savedRecord !== "object") return null;
+    if (
+      !shouldEstablishIdentityAfterSave({
+        savedAs,
+        alreadyEstablished: Boolean(establishedWorkflowReplyIdentity(savedRecord)),
+      })
+    ) {
+      return establishedWorkflowReplyIdentity(savedRecord);
+    }
+    // The minting read — records into the live-object and owner maps, which is exactly
+    // what establishedWorkflowReplyIdentity then finds.
+    workflowStableUuid(savedRecord);
+    return establishedWorkflowReplyIdentity(savedRecord);
+  } catch {
+    // A reply that cannot report identity is the bug being fixed, not a reason to fail a
+    // save that already wrote the file. saveReplyIdentity(null) still reports ABSENCE
+    // explicitly, so the caller is told rather than left to assume continuity.
+    return null;
+  }
+}
+
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
   // THE ESTABLISHMENT TEST, and the only one that matters here (#716): the uuid
@@ -2213,7 +2559,7 @@ function establishedWorkflowReplyIdentity(wf) {
   return routingKey ? { routingKey, uuid } : null;
 }
 
-function activeWorkflowUuidForOpenReply(target) {
+function activeWorkflowUuidForOpenReply(target, activeSnapshot) {
   // Do not accept a workflow-service reference captured before workflow_open's
   // awaits: a reconnect can replace/rebind that service while the old instance
   // still reports `target` as active. Read the panel's CURRENT binding at reply
@@ -2499,6 +2845,14 @@ function lsSet(key, val) {
 // (never plaintext in comfy.settings.json) — their settings are BUTTONS that drive
 // the existing secure request_secret flow into the orchestrator's secure store.
 // ---------------------------------------------------------------------------
+// #758 — the panel version this browser last ANNOUNCED to the user.
+//
+// localStorage, not a ComfyUI setting, for two reasons. It is genuinely per-browser —
+// "what this browser has already been told" — and a ComfyUI setting is per-user across
+// devices, which would silence the notice on a second machine that has not seen it. And
+// a setting has to be REGISTERED to be readable, which would put a bookkeeping value in
+// the settings UI where a user could only break it.
+const LAST_SEEN_VERSION_KEY = "comfyui-mcp.panel.lastSeenVersion";
 const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
 // Default model/effort are now PER-BACKEND (one independent setting each per
 // provider), so the Claude group never resets/repopulates the Codex group on a
@@ -2574,6 +2928,13 @@ const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
+// #753 — the sidebar had no way to make its text bigger, and the obvious user
+// workaround does not work: `.cmcp-root` sets `font-size: 0.8125rem`, but the
+// inner rules are `rem`, which resolve against the PAGE root rather than the
+// panel. Overriding `.cmcp-root { font-size }` therefore scales only the few
+// elements that inherit, and every rem-sized label stays exactly as it was.
+// A scale transform is the one lever that moves the whole panel at once.
+const SETTING_UI_SCALE = "comfyui-mcp.uiScale";
 const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 // Mobile app (beta) feature flag: gates the header "Remote control" QR button and
 // surfaces the tester-channel download links in Settings. The links are the
@@ -2763,6 +3124,43 @@ function effortComboOptions(backend) {
     { value: "", text: "Model default" },
     ...scale.map((id) => ({ value: id, text: effortMeta(id).label })),
   ];
+}
+
+/**
+ * Apply the UI scale to every mounted panel root.
+ *
+ * `zoom` rather than `transform: scale()`: transform does not affect LAYOUT, so a
+ * scaled panel would keep its original box and overflow or clip. zoom scales the
+ * box too, which is what makes the sidebar's own scrolling keep working.
+ *
+ * NO HEIGHT COMPENSATION IS NEEDED, and adding one is actively wrong. The
+ * reporter flagged that a zoomed element MIGHT overflow a percentage-height
+ * parent; measured in Chrome, it does not — `height: 100%` inside a zoomed
+ * element already resolves against the parent in the zoomed coordinate space.
+ * The `calc(100% / scale)` that shipped first applied that correction a SECOND
+ * time and left the panel at 1/scale of its slot.
+ * `target` — the specific root to style, for a panel that has been BUILT but not
+ * yet ATTACHED (codex). `buildPanel` creates its root with `createElement` and
+ * mounts it later, so a document query at that moment finds every panel except
+ * the one being built: the saved scale would then apply to nothing until the user
+ * touched the slider, i.e. the setting would look like it forgot itself on every
+ * reload — exactly the bug the mount-time call exists to prevent. Omitted, it
+ * styles every mounted root, which is what the settings handler wants.
+ */
+function applyPanelUiScale(raw, target) {
+  const scale = panelUiScaleFraction(raw);
+  try {
+    const roots = target ? [target] : document.querySelectorAll(".cmcp-root");
+    for (const root of roots) {
+      // 1 is the default everywhere; clearing it keeps the DOM free of a no-op
+      // zoom that would otherwise show up in every inspection of the panel.
+      if (scale === 1) root.style.removeProperty("zoom");
+      else root.style.zoom = String(scale);
+    }
+  } catch {
+    // A frontend that refuses the style write keeps the default size; a panel
+    // that is merely not scaled is still a usable panel.
+  }
 }
 
 function getSetting(id) {
@@ -3090,6 +3488,44 @@ function panelSettingsList() {
       // A link row — "📖 Read the docs". Sits ABOVE Discord deliberately: asking a
       // human was previously the ONLY exit from the panel, so the community carried
       // questions the docs already answered (#111).
+      // #758 — an in-product route to the release notes, not "go read a file on GitHub".
+      id: "comfyui-mcp.whatsNew",
+      name: "What's new",
+      category: cat("About", "What's new"),
+      sortOrder: 199,
+      tooltip:
+        "Show recent changes in the panel transcript — what shipped in this version and the ones before it. " +
+        "The panel can update from the Comfy Registry without you asking, so this is where to check when " +
+        "something behaves differently than you remember.",
+      type: () => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = `📋 Show what's new in ${PANEL_VERSION}`;
+        b.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:0.8rem;white-space:nowrap;";
+        b.addEventListener("click", () => {
+          // Open the panel first — painting into a transcript the user cannot see is the
+          // same failure as not painting at all. openSidebarTab() is the same activate the
+          // Model Explorer "Ask AI" path uses, including its retry for a tab store that is
+          // not ready on the first call.
+          try {
+            openSidebarTab();
+          } catch {
+            /* the notes still land in the transcript for whenever they do open it */
+          }
+          setTimeout(() => {
+            try {
+              openSidebarTab();
+            } catch {}
+            panelHooks.showWhatsNew?.();
+          }, 140);
+        });
+        return b;
+      },
+    },
+    {
       id: "comfyui-mcp.readDocs",
       name: "Documentation",
       category: cat("About", "Documentation"),
@@ -3162,6 +3598,10 @@ function panelSettingsList() {
             `backend: ${(getSetting(SETTING_BACKEND) ?? "claude")}`,
             `comfyui: ${window.app?.frontendVersion ?? window.app?.extensionManager?.appVersion ?? "unknown"}`,
             `page: ${location.origin}`,
+            // #584 — the one fact five rounds of fixes were guessing at. A user
+            // pasting diagnostics into an issue now brings the measurement with
+            // them instead of being asked to open DevTools afterwards.
+            describeModuleCache(readModuleCacheSummary()),
             `ua: ${navigator.userAgent}`,
             `time: ${new Date().toISOString()}`,
           ].join("\n");
@@ -3356,6 +3796,28 @@ function panelSettingsList() {
         );
         wrap.append(note, row);
         return wrap;
+      },
+    },
+    {
+      id: SETTING_UI_SCALE,
+      name: "Panel UI scale (%)",
+      category: cat("General", "Panel UI scale (%)"),
+      sortOrder: 143,
+      tooltip:
+        "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
+        "to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to " +
+        "every open panel. Note that overriding `.cmcp-root { font-size }` in a user stylesheet does NOT " +
+        "work: the panel's inner sizes are `rem`, which resolve against the page root rather than the " +
+        "panel, so most text ignores it. This setting is the supported way to scale the panel.",
+      type: "slider",
+      attrs: { min: PANEL_UI_SCALE_MIN, max: PANEL_UI_SCALE_MAX, step: 5 },
+      defaultValue: 100,
+      onChange: (value) => {
+        // NOT gated on settingsArmed, unlike the settings that seed the panel's
+        // runtime: this one writes nothing but CSS, has no default to re-seed,
+        // and a user dragging the slider expects the panel to move while they
+        // drag — including before the panel has finished arming.
+        applyPanelUiScale(value);
       },
     },
     {
@@ -3822,7 +4284,21 @@ async function programmaticSave(name) {
       outcome.original_on_disk = status === "present" ? true : "unverified";
     }
   }
-  return { name: saved || getWorkflowTitle(), ...outcome };
+  // #941 — establish the identity of the object the SAVE PRODUCED, and report THAT.
+  //
+  // Not `activeWorkflowRef()` after the await (codex): a tab switch during the save's
+  // internal awaits would mint for whichever canvas happens to be active, and the reply
+  // would then pair `workflow: "<copy>"` with a uuid describing a DIFFERENT canvas. An
+  // agent re-fencing on it would authorize graph writes against that other workflow. Same
+  // transaction-boundary mistake as #847, one iteration later.
+  //
+  // `details.savedRecord` is the save's own authoritative output — the same value
+  // shouldCarryIdentityAcrossSaveSwap is threaded with above — so name, routing key and
+  // uuid all come from one snapshot.
+  // Hand back the RECORD, and let the caller resolve identity from it. `activatedRecord` is
+  // the Save-As copy the adapter PROVED active; `savedRecord` covers the first-save path.
+  // Either way it is the save transaction's own output, never a later active-canvas read.
+  return { name: saved || getWorkflowTitle(), producedRecord: details?.activatedRecord || details?.savedRecord || null, ...outcome };
 }
 
 /** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
@@ -4008,14 +4484,53 @@ async function groundUnsavedWorkflow() {
     // probe, so we can't authorize on tab A and overwrite tab B), single-flighted so
     // concurrent turns can't create duplicate copies. Only a provably never-persisted
     // source is saved; anything unprovable is left for a manual Ctrl+S.
-    return await groundActiveWorkflow(app?.extensionManager?.workflow, {
+    const saved = await groundActiveWorkflow(app?.extensionManager?.workflow, {
       existsOnDisk: workflowExistsOnDisk,
       autoWorkflowName,
       reconcileSavedCopy: reconcileSavedWorkflowCopy,
       // #708 — grounding is the save that CREATES the "Untitled …" file, so it is the
       // one that must not write a canvas belonging to a different workflow into it.
       canvasBinding: describeLiveCanvasBinding,
+      // #847 — both halves run INSIDE the serialized grounding, against the workflow that
+      // transaction is saving. The probe is synchronous with reading it, and the path comes
+      // from the save's own result, so neither can be about a tab the user switched to.
+      // ROUTE ID ONLY, and that restriction is the fix for a regression I caused:
+      // `workflowStorageKey()` is NOT a read. It runs the full identity resolution, which
+      // mints uuids and writes path aliases — so probing it here performed identity work at
+      // a point in the save where it had never happened, and conversation-persistence:350
+      // ("clear all … preserves workflow identity") went red. `workflowTabId` returns the
+      // tmp: id this tab already routes on, and threads carry it as `workflowRouteKey`,
+      // which is what the filter matches. Enough to bridge, without touching identity.
+      // A PURE READ. Neither `workflowStorageKey()` nor `workflowTabId()` is one:
+      // the first runs full identity resolution (minting uuids, writing path aliases) and
+      // the second mints a tmp: id. Calling either here performed identity work at a point
+      // in the save where it had never happened, and turned conversation-persistence:350
+      // ("clear all … preserves workflow identity") red. The tmp: id this tab already
+      // routes on is enough — threads carry it as `workflowRouteKey`, which is what the
+      // filter matches — and if none exists yet there is nothing to bridge anyway.
+      identityProbe: (wf) => ({ routeId: (wf ? _tempWorkflowInstanceIds.get(wf) : null) ?? null }),
+      onGrounded: ({ savedName, identity }) => {
+        // One implementation, shared with the tests (codex) — see groundedWorkflowPath.
+        const path = groundedWorkflowPath(savedName);
+        if (!path) return;
+        // Prune BEFORE recording, never after: the path this save just created is not in
+        // the workflow store's list yet, so pruning afterwards deletes the very entry it
+        // just wrote. That is not theoretical — it broke conversation-persistence:507 the
+        // first time round.
+        const pruned = pruneGroundingIdentities(_preGroundingIdentities, {
+          knownPaths: knownWorkflowPaths(),
+        });
+        const recorded = rememberPreGroundingIdentity(_preGroundingIdentities, {
+          path,
+          storageKey: identity?.storageKey,
+          routeId: identity?.routeId,
+        });
+        // EITHER change has to be persisted. Persisting only on `recorded` left a prune's
+        // deletions in memory alone, so they came back from localStorage on reload (codex).
+        if (pruned || recorded) persistPreGroundingIdentities();
+      },
     });
+    return saved;
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
   }
@@ -4193,6 +4708,28 @@ let managerDialectCache = null;
  *  from a dialect-routed call (reProbeManagerDialect below). */
 function invalidateManagerDialectCache() {
   managerDialectCache = null;
+}
+
+/**
+ * Record a dialect the LIVE backend has DEMONSTRATED by completing an enqueue on it
+ * (#367).
+ *
+ * Detection picks `v2` vs `v2-batch` from `/v2/manager/is_legacy_manager_ui`, and a
+ * build that 405s `queue/task` without reporting a legacy UI is classified `v2` — so
+ * every later call re-POSTs the same refused route.
+ *
+ * A 405 on that route is only a CANDIDATE signal, never the proof (codex). It says the
+ * task route refuses this method; it says nothing about whether `batch` is served, and
+ * a generic frontend catchall can refuse both. Caching on the 405 would leave a backend
+ * that refuses BOTH — and updates fine on legacy — pinned to a route it will never
+ * accept, with nothing to clear it: the heal runs on a route-MISSING verdict, not a
+ * method rejection.
+ *
+ * So this is called only where an enqueue actually landed. It does not invalidate: the
+ * answer is now known, and clearing would just re-run the probe that got it wrong.
+ */
+function noteManagerDialectDowngrade(dialect) {
+  managerDialectCache = dialect;
 }
 
 /** #605 — drop the cached dialect and re-probe the LIVE backend once. Returns
@@ -4412,20 +4949,6 @@ async function managerQueueControl(call, route, { signal } = {}) {
     // (not ComfyUI's frontend catchall, which only serves UNREGISTERED GETs).
     if (!isMethodNotAllowed(err)) throw err;
     await call(route, { signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]) });
-  }
-}
-
-/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
- *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
- *  silent success on a failed op is exactly the #184 no-op bug. */
-function assertBatchOk(res, id, op) {
-  const failed = Array.isArray(res?.failed) ? res.failed : [];
-  if (failed.length && (id === undefined || failed.includes(id))) {
-    throw new Error(
-      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
-        "(check the ComfyUI server log for the underlying error — security_level " +
-        "gating is a common cause). The pack was NOT installed.",
-    );
   }
 }
 
@@ -5116,7 +5639,27 @@ function assertGraphBoundToActiveWorkflow(
   // decisions below need it: the stale-tag rebind and the unstamped-root seal ask
   // the same question (is this canvas provably the active workflow's?) and must not
   // answer it differently.
+  // #833 — ComfyUI's OWN mid-load flag, not a proxy for it. A canvas mid-load reads
+  // genuinely empty at that instant and is about to be populated, which is the only
+  // FALSE-EMPTY reading a both-sides-empty proof cannot exclude by itself. Unreadable
+  // ⇒ true, so an unknown frontend proves nothing and the empty gate stays closed.
+  let graphLoading = true;
+  try {
+    const flag = activeWorkflow?.changeTracker?.constructor?.isLoadingGraph;
+    graphLoading = typeof flag === "boolean" ? flag : true;
+  } catch {
+    graphLoading = true;
+  }
   let sealProofExclusive = false;
+  // #833 — the EMPTY case needs its OWN exclusivity, because the rule below inverts
+  // here. Skipping a DIRTY twin is right for a CONTENT match (a lagging tracker cannot
+  // prove its state equals the root), but an empty root needs no proof to match a blank
+  // tab: a dirty blank twin is exactly as plausible an owner as the active tab. Sealing
+  // on the content rule would stamp the active identity onto a root that may be the
+  // other blank tab's, wedging THAT tab on the foreign tag the moment the user switched
+  // to it — this bug's mirror image, and the #349 tag protections rightly refuse to
+  // re-stamp it back. So: every OTHER open workflow must be READABLY non-empty.
+  // Unreadable or absent enumeration proves nothing and blocks the seal.
   try {
     const others = app?.extensionManager?.workflow?.openWorkflows;
     if (Array.isArray(others)) {
@@ -5158,6 +5701,11 @@ function assertGraphBoundToActiveWorkflow(
     // Anything unprovable fails closed, and the #389 case (empty root while
     // the workflow reports N>0 nodes) still fires via the baseline read
     // guard below.
+    // #833 deliberately does NOT relax this. A DIRTY blank tab cannot clear the clean-tab
+    // proof, so a blank canvas still cannot re-stamp a tag here — extending it was tried
+    // and withdrawn: it broke all 19 fence-protection tests, because re-stamping a tag on
+    // an empty root is a claim about WHOSE canvas it is, which emptiness cannot support.
+    // The #833 read relaxation is confined to `graphEmptyBindingUnproven`.
     const staleTagOnEmptyCanvas =
       graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
     // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
@@ -5231,6 +5779,7 @@ function assertGraphBoundToActiveWorkflow(
     includeBaselineReadGuard,
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
+    graphLoading,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
@@ -6897,6 +7446,22 @@ function resolveNode(graph, nodeId) {
   // instead of only that it is not here. Diagnostic-only: runs on the failure path,
   // never throws, and degrades to the original message when the root is unreadable.
   if (!node) {
+    // artokun/comfyui-mcp#1294 — ASK "WHAT IS IT" BEFORE ANSWERING "IT IS NOT HERE".
+    // panel_query_graph hands out `rails.<side>.rail_node_id` (e.g. -20). Fed back
+    // to a write, it used to be reported as an id from another workflow or a removed
+    // node, with a remedy of re-reading the surface that produced it. The id is
+    // neither missing nor foreign — it is a boundary rail, and `resolveRailNode`
+    // already resolves exactly this form for move_node (#302). Its real-node
+    // collision guard is what makes this safe here: a rail reference is only
+    // recognised once getNodeById has already declined the id.
+    let rail = null;
+    try {
+      rail = resolveRailNode(graph, nodeId);
+    } catch {
+      rail = null; // a diagnostic must never replace the failure with its own
+    }
+    if (rail) throw new Error(describeRailNodeTarget(nodeId, rail.rail));
+
     let rootGraph = null;
     let viewingRoot = true;
     try {
@@ -7316,6 +7881,7 @@ async function awaitRequiredCustomWidgetRegistration(
   currentDef,
   classType,
   widenSocketProof,
+  liveNodeOfClass,
 ) {
   const startedAt = Date.now();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
@@ -7348,6 +7914,29 @@ async function awaitRequiredCustomWidgetRegistration(
     unavailable = check();
   }
   if (!unavailable.length) return;
+  // #636 — LAST, and only once the wait has already failed: ask what this ComfyUI
+  // actually DID. Everything above reasons about what SHOULD happen, and on a backend
+  // where nothing outputs the datatype a socket-shaped input has no proof and fails
+  // closed forever — no retry can change it, because every input to that decision is a
+  // snapshot. The reporter had a WORKING node of this very class on the canvas while
+  // being told the class could not be built.
+  //
+  // Placed after the poll on purpose: a genuinely still-loading widget must get its full
+  // 5 s first, so this can only ever convert a permanent refusal into a success, never
+  // shorten a legitimate wait.
+  if (typeof liveNodeOfClass === "function") {
+    let live = null;
+    try {
+      live = liveNodeOfClass(classType);
+    } catch {
+      live = null; // an unreadable canvas explains nothing; fall through and refuse
+    }
+    if (live) {
+      const stillUnexplained = unavailableEntriesLiveNodeCannotExplain(unavailable, live);
+      if (!stillUnexplained.length) return;
+      unavailable = stillUnexplained;
+    }
+  }
   // #695: the poll is the ONLY thing here a retry can change (nodeData, currentDef and
   // knownSocketTypes are all snapshots), so a type that is structurally a socket must be
   // waived by the check rather than waited out — and whatever is left after the wait gets
@@ -7392,6 +7981,60 @@ function revalidateGraphMutationContext(captured) {
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
+/**
+ * Repaint the open Chat-history list, if one is open (#847).
+ *
+ * The list paints once when the pane opens. A route-stamp migration lands on the
+ * 600 ms workflow poll, so a pane opened just before a first save shows the
+ * pre-migration answer and never corrects itself — the rows do not change, so
+ * Playwright's auto-retry cannot save it either, and neither can a user staring
+ * at it.
+ *
+ * Reassigned on every render of the pane rather than nulled on close: the pane is
+ * a popover that is re-rendered in place (`histPop.textContent = ""`) and has no
+ * teardown to hang a null on. A handle left over from a closed popover repaints a
+ * hidden node, which costs nothing and shows nobody anything — and it closes over
+ * the same `threads` BINDING, not a copy, so it cannot paint a stale list.
+ */
+let repaintHistoryList = null;
+
+/**
+ * #851 — WHICH ComfyUI a reboot reply is about.
+ *
+ * The reply named the ROUTE (`/v2/manager/reboot`) and never the HOST, so a caller
+ * could not tell which server had just gone down. That is not cosmetic: when the
+ * panel is driving a ComfyUI that is NOT the orchestrator's headless COMFYUI_URL, a
+ * confirmation timeout sends the user to `restart_comfyui`, which targets the OTHER
+ * machine and answers "No ComfyUI process found on port 8188" — while the panel had
+ * been operating happily on the live one all along. Nothing in any reply revealed the
+ * two were different.
+ *
+ * The panel is the one component that knows this for certain: it runs INSIDE the
+ * ComfyUI it reboots. `comfyuiUrlForAgent()` is deliberately the SAME value handed to
+ * the orchestrator in `hello`, so the identity a caller compares against its own
+ * target cannot drift from the one it was told to target.
+ *
+ * A plain function, NOT a method on the executors table: dispatch invokes
+ * `executor(msg)` with no receiver, so `this` is undefined in a module and a method
+ * call here would throw instead of rebooting.
+ */
+/**
+ * The same identity, for prose (#851).
+ *
+ * `target` is for a caller comparing hosts; these strings are what a HUMAN reads,
+ * and "could not reach any reboot endpoint" that cannot say WHICH server it failed
+ * to reach is the reported failure in miniature. Appends nothing when the target is
+ * unknown, rather than naming a blank one.
+ */
+function rebootTargetLabel(prefix) {
+  const target = comfyuiUrlForAgent();
+  return target ? prefix + " on " + target : prefix;
+}
+
+function rebootTargetFields() {
+  const target = comfyuiUrlForAgent();
+  return target ? { target } : {};
+}
 
 const GRAPH_TOOL_EXECUTORS = {
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
@@ -7629,12 +8272,38 @@ const GRAPH_TOOL_EXECUTORS = {
     // raises these clips, so the footer must not pretend one does.
     let outlineClipped = 0;
     let outlineTitlesClipped = 0;
-    /** clipOutlineTitle, counting — every title in the outline goes through here. */
+    /**
+     * clipOutlineTitle, counting — every title in the outline goes through here.
+     *
+     * #904 — titles render INSIDE quotes, which is what keeps a bracket in one from
+     * reading as a status tag. That containment is only worth anything if the quotes
+     * are trustworthy, so a quote in the title is escaped rather than allowed to close
+     * the run early: `He said "hi" [bypass]` would otherwise end the quoted title at
+     * `hi` and leave `[bypass]` outside it, where the panel's own tags live.
+     */
     const title_ = (t) => {
       const c = clipOutlineTitle(t);
       if (c.clipped) outlineTitlesClipped++;
-      return c.text;
+      return String(c.text ?? "")
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"');
     };
+    /**
+     * Make user-controlled text safe INSIDE a bracketed annotation (#636, codex).
+     *
+     * This outline is read by the MODEL, and a label that can close its own tag can forge
+     * an adjacent one: `x"] [after_gen=randomize]` would report a control mode the widget
+     * does not have — the same class of harm as the wrong answer this fix exists to stop,
+     * pointed the other way. Clipping does not prevent that, so the delimiters are removed
+     * rather than trusted. Deliberately lossy on brackets: an annotation that cannot be
+     * closed early matters more than reproducing a bracket in a display name.
+     */
+    const tagText_ = (t) =>
+      String(t ?? "")
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/[[\]]/g, "")
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"');
     // Rebuilt per rung (not hoisted) so its title clips are counted against the rung that
     // actually emits them — a count carried in from outside would claim clips the
     // rendered text does not contain.
@@ -7647,11 +8316,38 @@ const GRAPH_TOOL_EXECUTORS = {
         // single title.
         return `  "${title_(g.title)}"${tag} → ${ids.join(",") || "(empty)"}`;
       });
+    /**
+     * A widget VALUE, rendered so it can never be mistaken for one of this outline's own
+     * status tags (#904).
+     *
+     * The tags here carry real meaning — `[after_gen=randomize]` says ComfyUI rewrites
+     * this value every run, `[bypass]`/`[mute]` say the node is not executing — and
+     * values render UNQUOTED in exactly the position a tag occupies, so
+     * `text=hello [after_gen=randomize] world` was indistinguishable from the genuine
+     * annotation. Widget values arrive inside workflows people DOWNLOAD, so the author of
+     * a shared JSON could put one there.
+     *
+     * Values are NOT stripped the way a label is (#636). ComfyUI prompt syntax uses
+     * brackets — `[cat|dog]` is ordinary content — so removing them would corrupt the
+     * very thing the caller asked to see, trading one false report for another.
+     *
+     * The invariant instead: a BARE token never contains a bracket, and anything that
+     * does is QUOTED. So a tag outside quotes is always the panel's own, content is
+     * preserved exactly, and only the rare bracketed value pays the two quote characters.
+     *
+     * The quoting decision is made on the POST-clip text, so a clip that removes the
+     * bracket leaves nothing to impersonate a tag and one that lands mid-bracket leaves a
+     * quoted partial — never a bare token. Escaping runs after the 60-char budget, so a
+     * quote/backslash-dense value can render slightly longer than 60; that costs a few
+     * characters against max_chars and cannot reintroduce a forgeable tag (codex).
+     */
     const fmtVal = (v) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
-      if (s.length <= 60) return s;
-      outlineClipped++;
-      return s.slice(0, 57) + "…";
+      const clipped = s.length <= 60 ? s : (outlineClipped++, s.slice(0, 57) + "…");
+      if (!/[[\]]/.test(clipped)) return clipped;
+      // Escape backslashes first, then quotes, so the escape introduced for a quote is
+      // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
+      return `"${clipped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     };
     const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
@@ -7688,14 +8384,28 @@ const GRAPH_TOOL_EXECUTORS = {
           );
           // #607: flag widgets overridden by a link so the stored value isn't read as effective.
           const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+          // #636 — the DISPLAY name a user renamed this widget to. graph_query already
+          // reports these (`widget_labels`), but the outline did not, and the outline is
+          // the reader an agent reaches for first: the reporter was told their renames
+          // "had not stuck" while the canvas plainly showed them, and only a screenshot
+          // settled it. Renamed widgets ONLY, so an unrenamed graph's outline is
+          // byte-identical to before and costs nothing against max_chars.
+          const renamed = widgetLabelMap(n);
           widgets = (n.widgets ?? [])
             .filter((w) => w && typeof w.name === "string")
             .map((w) => {
               // At "no_values" the widget NAMES still tell an agent what is configurable;
               // the VALUES are the bulk of the bytes, so they go first.
               const base = level === "full" ? `${w.name}=${fmtVal(w.value)}` : w.name;
+              // The NAME stays the addressable key and stays first — panel_set_widget
+              // takes the name, not the label — with the label annotated beside it in the
+              // same bracket idiom as [after_gen=…] and [bypass].
+              // ESCAPED, not merely clipped (codex): `title_` bounds the SIZE, `tagText_`
+              // stops a user-controlled label from closing this tag and forging the next.
+              const label = renamed[w.name];
+              const withLabel = label ? `${base} [renamed "${tagText_(title_(label))}"]` : base;
               const mode = cagMode.get(w.name);
-              const withMode = mode ? `${base} [after_gen=${mode}]` : base;
+              const withMode = mode ? `${withLabel} [after_gen=${mode}]` : withLabel;
               return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
             })
             .join(" ");
@@ -8702,13 +9412,26 @@ const GRAPH_TOOL_EXECUTORS = {
     // createNode would build the OLD shape — a new link input would not even
     // get a slot and the node could never validate. Refuse before creating
     // anything, with the remedy that actually updates the schema.
+    //
+    // #852 — and that remedy is panel_refresh_nodes, not a tab reload. This text
+    // named the reload alone, so a user whose loader options had merely drifted
+    // (a model file moved between folders) was told to throw away their canvas
+    // state for a condition the panel can clear in place: refresh_nodes re-fetches
+    // /object_info and calls registerNodesFromDefs, which is precisely what updates
+    // the nodeData this check reads. Same class of defect as #663 — a refusal that
+    // sends the caller to the wrong recovery costs more than the refusal itself.
     const drifted = driftedRequiredInputNames(currentDef, nodeData);
     if (drifted.length) {
       throw new Error(
         `"${class_type}" required input${drifted.length === 1 ? "" : "s"} ` +
           `${drifted.map((name) => `"${name}"`).join(", ")} ${drifted.length === 1 ? "was" : "were"} ` +
-          "added or retyped since this page loaded its node schema. Reload the ComfyUI tab so " +
-          "the frontend picks up the updated node definition, then retry.",
+          "added or retyped since this page loaded its node schema, so creating it now would " +
+          "build the OLD shape. Call panel_refresh_nodes and retry — it re-fetches /object_info " +
+          "and re-registers the class in place, which is exactly what this refusal is waiting " +
+          "for, and it costs you no canvas state. Reloading the ComfyUI tab also works and is " +
+          "the fallback if the refresh reports it did not complete. NOTE: the refresh updates " +
+          "the CLASS, so the node you add next is correct; nodes ALREADY on the canvas keep the " +
+          "shape they were created with.",
       );
     }
     // Socket proof comes from the SAME fresh defs — NOT the LiteGraph
@@ -8749,6 +9472,19 @@ const GRAPH_TOOL_EXECUTORS = {
       currentDef,
       class_type,
       widenSocketProof,
+      // #636 — the canvas as evidence of last resort. A node of this class that ComfyUI
+      // ALREADY built here shows how each input actually materialised, which no amount of
+      // schema reasoning can establish on a backend that never outputs the datatype.
+      // Read lazily: only the refusal path calls it, so a healthy add pays nothing.
+      (cls) => {
+        try {
+          const graph = getGraphCtx()?.graph ?? app?.graph ?? null;
+          const nodes = graph?._nodes ?? graph?.nodes ?? [];
+          return nodes.find((n) => n?.type === cls) ?? null;
+        } catch {
+          return null;
+        }
+      },
     );
     const node = LG.createNode(class_type);
     if (!node) {
@@ -9423,7 +10159,15 @@ const GRAPH_TOOL_EXECUTORS = {
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+          typeof api?.getNodeDefs === "function"
+            ? // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
+              // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
+              // Still the WHOLE payload, so no question this fence asks changes scope —
+              // only how often it is re-fetched. Dropped by anything that knows the schema
+              // moved. See lib/object-info-cache.js for why the per-class route #767 used
+              // for add_node is NOT safe here.
+              await objectInfoCache.read(() => api.getNodeDefs())
+            : null,
         ),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
@@ -10103,6 +10847,31 @@ const GRAPH_TOOL_EXECUTORS = {
     switch (action) {
       case "center_on_node": {
         const node = resolveNode(graph, node_id);
+        // #754 — `scale` was accepted by this tool and silently ignored on this branch,
+        // so "centre on node 42 at 1.5x" centred at whatever zoom happened to be set.
+        //
+        // Applied BEFORE centring. The fallback math below divides by `ds.scale`, so
+        // zooming afterwards would slide the node straight back off-centre — the #401
+        // hazard, one branch over.
+        //
+        // For the `canvas.centerOnNode` path the ordering is chosen on the same
+        // principle but WITHOUT a claim about litegraph's internals: whether that
+        // implementation reads ds.scale is not verifiable from this repo (the frontend
+        // bundle is not vendored here). Zoom-first is correct either way — if it reads
+        // the scale, the centring accounts for the new zoom; if it does not, setting the
+        // scale first is harmless. Asserting which would be stating an unverified
+        // implementation detail as fact.
+        //
+        // The #401 centre-preserving correction is deliberately NOT used here. It exists
+        // to hold the CURRENT viewport centre across a zoom; this action is about to
+        // choose a new centre, so preserving the old one is wasted work that the centring
+        // immediately overwrites. Same validated range as action:"zoom", so one tool does
+        // not accept a scale its sibling refuses.
+        if (scale !== undefined) {
+          const s = Number(scale);
+          if (!(s > 0.05 && s <= 4)) throw new Error("scale must be in (0.05, 4]");
+          ds.scale = s;
+        }
         if (typeof canvas.centerOnNode === "function") {
           canvas.centerOnNode(node);
         } else {
@@ -10984,7 +11753,8 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_save({ name } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
-    const { name: workflow, ...outcome } = await programmaticSave(name);
+    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
+    const replyIdentity = saveProducedIdentity(producedRecord, !!outcome.saved_as);
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
     //
@@ -10992,15 +11762,24 @@ const GRAPH_TOOL_EXECUTORS = {
     // DIFFERENT workflow active, which fences the very session that asked for the
     // save; without an identity in this reply the caller has nothing to re-fence
     // to, and every call that could tell it is itself refused.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
+    // NO active-canvas fallback for a Save-As (codex). If the produced record yielded no
+    // identity, absence must STAY absence: falling back to whatever is active now can pair
+    // this reply’s `workflow: "<copy>"` with a DIFFERENT canvas’s uuid, and an agent
+    // re-fencing on that would authorize graph writes against the wrong workflow — the
+    // exact misbinding this fix exists to prevent. saveReplyIdentity(null) reports
+    // `workflow_identity_unavailable` explicitly, so the caller is told rather than misled.
+    // An in-place save does not change which workflow is active, so its pre-existing #747
+    // fallback strands nobody and stays.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const { name: workflow, ...outcome } = await programmaticSave(name);
+    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: true }) };
+    const replyIdentity = saveProducedIdentity(producedRecord, true);
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: true }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
@@ -11506,6 +12285,39 @@ const GRAPH_TOOL_EXECUTORS = {
       // LiteGraph canvas flag, not a workflow-service member.
         beginWorkflowReloadStep(reloadGuardToken);
         try {
+          // #874 — CAPTURE THE LIVE CANVAS, not the last thing a user touched.
+          //
+          // This repaint reloads the graph from `activeState`, and ComfyUI's
+          // ChangeTracker captures on USER INPUT events only. So every value a NODE
+          // wrote without user input — an ImpactWildcardEncode populate, a
+          // control_after_generate roll, a subgraph proxy the frontend filled in — is
+          // absent from that snapshot, and reloading it REVERTED them. Silently:
+          // nothing errored and the graph looked right afterwards. Measured in a live
+          // browser: live width 775, snapshot [768, 768, 1].
+          //
+          // `checkState()` is the tracker's own capture — the same call the command
+          // dispatch already makes after every successful command, for exactly this
+          // reason. Taking it here makes the snapshot mean what this repaint has always
+          // assumed it means.
+          //
+          // It DIFFS FIRST, so an unchanged canvas stays a no-op and no undo entry
+          // appears. Where it does find a change it records one, which is the honest
+          // outcome rather than a side effect: the change really happened, and until
+          // now it was silently discarded instead of being undoable.
+          //
+          // Best-effort. A frontend without `checkState` behaves exactly as before —
+          // this must never be the thing that fails an open.
+          try {
+            // AWAITED (codex). A frontend whose tracker captures asynchronously would
+            // otherwise have `activeState` read before the capture landed — the silent
+            // revert intact, and a late rejection escaping this try/catch to become an
+            // unhandled rejection. Awaiting a non-promise is free, so the synchronous
+            // trackers this ships against are unaffected.
+            await target.changeTracker?.checkState?.();
+          } catch {
+            // A tracker that refuses to capture leaves the stale snapshot in place,
+            // which is today's behaviour, not a new failure.
+          }
           // `activeWorkflowNodeCount` deliberately accepts both tracker-owned and flat
           // activeState shapes. Use that SAME state source here: otherwise a frontend
           // that reports the active workflow's 15 nodes through flat `target.activeState`
@@ -11875,10 +12687,46 @@ const GRAPH_TOOL_EXECUTORS = {
     // after another tab wins the active slot during any await above; publishing
     // its UUID then would let the MCP stamp a command for a different canvas.
     // Omission is deliberate: the MCP keeps its existing fence fail-closed.
-    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target);
+    // ONE observation, shared by the uuid decision and the binding report (codex).
+    // Reading the active workflow twice let a reply pair a uuid decided against one
+    // observation with binding fields decided against a later one — internally
+    // contradictory diagnostics, which is what this issue is about.
+    const liveActiveAtReply = (() => {
+      try {
+        return activeWorkflowRef();
+      } catch {
+        return null;
+      }
+    })();
+    const targetRoutingKeyAtReply = workflowTabId(target);
+    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target, liveActiveAtReply);
+    // #887 — report WHAT WAS OBSERVED to be active, beside what was requested.
+    //
+    // `opened` and `routing_key` both name the TARGET, and nothing in the reply said what
+    // the panel saw in the active slot. The orchestrator renders that as a flat assertion
+    // ("the canvas IS bound to X ... You are NOT on the wrong workflow") while
+    // panel_list_workflows can name a different workflow a moment later — and a Save-As
+    // taken on that assurance writes the LIVE canvas, not the one the caller believes.
+    //
+    // This does NOT close the window: a reply describes a moment, and the active workflow
+    // can change immediately after it is composed (measured — steal the active slot while
+    // an open is in flight and the target's uuid still ships, because at emission the
+    // target really WAS active). It makes the moment REPORTABLE, so a caller can compare
+    // rather than trust.
+    const openActiveBinding = describeOpenActiveBinding({
+      targetRoutingKey: targetRoutingKeyAtReply,
+      activeRoutingKey: (() => {
+        try {
+          return liveActiveAtReply ? workflowTabId(liveActiveAtReply) : null;
+        } catch {
+          return null; // unreadable -> `active_matches_target: null`, never a false mismatch
+        }
+      })(),
+    });
     return {
       opened: { path: target.path, filename: target.filename },
-      routing_key: workflowTabId(target),
+      routing_key: targetRoutingKeyAtReply,
+      ...openActiveBinding,
       ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
       modified: !!target.isModified,
       // #402 — the receipt id for THIS open. Journaled in the panel, so if this reply
@@ -11955,6 +12803,40 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!target) throw new Error("no target workflow");
     // Guard against data loss: don't silently close a workflow with unsaved
     // changes (closeWorkflow bypasses the UI's save prompt). Save first.
+    //
+    // #882 — CAPTURE BEFORE READING THE FLAG. `isModified` comes from a snapshot
+    // ComfyUI takes on user input only, so a value a NODE wrote leaves this reading
+    // false while the canvas already differs from the file — and this guard then
+    // discards exactly the work it exists to protect.
+    //
+    // This executor is async, so unlike the synchronous confirm gate it CAN wait for
+    // a tracker that captures asynchronously — awaiting the capture's OWN promise, so
+    // a rejection becomes "failed" here rather than being swallowed into a verdict
+    // that still permits the close (codex).
+    const captured = captureCanvasIntoTracker(target);
+    // `?? "unverified"`: a verdict that somehow arrives empty must land on the refusal
+    // side, never slip through to the stale flag below.
+    const verdict =
+      captured.verdict === "pending"
+        ? ((await captured.settled) ?? "unverified")
+        : (captured.verdict ?? "unverified");
+    // A capture that FAILED — or that cannot be shown to have HAPPENED — leaves the
+    // tracker possibly behind the canvas, so the flag proves nothing. Refuse rather
+    // than close; `force` still discards, which is the caller saying they meant it.
+    // "inactive" is NOT a failure: a non-active tab was already frozen by ComfyUI's
+    // `deactivate()`, so its flag is trustworthy without any capture here.
+    if ((verdict === "failed" || verdict === "unverified") && !force) {
+      throw new Error(
+        `"${target.filename || target.path}" could not be checked for unsaved changes ` +
+          `(${
+            verdict === "failed"
+              ? "capturing the live canvas failed"
+              : "the live canvas could not be captured right now — an undo, a load, or a " +
+                "change already in flight suppresses it; this clears on its own"
+          }), so closing it might discard work. Save it first (panel_save_workflow), ` +
+          `retry, or pass force:true to close anyway.`,
+      );
+    }
     if (target.isModified && !force) {
       throw new Error(
         `"${target.filename || target.path}" has unsaved changes — save it first (panel_save_workflow) before closing, or pass force:true to discard.`,
@@ -12460,7 +13342,17 @@ const GRAPH_TOOL_EXECUTORS = {
       return t.startsWith(prefix) ? t.slice(prefix.length) : t;
     };
     const blueprintList = () => [...(store.subgraphBlueprints ?? [])];
-    const matchesRequested = (d) => d?.name === fullType || bareName(d) === finalName;
+    // #636 — MATCH THE DISPLAY NAME TOO. Measured on ComfyUI 0.31: `typePrefix` is
+    // absent (so the literal fallback above is what gets used), 89 of 91 blueprints are
+    // named `SubgraphBlueprint.<content-hash>`, and the name a user typed lives in
+    // `display_name`. Against that, both tests below compare a NAME-derived key against a
+    // HASH and can never match — so the preflight was blind, and publishSubgraph() would
+    // reach the confirmOverwrite() dialog this exists to keep a programmatic call away
+    // from. The comment above predicted this exact failure for "a frontend that names
+    // blueprints differently"; it is not hypothetical.
+    const displayName = (d) => (typeof d?.display_name === "string" ? d.display_name : "");
+    const matchesRequested = (d) =>
+      d?.name === fullType || bareName(d) === finalName || displayName(d) === finalName;
     // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
     // would hang this programmatic call waiting for UI. Preflight and refuse with a
     // clear error instead. The remedy must be actionable from where the caller IS:
@@ -12473,11 +13365,39 @@ const GRAPH_TOOL_EXECUTORS = {
     const beforeKeys = new Set(before.map((d) => d?.name));
     const collision = before.find(matchesRequested);
     if (collision) {
+      // #636 — DON'T SEND THEM AFTER A BLUEPRINT COMFYUI WON'T DELETE. The remedy below
+      // used to say "delete it from the library and retry" unconditionally, and
+      // subgraphStore.deleteBlueprint refuses a global/bundled one outright:
+      //
+      //     if (isGlobalBlueprint(name)) { toast(cannotDeleteGlobal); return }
+      //
+      // On a stock install the overwhelming majority of blueprints are global (89 of 91
+      // measured here), so the collision most likely to happen is exactly the one where
+      // that advice cannot be followed — the user goes looking for a delete that is not
+      // offered, and the message has suggested nothing else.
+      //
+      // Unknown is not global: only a POSITIVE true narrows the remedy, so an older
+      // frontend or an unreadable predicate keeps the existing wording rather than
+      // withholding an option that may well work.
+      let collisionIsGlobal = false;
+      try {
+        const collidedBare = bareName(collision);
+        collisionIsGlobal =
+          typeof store.isGlobalBlueprint === "function" &&
+          String(collision?.name ?? "").startsWith(prefix) &&
+          store.isGlobalBlueprint(collidedBare) === true;
+      } catch {
+        collisionIsGlobal = false;
+      }
       throw new Error(
         `a subgraph blueprint named "${finalName}" already exists (type "${collision.name}") and this ` +
           `tool will not replace it — replacing one programmatically would need ComfyUI's overwrite ` +
-          `dialog, which cannot be answered from here. Either save under a different name, or delete ` +
-          `"${finalName}" from the subgraph library in the ComfyUI UI first and then retry this call.`,
+          `dialog, which cannot be answered from here. ` +
+          (collisionIsGlobal
+            ? `That one ships WITH ComfyUI, and ComfyUI refuses to delete a bundled blueprint — so ` +
+              `there is no way to free the name. Save under a different one.`
+            : `Either save under a different name, or delete "${finalName}" from the subgraph library ` +
+              `in the ComfyUI UI first and then retry this call.`),
       );
     }
     await store.publishSubgraph(finalName);
@@ -12535,12 +13455,41 @@ const GRAPH_TOOL_EXECUTORS = {
     const defs = store.subgraphBlueprints ?? [];
     const blueprints = [...defs].map((d) => {
       const type = d?.name ?? "";
+      const bare = type.startsWith(prefix) ? type.slice(prefix.length) : type;
+      // #636 — ASK THE STORE. This read `d?.isGlobal === true`, and a blueprint carries no
+      // such property (its keys are name, display_name, category, main_category,
+      // python_module, description, help, deprecated), so the field was ALWAYS false —
+      // reporting a confident "user blueprint" for every bundled one. The store answers it
+      // with a predicate, and ComfyUI's own call site shows what it wants:
+      //
+      //     subgraphStore.isGlobalBlueprint(name.slice(BLUEPRINT_TYPE_PREFIX.length))
+      //
+      // the PREFIX-STRIPPED name, not the object. Passing the object is what made an
+      // earlier probe of mine answer false for everything and look correct.
+      //
+      // `null` when the predicate is absent or throws, NOT false: "this frontend cannot
+      // tell me" and "this is a user blueprint" are different answers, and the whole
+      // defect here was the second being asserted in place of the first.
+      // ONLY when the prefix actually matched (codex). `prefix` is a FALLBACK — the
+      // measured frontend exposes no `typePrefix` — so a type that does not start with it
+      // leaves `bare` unstripped, and passing that yields a `false` indistinguishable from
+      // a real user blueprint. A predicate cannot report "you asked me the wrong
+      // question", and nothing at runtime can detect the disagreement, so the only honest
+      // answer for an unrecognised prefix is null.
+      let isGlobal = null;
+      try {
+        if (type.startsWith(prefix) && typeof store.isGlobalBlueprint === "function") {
+          isGlobal = store.isGlobalBlueprint(bare) === true;
+        }
+      } catch {
+        isGlobal = null;
+      }
       return {
-        name: type.startsWith(prefix) ? type.slice(prefix.length) : type,
+        name: bare,
         type,
         display_name: d?.display_name ?? null,
         description: d?.description ?? null,
-        is_global: d?.isGlobal === true,
+        is_global: isGlobal,
       };
     });
     // #690(5) — bounded like every other panel read. `count` stays the LIBRARY
@@ -12561,16 +13510,64 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!name || typeof name !== "string") throw new Error("name (blueprint name or type) is required");
     const store = getSubgraphStore();
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
-    const type = name.startsWith(prefix) ? name : `${prefix}${name}`;
     if (typeof store.getBlueprint !== "function") {
       throw new Error("subgraph store does not expose getBlueprint on this frontend");
     }
-    let bp;
+    // #636 — RESOLVE THE NAME THE USER CAN SEE. Blueprints are keyed by a content hash on
+    // current ComfyUI (measured: 89 of 91 named `SubgraphBlueprint.<hash>`, the typed name
+    // in `display_name`, and `typePrefix` absent so the literal fallback above is what is
+    // used). Building the type as prefix+name therefore resolved to nothing for the ONLY
+    // name a user or agent would think to use — the one the library shows — while the
+    // opaque hash worked. Same root cause as the collision preflight fixed in 0.11.71.
+    //
+    // Order matters: the caller's string is tried AS a type first, so an exact type or a
+    // hash keeps resolving exactly as before and this can only ever add a resolution that
+    // previously failed. Only if that finds nothing is `display_name` consulted.
+    const asType = name.startsWith(prefix) ? name : `${prefix}${name}`;
+    // AMBIGUITY REFUSES, it does not guess (codex). `display_name` is user-controlled and
+    // not unique, so taking the first match could insert a DIFFERENT graph than the one
+    // asked for — and a wrong subgraph silently added is far worse than a refusal, which
+    // the caller can resolve by passing the unique `type`.
+    const displayMatches = (store.subgraphBlueprints ?? []).filter(
+      (d) => typeof d?.display_name === "string" && d.display_name === name,
+    );
+    let type = asType;
+    let bp = null;
+    let lookupError = null;
     try {
       bp = store.getBlueprint(type);
     } catch (err) {
+      // Kept, not discarded: if nothing resolves, a real store failure must not be
+      // reported as "you never saved this" (codex).
+      lookupError = err;
+    }
+    if (!bp) {
+      if (displayMatches.length > 1) {
+        throw new Error(
+          `"${name}" matches ${displayMatches.length} saved subgraphs with that library ` +
+            `name, so adding one would be a guess. Pass the unique \`type\` instead — ` +
+            `panel_list_subgraphs reports it for each.`,
+        );
+      }
+      const viaDisplay =
+        typeof displayMatches[0]?.name === "string" ? displayMatches[0].name : null;
+      if (viaDisplay) {
+        type = viaDisplay;
+        try {
+          bp = store.getBlueprint(type);
+        } catch (err) {
+          lookupError = err;
+        }
+      }
+    }
+    if (!bp) {
       throw new Error(
-        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with panel_list_subgraphs.`,
+        `No saved subgraph blueprint "${name}" — neither as a blueprint type nor as the ` +
+          `name shown in the library. List them with panel_list_subgraphs and use either ` +
+          `the \`type\` or the \`display_name\` it reports.` +
+          // A store that THREW is a different fact from one that simply has no such
+          // blueprint, and the caller cannot act on the second remedy if it was the first.
+          (lookupError ? ` (the lookup also failed: ${coerceMessageText(lookupError?.message ?? lookupError)})` : ""),
       );
     }
     const position = placementFor(graph, pos);
@@ -14070,11 +15067,35 @@ const GRAPH_TOOL_EXECUTORS = {
           enqueued = true;
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
-          // The 405 legacy self-update fallback wraps ONLY the enqueue: once the
-          // task POST landed, a legacyUpdate would queue a SECOND update.
+          // The 405 fallback wraps ONLY the enqueue: once the task POST landed, a
+          // retry on another dialect would queue a SECOND update.
+          //
+          // #367 — a 405 HERE tries v2-batch before legacy. It is a CANDIDATE, not a
+          // verdict (codex): `queue/task` 405ing is the SHAPE this file has described
+          // as v2-batch since #187/#182/#184 ("POST /v2/manager/queue/task 405s
+          // (frontend catchall). Mutations go through POST /v2/manager/queue/batch"),
+          // and the backend that produced it is a pip v4 whose /v2 GETs all answer — so
+          // the legacy routes, which carry no /v2 prefix, are the one thing it is LEAST
+          // likely to serve. But a generic catchall can refuse batch too, which is why
+          // this costs one POST, keeps the legacy rung behind it, and caches nothing.
+          // The reporter's Manager v4 405'd here and the legacy fallback failed too,
+          // leaving update unusable with a fully working batch route sitting unused.
+          //
+          // The legacy rung is not lost, it is reordered behind this one: the v2-batch
+          // branch below falls to legacy on its own 405, so the ladder is
+          // v2 → v2-batch → legacy, each TRANSITION triggered only by a method rejection
+          // (the rejection is proven; what it proves is that THIS route refuses, never
+          // that the next dialect works — that is settled by the next enqueue landing).
+          // Monotonic, so it cannot cycle. #424's eventual legacy landing still
+          // happens for a backend that really is legacy — it just gets there second.
           if (!enqueued && isMethodNotAllowed(err)) {
-            methodRejected = true;
-            dialect = "legacy";
+            // NOTHING is cached here (codex): a 405 proves only that `queue/task` was
+            // refused, never that `batch` is usable. Recording it before the batch POST
+            // lands would leave a build that refuses BOTH — and updates fine on legacy —
+            // permanently cached as v2-batch, re-paying the refused batch POST on every
+            // later call, and the heal only runs on a route-MISSING verdict, not a 405.
+            // The cache is written below, once batch actually works.
+            dialect = "v2-batch";
             continue;
           }
           // codex P0: the heal retries ONLY a PROVEN route-level rejection (the
@@ -14100,6 +15121,11 @@ const GRAPH_TOOL_EXECUTORS = {
           });
           enqueued = true;
           assertBatchOk(res, id, "update");
+          // #367 — PROVEN, so record it. Detection reads /v2/manager/is_legacy_manager_ui
+          // and a build that refuses `queue/task` without reporting a legacy UI is
+          // classified `v2`, so every later call re-POSTs the refused route. This says
+          // what the backend just demonstrated: batch is the route that works here.
+          noteManagerDialectDowngrade("v2-batch");
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
           // The 405 legacy self-update fallback wraps ONLY the enqueue (as above).
@@ -14158,12 +15184,18 @@ const GRAPH_TOOL_EXECUTORS = {
         note:
           `${recentFailures.length} recent ComfyUI-Manager task(s) FAILED (see recent_failures). ` +
           `A drained queue that shows "done" does NOT mean every task succeeded — check these ` +
-          `before reporting an install/update as successful.`,
+          `before reporting an install/update as successful.` +
+          // #920 — a registry-lookup miss reads like a lookup bug and sends people to
+          // re-check spelling and channels. On a stock v4 an unlisted git URL is simply
+          // not installable, and saying so beats echoing a name the caller never supplied.
+          unlistedGitUrlAdvice(recentFailures.map((f) => f?.result ?? "").join(" ")),
       };
     }
     return { status };
   },
 
+  // #851 — every branch below names the TARGET as well as the route, via
+  // `rebootTargetFields()`. See that function for why the host matters.
   async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
@@ -14180,6 +15212,7 @@ const GRAPH_TOOL_EXECUTORS = {
           return {
             rebooting: false,
             blocked_busy: true,
+            ...rebootTargetFields(),
             queue_running: running,
             queue_pending: pending,
             message:
@@ -14227,12 +15260,14 @@ const GRAPH_TOOL_EXECUTORS = {
     for (const { route, method } of candidates) {
       try {
         const res = await api.fetchApi(route, { method });
-        if (res && res.ok) return { rebooting: true, endpoint: route, method };
+        if (res && res.ok) return { rebooting: true, endpoint: route, method, ...rebootTargetFields() };
         if (res && res.status === 403) {
           return {
             rebooting: false,
+            ...rebootTargetFields(),
             error:
-              "ComfyUI-Manager refused the reboot (HTTP 403): rebooting requires the Manager " +
+              rebootTargetLabel("ComfyUI-Manager refused the reboot (HTTP 403)") +
+              ": rebooting requires the Manager " +
               "security level to be 'middle' or below. Ask the user to lower it in ComfyUI-Manager " +
               "settings, then retry. ComfyUI was NOT restarted.",
           };
@@ -14248,6 +15283,7 @@ const GRAPH_TOOL_EXECUTORS = {
             rebooting: true,
             endpoint: route,
             method,
+            ...rebootTargetFields(),
             note: `proxy returned ${res.status} (origin going down) — reboot initiated`,
           };
         }
@@ -14259,14 +15295,17 @@ const GRAPH_TOOL_EXECUTORS = {
           rebooting: true,
           endpoint: route,
           method,
+          ...rebootTargetFields(),
           note: "connection dropped (server going down) — reboot initiated",
         };
       }
     }
     return {
       rebooting: false,
+      ...rebootTargetFields(),
       error:
-        "Could not reach any ComfyUI-Manager reboot endpoint — ComfyUI was NOT restarted " +
+        rebootTargetLabel("Could not reach any ComfyUI-Manager reboot endpoint") +
+        " — ComfyUI was NOT restarted " +
         "(is the built-in Manager enabled?). Tried: " +
         errors.join("; "),
     };
@@ -16241,6 +17280,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 const PANEL_CSS = `
 .cmcp-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
+  /* #753 — a plain 100% is CORRECT under the UI-scale zoom, and dividing by the
+     scale is not. A percentage height inside a zoomed element ALREADY resolves
+     against the parent in the zoomed coordinate space, so the compensation that
+     shipped applied it twice (at 175%: 619px parent -> 202px root) and left the
+     composer stranded mid-panel above a band of empty space. Measured in Chrome,
+     both ways. Do not re-add it. */
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;
@@ -16903,6 +17948,15 @@ const PANEL_CSS = `
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
+/* #758 — the update notice. Sits in the transcript as a system line, so it inherits
+   the panel's scale and scroll rather than becoming a modal the user must dismiss. */
+.cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+.cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
+.cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.cmcp-whatsnew-list li { line-height: 1.45; }
+.cmcp-whatsnew-tag { display: inline-block; font-size: 0.58rem; text-transform: uppercase;
+  letter-spacing: 0.04em; opacity: 0.75; border: 1px solid currentColor; border-radius: 3px;
+  padding: 0 0.22rem; margin-right: 0.15rem; vertical-align: baseline; }
 .cmcp-workflow-version { margin-top: 0.35rem; font-size: 0.58rem; opacity: 0.62;
   display: flex; gap: 0.3rem; align-items: center; }
 .cmcp-workflow-version .pi { font-size: 0.58rem; }
@@ -17584,6 +18638,10 @@ function buildPanel() {
 
   const root = document.createElement("div");
   root.className = "cmcp-root";
+  // #753 — a saved scale has to apply to a panel that mounts LATER (a reload, a
+  // workflow switch that re-mounts the sidebar), not only to one that is open
+  // when the slider moves. Read it here, at the one place a root is created.
+  applyPanelUiScale(getSetting(SETTING_UI_SCALE), root);
   // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
@@ -19784,6 +20842,17 @@ function buildPanel() {
         try {
           const wf = app?.extensionManager?.workflow?.activeWorkflow;
           if (!wf || typeof wf.isModified !== "boolean") return true; // unknown → confirm
+          // #882 — capture first, or this reads a flag that a NODE-written value
+          // cannot set. It failed closed for an UNREADABLE flag and not for a STALE
+          // one, so the confirm was skipped and the canvas clobbered without asking.
+          //
+          // This caller is synchronous (graphDirtyForConfirm reads the return value
+          // directly), so a tracker that captures asynchronously cannot be waited
+          // for — and neither can one that threw. Both mean the flag below is not
+          // known to be current, which is the same position as unreadable: confirm.
+          const captured = captureCanvasIntoTracker(wf).verdict;
+          if (captured === "pending" || captured === "failed" || captured === "unverified")
+            return true;
           return wf.isModified;
         } catch { return true; }
       },
@@ -20032,10 +21101,28 @@ function buildPanel() {
   const MAX_WORKFLOW_VERSIONS = 20;
   const MAX_THREAD_MSGS = 5000;
   let historyPersistenceWarningCode = null;
+  // #861 — one note per panel, not one per persist.
+  let shadowEvictionNoted = false;
   const historyStore = new ChatHistoryStore({
     threadsKey: THREADS_KEY,
     maxThreads: MAX_THREADS,
     maxMessages: MAX_THREAD_MSGS,
+    // #861 — say it in the log, ONCE, and not in the transcript. Shedding cached
+    // chats to stay inside a byte budget is normal and lossless (nothing is evicted
+    // that is not durable elsewhere), so a system message would be nagging the user
+    // about correct behaviour. But it must not be invisible either: the bug being
+    // fixed here was the panel silently occupying a shared origin budget until
+    // ComfyUI failed and got the blame.
+    onShadowEvict: (ids, bytes) => {
+      if (shadowEvictionNoted) return;
+      shadowEvictionNoted = true;
+      console.info(
+        "[comfyui-mcp-panel] trimmed " + ids.length + " cached chat(s) from localStorage to stay " +
+          "under the panel's share of this origin's storage (now ~" + Math.round(bytes / 1024) + "KB). " +
+          "Nothing was lost — every trimmed chat is in IndexedDB and still listed in Chat history. " +
+          "localStorage is shared with ComfyUI, which needs it for workflow drafts and tab restore.",
+      );
+    },
     onPersistenceError: (failure) => {
       if (failure?.code === historyPersistenceWarningCode) return;
       historyPersistenceWarningCode = failure?.code || "history-persistence-unavailable";
@@ -20874,6 +21961,23 @@ function buildPanel() {
   }
   function mountHolderVideo(holder) {
     if (holder._video) return; // already live
+    // #909 — a failure is TERMINAL for this source (codex). `data-src` survives the error
+    // paint, so without this the lazy observer remounts the same known-bad media on the
+    // next scroll-in: the message vanishes, the decode fails again, and the card blinks
+    // back to blank. Cleared only by a new source, which is the only thing that could
+    // change the answer.
+    if (holder._mediaFailedSrc && holder._mediaFailedSrc === holder.dataset.src) return;
+    // A DIFFERENT source gets a real attempt — and must not inherit the previous
+    // failure's styling (codex). The error paint appends inline declarations
+    // (display:grid, padding, muted colour); without restoring, a later valid video
+    // renders inside them and repeated failures keep appending. Restore the exact
+    // cssText from before the failure rather than clearing, which would also discard the
+    // learned aspect-ratio and any unrelated inline state.
+    if (holder._preFailCss != null) {
+      holder.style.cssText = holder._preFailCss;
+      holder._preFailCss = null;
+      holder._mediaFailedSrc = null;
+    }
     const v = document.createElement("video");
     v.muted = true;
     v.setAttribute("muted", ""); // required for muted autoplay on some browsers
@@ -20887,6 +21991,47 @@ function buildPanel() {
     v.addEventListener("loadedmetadata", () => {
       // Learn the real aspect ratio so the placeholder (and layout) match exactly.
       if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+    });
+    // #909 — SAY SO when the browser cannot decode it. `show_media` reports the DOM
+    // dispatch, not the decode, so an MP4 the browser refuses (the report: MPEG-4 Part 2,
+    // `mpeg4`/`mp4v`) answered ok:true and rendered a blank card — indistinguishable from
+    // a video that simply has not painted yet. The `play()` rejection is swallowed just
+    // below, deliberately (muted autoplay may be blocked, which is not a failure), so
+    // this listener is the only place the difference can be surfaced.
+    v.addEventListener("error", () => {
+      // UNMOUNT ALSO FIRES THIS. unmountHolderVideo clears `src` and calls load() to
+      // release the decoded buffers — that is a teardown, not a decode failure, and
+      // painting the message there would replace every healthy video with an error as
+      // soon as it scrolled out of view. Both tests are needed: the holder no longer
+      // owning this element, and the element no longer having a source.
+      if (holder._video !== v) return;
+      if (!v.getAttribute("src")) return;
+      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is "unsupported source or type" — NOT
+      // exclusively a codec/container verdict, and some decode failures arrive as code 3
+      // instead (codex). So re-encoding is offered as a useful remedy, never asserted as
+      // the only one, and the other codes get a narrower sentence that claims no cause.
+      const unsupported = v.error?.code === 4;
+      holder.textContent = unsupported
+        ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
+        : "This video could not be loaded.";
+      holder._preFailCss = holder.style.cssText;
+      holder.style.cssText +=
+        ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
+        "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";
+      // Release the decode buffers the way unmountHolderVideo does — detaching alone is
+      // not deterministic release, and unmount will skip this element once `_video` is
+      // null, so this is the last chance to do it (codex).
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        // best-effort, exactly as the unmount path treats it
+      }
+      v.remove();
+      holder._video = null;
+      // Remember WHICH source failed, so a later card with a different source still gets
+      // a real attempt.
+      holder._mediaFailedSrc = holder.dataset.src;
     });
     holder.textContent = "";
     holder.appendChild(v);
@@ -21852,6 +22997,95 @@ function buildPanel() {
     scrollLog();
   }
 
+  /**
+   * #758 — say what changed, once, after the install moved under the user.
+   *
+   * The panel updates from the Comfy Registry and the orchestrator runs
+   * `npx comfyui-mcp@latest`, so the version moves without the user asking. Their first
+   * signal is behaviour they did not expect, which reads as a bug rather than a release.
+   *
+   * Silent on a FIRST run. An unrecorded last-seen version means a fresh install or a
+   * user who predates this feature, and opening with a wall of history nobody asked for
+   * is the opposite of the point — it records the version and announces the NEXT change,
+   * which is the first one it can honestly call a change.
+   *
+   * The changelog is fetched ONLY when there is something to announce. It is ~140KB and
+   * the overwhelmingly common case is no version change at all.
+   */
+  async function announcePanelUpdate({ force = false } = {}) {
+    try {
+      const lastSeen = lsGet(LAST_SEEN_VERSION_KEY);
+      const level = updateAnnouncement({ lastSeen, current: PANEL_VERSION });
+      if (!force && level === 'none') {
+        // Nothing to say — but a DOWNGRADE must not overwrite a newer recorded version
+        // (codex): doing so makes a later re-upgrade re-announce releases already seen,
+        // which breaks the one promise this feature makes. Only ever move it forward.
+        if (lastSeen && compareVersions(PANEL_VERSION, lastSeen) > 0) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+        else if (!lastSeen) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+        return;
+      }
+
+      const res = await fetch('/extensions/comfyui-mcp-panel/changelog.json', { cache: 'no-cache' });
+      if (!res.ok) return; // offline / 404: say nothing, record nothing, try again next mount
+      const data = await res.json();
+      const picked = releasesSince(data?.releases, { lastSeen, current: PANEL_VERSION });
+      // Re-decide the level with the release COUNT, which is only known now (codex). The
+      // first pass could not pass it, so a same-minor jump across a dozen releases always
+      // came out 'patch' and the pile-of-releases half of the policy never fired.
+      const shownLevel = updateAnnouncement({ lastSeen, current: PANEL_VERSION, releaseCount: picked.length });
+      // A patch is a quiet line; a minor bump or a pile of releases is the case the report
+      // is really about (a tool surface consolidating, a default flipping) and gets more.
+      const maxEntries = (force ? 'major' : shownLevel) === 'major' ? 10 : 3;
+      const entries = summarizeReleases(picked, { maxEntries });
+      if (!entries.length) return;
+
+      // MOUNT IDENTITY, checked after every await (codex). The sidebar can re-mount while
+      // this fetch is in flight; this closure captured the OLD `log`, so appending now
+      // would paint into a detached transcript nobody can see — and because the version
+      // used to be recorded before the fetch, the new mount would decide there was nothing
+      // to announce. The note was then lost for good, on an ordinary remount.
+      // UNCONDITIONAL (codex). `force` may skip the already-seen gate — that is its whole
+      // job — but never mount ownership. A Settings click whose fetch resolves after its
+      // panel unmounted would otherwise paint into a dead transcript, and the user's
+      // explicit "Show what's new" would visibly do nothing.
+      if (client !== liveBridgeClient || !log.isConnected) return;
+
+      const box = document.createElement('div');
+      box.className = 'cmcp-sys cmcp-whatsnew';
+      box.dataset.testid = 'panel-whats-new';
+      const head = document.createElement('div');
+      head.className = 'cmcp-whatsnew-head';
+      head.textContent = lastSeen
+        ? `Updated to ${PANEL_VERSION} (you were on ${lastSeen}) — what changed:`
+        : `ComfyUI Agent Panel ${PANEL_VERSION} — recent changes:`;
+      box.appendChild(head);
+      const list = document.createElement('ul');
+      list.className = 'cmcp-whatsnew-list';
+      for (const entry of entries) {
+        const li = document.createElement('li');
+        const tag = document.createElement('span');
+        tag.className = 'cmcp-whatsnew-tag';
+        // Fixed vs Changed is the distinction the report asks for: "this used to work
+        // differently on purpose" is a different message from "this was broken".
+        tag.textContent = entry.section;
+        li.appendChild(tag);
+        // textContent, never innerHTML. The JSON is served content, not a compile-time
+        // constant, so it is rendered as text regardless of who authored it.
+        li.appendChild(document.createTextNode(' ' + entry.text));
+        list.appendChild(li);
+      }
+      box.appendChild(list);
+      log.appendChild(box);
+      scrollLog();
+      // COMMIT LAST. `lastSeen` now means "this browser was shown these notes", not
+      // "we tried" — so an offline update, a 404, a stale asset or a remount race leaves
+      // the notes pending instead of silently swallowing them (codex).
+      if (!force) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+    } catch {
+      // A release note is never worth breaking the panel over.
+    }
+  }
+
   function appendActivity(cmd, msg, reply) {
     const { icon, text, detail } = describeCommand(cmd, msg, reply);
     const card = { icon, text, detail, error: !reply.ok };
@@ -22076,6 +23310,90 @@ function buildPanel() {
     if (followsPanel) {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf) _tempWorkflowInstanceIds.delete(wf);
+      // #847 — CARRY THE ROUTE STAMP ACROSS THE SAVE, on every thread that holds it.
+      //
+      // A first save moves the tab from `tmp:<uuid>` to `wf:<path>` and re-mints the
+      // storage uuid at the same moment, so a conversation recorded before it holds
+      // neither of the live workflow's identity forms and drops out of "Current
+      // workflow only" — the workflow it was actually held on. 0.11.56 matched those
+      // threads in memory via `_priorTempWorkflowIds`; that is a WeakMap, so the
+      // match died on reload and this is the durable half.
+      //
+      // EVERY thread, not just the active one. Revising only `thread` is what left
+      // the reported case broken: chat, save, start a new chat, filter — and the
+      // FIRST chat is the one missing, because it was not the active thread when the
+      // save landed.
+      //
+      // Rewrites a routing stamp and nothing else. No transcript is touched, and it
+      // goes through `reviseThread` so it travels the same causal field-op path as
+      // the other stamps rather than losing to a stale tab's write.
+      // The ids to migrate FROM — and the hard part is PROVING one belongs to this
+      // tab rather than to a workflow the user merely switched away from (codex P0).
+      //
+      // `tmp:` -> `wf:` is the shape of a first save. It is ALSO the shape of a
+      // switch from an unsaved workflow A to an already-saved workflow B, and an
+      // earlier cut could not tell them apart: it read `currentWorkflowId` starting
+      // with `tmp:` as "this tab's pre-save id" and rewrote every one of A's threads
+      // to B's path — permanently attributing one workflow's conversations to
+      // another. That is the cross-attribution this whole area exists to prevent,
+      // and it is worse than the bug being fixed.
+      //
+      // The discriminator is whether the old id STILL NAMES AN OPEN TAB. A save
+      // consumes the tmp: identity — nothing answers to it afterwards. A switch
+      // leaves A open and answering. So an id is only a pre-save identity of THIS
+      // tab if no open workflow still claims it.
+      //
+      // Fails closed: if the open list cannot be read, nothing is migrated and the
+      // in-memory match (0.11.56) still covers the session.
+      const stillOpenRouteIds = (() => {
+        try {
+          const svc = app?.extensionManager?.workflow;
+          const open = svc?.openWorkflows;
+          if (!Array.isArray(open)) return null; // unknown — refuse to migrate
+          const ids = new Set();
+          for (const candidate of open) {
+            if (candidate === wf) continue; // the tab we are migrating TO
+            const id = workflowTabId(candidate);
+            if (typeof id === "string" && id) ids.add(id);
+          }
+          return ids;
+        } catch {
+          return null;
+        }
+      })();
+      // The decision itself lives in lib/ so it can be tested against the real
+      // function rather than asserted about at source — including the switch case
+      // that made an earlier cut re-attribute one workflow's chats to another.
+      const priorRouteIds = migratableRouteIds({
+        newRouteId: wfid,
+        candidateRouteIds: [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null],
+        openRouteIds: stillOpenRouteIds,
+      });
+
+      // NOTHING IS MIGRATED HERE, and that is the finding rather than an omission.
+      //
+      // Threads stamped before a first save hold an id nothing answers to afterwards,
+      // and both ways of fixing that need to know the old id was THIS tab's past.
+      // The panel cannot prove it: the workflow OBJECT is replaced across the save
+      // (instrumented — the WeakMap that would vouch has nothing under its key by
+      // then), and `openWorkflows` not claiming an id is absence of a competing
+      // claimant, not ownership (codex). Close A, switch to B, and A's conversations
+      // would be attributed to B.
+      //
+      // So `priorRouteIds` is used for ONE thing: knowing that a genuine first save
+      // just happened, which is when an open history pane is showing a stale answer.
+      // No stamp is rewritten and no identity is inferred. #847 stays open for the
+      // rest, with the ownership gap written down rather than guessed at.
+      const savedThisTick = priorRouteIds.size > 0;
+      // A pane that is already open painted the pre-migration answer and will not
+      // repaint itself; nothing else changes its rows.
+      if (savedThisTick) {
+        try {
+          repaintHistoryList?.();
+        } catch {
+          // A stale handle must never break the workflow poll.
+        }
+      }
       if (thread) {
         historyStore.reviseThread(thread, {
           workflowKey: workflowStorageKey(),
@@ -22239,9 +23557,30 @@ function buildPanel() {
       listEl.textContent = "";
       const q = search.value.trim().toLocaleLowerCase();
       // Panel-owned threads keep workflow provenance instead of the global
-      // active-pointer key. Accept both the durable workflow UUID and the
-      // current bridge-tab id so the filter works before and after first save.
-      const currentWorkflowKeys = new Set([workflowStorageKey(), workflowTabId()]);
+      // active-pointer key. Accept the durable workflow UUID and the current
+      // bridge-tab id — which between them cover a thread written on either side
+      // of a first save, but NOT one written across it.
+      // #847 — the PRIOR tmp: id counts too. A first save migrates the route id
+      // (tmp:<uuid> -> wf:<path>) and re-mints the storage uuid at the same boundary, so a
+      // thread recorded minutes earlier on this very tab holds neither live form and drops
+      // out of this filter. `_priorTempWorkflowIds` already retains that id for the live
+      // object's lifetime, and `workflowRecordMatchesSelector` already honours it — this
+      // was the one reader that did not.
+      const activeWf = activeWorkflowRef();
+      const liveRouteId = workflowTabId();
+      const currentWorkflowKeys = currentWorkflowIdentityKeys({
+        storageKey: workflowStorageKey(),
+        routeId: liveRouteId,
+        priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
+      });
+      // #847 — and the identity this tab held before GROUNDING created this path. The
+      // WeakMap above cannot help here: grounding replaces the workflow object, so it has
+      // nothing under the successor's key. This lineage was recorded by the save itself,
+      // which is the only observer that can prove the old id was this tab's.
+      for (const form of preGroundingIdentityForms(_preGroundingIdentities, savedWorkflowPath(activeWf))) {
+        currentWorkflowKeys.add(form);
+      }
+
       const visible = threads
         .filter((candidate) =>
           !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
@@ -22427,6 +23766,9 @@ function buildPanel() {
       picker.click();
     });
     paintList();
+    // Publish the repaint so a migration landing while this pane is open can
+    // correct it (#847).
+    repaintHistoryList = paintList;
 
     const footer = document.createElement("div");
     footer.className = "cmcp-hist-footer";
@@ -23555,6 +24897,15 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+
+  // #758 — announce an update once the transcript exists to receive it. Deliberately
+  // NOT awaited: a release note must never sit in front of the panel becoming usable.
+  announcePanelUpdate();
+  // #758 — and keep it REACHABLE. The Discord ask was for somewhere to reference what
+  // changed; a line in the transcript scrolls away, is cleared with the chat, and is
+  // gone entirely if the user was not looking (codex). Settings → About re-paints it on
+  // demand, with `force` so it ignores the already-seen record.
+  panelHooks.showWhatsNew = () => announcePanelUpdate({ force: true });
 
   // Per-workflow auto-follow. Sync to the current workflow's thread NOW (initial
   // bind), then poll: under keep-alive the panel does NOT re-mount on a ComfyUI
@@ -27638,6 +28989,31 @@ async function healStaleBundleIfNeeded() {
     if (staleness === "current") {
       // A previous heal took — clear the marker so the NEXT update heals too.
       if (ssGet(BUNDLE_HEAL_KEY)) ssSet(BUNDLE_HEAL_KEY, null);
+      // #584 — "current" IS THE BLIND SPOT. This compares one number: the
+      // PANEL_VERSION of the module that happens to hold it. ComfyUI imports
+      // 112 of our modules independently, so a page can carry that constant
+      // fresh and its siblings stale, report `current`, heal nothing, and still
+      // refuse every write. That is the shape this issue keeps coming back
+      // with — a version check that looks healthy while the page does not
+      // behave like it.
+      //
+      // So when the version says current, ask the OTHER question: did these
+      // modules actually come off the wire? A healthy load is all-network and
+      // says nothing. Anything else is the datum five rounds of fixes have been
+      // missing, and it is stated once, at the moment it is observable.
+      try {
+        const cache = readModuleCacheSummary();
+        if (cache.verdict === "mixed" || cache.verdict === "all-cached") {
+          console.warn(
+            `[comfyui-mcp-panel] version reads CURRENT (${PANEL_VERSION}), but ${describeModuleCache(cache)} ` +
+              `If panel_* writes are being refused, quote this line in ` +
+              `https://github.com/artokun/comfyui-mcp-panel/issues/584 — it is the measurement that ` +
+              `issue is missing. A hard refresh (Ctrl+Shift+R) is the workaround.`,
+          );
+        }
+      } catch {
+        /* a diagnostic must never break startup */
+      }
       return;
     }
     if (staleness !== "stale") return;

@@ -69,9 +69,13 @@ export function installGitUrl({ id, repository } = {}) {
  *
  * A git URL (via `id` OR `repository`, any recognized protocol) always routes to
  * the repo-name-as-id payload: v4 installs by {id: repoName, selected_version:
- * ref||"nightly", channel:"dev"} (no files — v4 resolves by CNR/repo name);
- * v2-batch + legacy install the URL natively via {id: repoName, version:
- * "unknown", files:[url]}. A registry id keeps the versioned body. `id` is
+ * ref||"nightly", channel:"dev", repository: url}. The `repository` half was missing
+ * and is #920 — without it v4 has only the NAME and resolves it against the registry,
+ * which is a lookup rather than a clone; Manager's own InstallPackParams documents the
+ * field as "required if selected_version is nightly". v2-batch + legacy install the URL
+ * natively via {id: repoName, version: "unknown", files:[url]} — a different shape whose
+ * handler reads files[0], so they were never missing it. A registry id keeps the
+ * versioned body and carries no `repository` at all. `id` is
  * NEVER a full URL (a full URL matches nothing on v4 → silent "done"; on 3.x it
  * fails LATER while resolving, past the immediate `failed` array).
  */
@@ -89,6 +93,23 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
           id: gitRepoName(gitUrl),
           version: selected,
           selected_version: selected,
+          // #920 — SEND THE URL. Reducing it to `gitRepoName` and stopping there turned a
+          // from-source install into a registry lookup, and Manager answered
+          // "Node '<name>@nightly' not found in [ManagerChannel.dev,
+          // ManagerDatabaseSource.cache]" — both sources being the two defaults below.
+          //
+          // The field is not inferred. Manager's own model declares it:
+          //
+          //   class InstallPackParams(ManagerPackInfo):
+          //     repository: Optional[str] = Field(
+          //       None, description="GitHub repository URL (required if selected_version
+          //                          is nightly)")
+          //
+          // and "required if nightly" is exactly the reported call. `id` stays the derived
+          // NAME rather than the URL: sending a URL there made v4 silently mark the
+          // install done while doing nothing, which is why it was derived in the first
+          // place — that behaviour is preserved, this only stops discarding the URL.
+          repository: gitUrl,
           channel: channel || "dev",
           mode: mode || "cache",
         },
@@ -777,6 +798,69 @@ function taskStatusStr(item) {
  * shape we don't recognize can never become a FALSE failure). Prefers the
  * `status.messages` (the crash/exception text) for the reason, then `result`.
  */
+/**
+ * #920 — does this Manager failure mean "that pack is not in the registry"?
+ *
+ * v4 resolves an install from its OWN database — `get_custom_nodes(channel, mode)`,
+ * falling back to `cnr_map[node_id]` — and when neither has the pack it answers
+ *
+ *   Node '<id>@<version>' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]
+ *
+ * Matched on the STABLE part ("not found in" + a bracketed source list) rather than
+ * the enum spellings, which vary with channel/mode. Deliberately narrow: only a
+ * message we positively recognise is reshaped, everything else passes through.
+ */
+export function isRegistryLookupMiss(text) {
+  return typeof text === "string" && /Node\s+'[^']*@[^']*'\s+not found in\s*\[[^\]]*\]/i.test(text);
+}
+
+/**
+ * #920 — what to add when a GIT URL install hits that miss.
+ *
+ * The reporter passed a repository URL and got a registry-lookup failure naming a
+ * pack id they never supplied. That reads like a lookup bug and sends people to
+ * re-check spelling, channel and mode; none of it is the problem.
+ *
+ * Both facts below are read from ComfyUI-Manager's SOURCE, not its schema — the
+ * schema is what misled two separate attempts at this issue (`InstallPackParams`
+ * declares `repository` "required if selected_version is nightly", and `do_install`
+ * reads only id/selected_version/channel/mode/skip_post_install):
+ *
+ *   1. the pack is not in the registry — that IS what the lookup missed;
+ *   2. a stock v4 has NO route that installs an arbitrary git URL. The legacy
+ *      `/manager/queue/install` route does (`@unknown` + `files:[url]`), but
+ *      `comfyui_manager/__init__.py` registers the legacy server only under
+ *      `--enable-manager-legacy-ui`.
+ *
+ * Returns "" when there is nothing extra to say, so callers may append blindly.
+ */
+export function unlistedGitUrlAdvice(failureText) {
+  if (!isRegistryLookupMiss(failureText)) return "";
+  // Phrased for BOTH readers, because the surface that shows this failure
+  // (panel_node_queue_status) does not carry the original request and plumbing it
+  // through for a message is not worth the coupling. Someone who mistyped a
+  // registry id needs the first sentence; someone who passed a git URL needs the
+  // rest, and the conditional wording keeps it from asserting which they did.
+  return (
+    ` — NOTE: that is a NODE REGISTRY lookup. The pack is not in the registry under that` +
+    ` name. IF YOU PASSED A GIT URL: this ComfyUI-Manager cannot install one. It resolves` +
+    ` installs from its own database, and the parameter that would carry a URL (repository)` +
+    ` is accepted and then IGNORED by its install handler — so no argument to this tool will` +
+    ` make it clone your URL. USE install_custom_node INSTEAD: that tool runs on the` +
+    ` machine rather than in this browser, and when the Manager cannot resolve a pack it` +
+    ` clones the repository into custom_nodes/ itself. It is the one path that installs an` +
+    ` unlisted URL — so this tool's usual "prefer me over the headless install_custom_node"` +
+    ` guidance does NOT hold for this case. Restart ComfyUI afterwards to load it.` +
+    ` If that is not available (a REMOTE target has no local tree to clone into, and it` +
+    ` keeps the Manager's error for that reason), the remaining options are to clone into` +
+    ` custom_nodes/ by hand, or ask the pack author to publish to the registry. A legacy` +
+    ` git-URL route also exists but needs TWO steps — --enable-manager-legacy-ui (which` +
+    ` REPLACES the v2 Manager API) AND allow_git_url_install = true in ComfyUI-Manager's` +
+    ` config.ini, without which an unlisted pack is rated "high+" risk and it answers 404.` +
+    ` IF YOU MEANT A REGISTRY PACK: check the id and the channel/mode named in the brackets.`
+  );
+}
+
 export function taskFailureReason(item) {
   if (!isTaskHistoryItem(item)) return null;
   if (!TASK_FAILURE_STATUS.has(taskStatusStr(item))) return null;
@@ -898,4 +982,25 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
       `usually required to load an updated node. If it still misbehaves, check the ` +
       `ComfyUI server log.`,
   };
+}
+
+/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
+ *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
+ *  silent success on a failed op is exactly the #184 no-op bug.
+ *
+ *  Lives HERE rather than in the panel (#367): the unit harness injects the panel's
+ *  mutation deps by name from this module, and it was destructuring an `assertBatchOk`
+ *  this module never exported — so every batch-path test would have crashed on
+ *  `assertBatchOk is not a function`. None did, because none reached the batch branch.
+ *  Exporting it is what makes that branch testable at all.
+ */
+export function assertBatchOk(res, id, op) {
+  const failed = Array.isArray(res?.failed) ? res.failed : [];
+  if (failed.length && (id === undefined || failed.includes(id))) {
+    throw new Error(
+      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
+        "(check the ComfyUI server log for the underlying error — security_level " +
+        "gating is a common cause). The pack was NOT installed.",
+    );
+  }
 }

@@ -14,6 +14,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fetchNodeDefsWithRetry } from "../../web/js/lib/object-info-retry.js";
+
+/** #716 — records invalidate() calls so a test can assert the refresh drops the cache. */
+let cacheInvalidations = 0;
+const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
 
 import {
   describeNodeDefRefresh,
@@ -347,6 +352,11 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -357,6 +367,11 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     () => ({}),
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the delays are the shipped ones, the sleep is not.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
 }
 
@@ -463,6 +478,11 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs };`,
@@ -481,6 +501,11 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     },
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the shipped delays, an instant sleep.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
   const verdict = await registerWithThrowingRecorder(undefined);
   assert.equal(verdict.reason, "register_failed");
@@ -513,6 +538,11 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -529,9 +559,89 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     },
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the shipped delays, an instant sleep.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
   const verdict = await registerComfyNodeDefs(undefined);
   assert.equal(verdict.refreshed, false);
   assert.equal(verdict.reason, "register_failed");
   assert.equal(getConfirmed(), false, "the shared trust flag must not latch true after a falsy throw");
+});
+
+test("#954: the shipping run survives a transient getNodeDefs throw", async () => {
+  // The WIRING SEAM (codex). The retry helper has its own tests and the browser run proved
+  // the whole path, but neither pins that registerComfyNodeDefs itself turns
+  // first-throw/second-success into a refresh — which is the exact regression #954 reports.
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError("Failed to fetch");
+        return { SomeNode: {} };
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true, "a blip inside a reconnect window must not fail the refresh");
+  assert.equal(calls, 2, "it re-attempted rather than swallowing the throw");
+});
+
+test("#954: a persistent getNodeDefs throw still reports the fetch failure it always did", async () => {
+  // The other direction, and the one a retry can silently break: a genuine outage must keep
+  // producing `object_info_fetch_failed` with a real detail, not a vaguer verdict.
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        throw new TypeError("Failed to fetch");
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(String(verdict.detail ?? ""), /Failed to fetch/);
+  assert.equal(calls, 3, "bounded — it does not retry forever");
+});
+
+test("#716: a successful refresh DROPS the widget-write burst cache", async () => {
+  // The TTL is only safe because anything that knows the schema moved drops the entry.
+  // A refresh is exactly that event — it runs on refresh_nodes, on a completed install and
+  // on reconnect. Without this the next widget write would be authorized against a map
+  // taken before the very change that prompted the refresh.
+  const before = cacheInvalidations;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true);
+  assert.equal(cacheInvalidations, before + 1, "the burst cache must be dropped by a refresh");
+});
+
+test("#716: a FAILED refresh still drops the burst cache", async () => {
+  // codex: invalidating only after a successful fetch left the pre-change map authorizing
+  // writes for the rest of the TTL when the refresh failed — and a failed refresh is when
+  // the schema is most likely to have moved. The old code would have fetched and failed
+  // closed. So the drop happens when the run STARTS, whatever it goes on to do.
+  const before = cacheInvalidations;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.equal(cacheInvalidations, before + 1, "a failed refresh must not leave a usable entry");
 });
