@@ -909,7 +909,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.87";
+const PANEL_VERSION = "0.11.88";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -2950,6 +2950,10 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 const SETTING_FLAG_APPS = "comfyui-mcp.featureFlag.apps";
 const SETTING_FLAG_TRAINING = "comfyui-mcp.featureFlag.training";
 const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
+// Explicit global consent for the embedded prompt editor to use HTTP-backed
+// providers. Off by default; unlike a node property this never travels inside
+// a workflow. The orchestrator persists the authoritative value server-side.
+const SETTING_PROMPT_ASSIST_HTTP = "comfyui-mcp.promptAssist.httpProviders";
 // Session ownership: when TRUE (default), the conversation belongs to the PANEL
 // — switching/saving/renaming/creating workflows never swaps or resets the chat;
 // the agent just gets told (mechanically, on the next message) which canvas it's
@@ -3007,6 +3011,7 @@ const panelHooks = {
   applyAutoConnect: null, // (bool)
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
+  applyPromptAssistHttpConfig: null, // () — push explicit direct-HTTP prompt consent
   applyMobileBeta: null, // (bool) — show/hide the header Remote-control (QR) button
   applyFlagApps: null, // (bool) — show/hide the Apps toolbar button
   applyFlagTraining: null, // (bool) — show/hide the Training toolbar button
@@ -3748,6 +3753,24 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyFlagRunpod?.(!!v);
+      },
+    },
+    {
+      id: SETTING_PROMPT_ASSIST_HTTP,
+      name: "Allow direct HTTP providers",
+      category: cat("Prompt assistant", "Allow direct HTTP providers"),
+      sortOrder: 147,
+      tooltip:
+        "Allow embedded prompt editors to send scene prompt text directly to the HTTP endpoint configured for " +
+        "Kimi, Kimi K3, GLM, MiniMax, Ollama, OpenRouter, LM Studio, llama.cpp, or Custom endpoint. Off by " +
+        "default. These requests are text-only and carry no ComfyUI/MCP tool schema, but hosted or custom " +
+        "endpoints receive the prompt text under their own privacy and billing terms. This is a global " +
+        "comfyui-mcp setting and is never stored in a workflow.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: () => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyPromptAssistHttpConfig?.();
       },
     },
     {
@@ -24132,6 +24155,13 @@ function buildPanel() {
     if (!client?.isConnected?.()) return;
     client.sendFrame?.({ type: "set_config", stall_seconds: stallSettingSeconds() });
   }
+  function sendPromptAssistHttpConfig() {
+    if (!client?.isConnected?.()) return;
+    client.sendFrame?.({
+      type: "set_config",
+      prompt_assist_http: getSetting(SETTING_PROMPT_ASSIST_HTTP) === true,
+    });
+  }
   // Push the user's preferred models + Ollama endpoint config (set_config → the
   // orchestrator persists them in ~/.comfyui-mcp/panel-settings.json and refreshes
   // the model catalog). On connect we only sync when something is non-default
@@ -24224,6 +24254,9 @@ function buildPanel() {
         // Push the current render-stall threshold so a reused/just-connected
         // orchestrator reflects the live setting (the spawn env covers a fresh one).
         sendStallConfig();
+        // Consent is a standalone global setting: always synchronize BOTH true
+        // and false without forcing/defaulting unrelated model configuration.
+        sendPromptAssistHttpConfig();
         // Sync preferred models + ollama endpoint config (only when non-default).
         sendAgentModelConfig(false);
         // Reconnected — drop any transient "reconnecting" banner; live frames
@@ -28711,6 +28744,7 @@ function buildPanel() {
   };
   panelHooks.applyStallConfig = () => sendStallConfig();
   panelHooks.applyAgentModelConfig = () => sendAgentModelConfig(true);
+  panelHooks.applyPromptAssistHttpConfig = () => sendPromptAssistHttpConfig();
   panelHooks.requestSecret = (envKey, friendly) => {
     // EVERY token button is agent-free: paint the same masked card the agent
     // flow uses, then ship the value in a set_secret frame the ORCHESTRATOR
@@ -28887,6 +28921,7 @@ function buildPanel() {
       panelHooks.applyAutoConnect = null;
       panelHooks.applyStallConfig = null;
       panelHooks.applyAgentModelConfig = null;
+      panelHooks.applyPromptAssistHttpConfig = null;
       panelHooks.applyMobileBeta = null;
       panelHooks.applyFlagApps = null;
       panelHooks.applyFlagTraining = null;

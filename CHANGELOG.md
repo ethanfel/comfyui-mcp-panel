@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.88] - 2026-08-12
+
+### Added
+
+- Added **Settings → Comfy MCP Agent → Prompt assistant → Allow direct HTTP
+  providers**. It is off by default, never stored in workflows, and explicitly
+  controls whether embedded prompt editors may send prompt text to configured
+  Kimi, Kimi K3, GLM, MiniMax, Ollama, OpenRouter, LM Studio, llama.cpp, or
+  custom endpoints.
+- connect external sessions to live canvas
+
+### Fixed
+- the suite stops leaving workflows behind at all (#907)
+
+### Changed
+- scope two tag-survival claims to the frontend that reported them (#970)
+- replace a build-range claim this file disproves (#752) (#969)
+
+
 ## [0.11.87] - 2026-08-09
 
 ### Fixed
