@@ -51,12 +51,38 @@ import { parseHistoryEntry } from "./history-reconcile.js";
 export const NO_PROMPT_KEY = "__no_prompt__";
 
 /**
+ * Mint a per-queue completion identity. The route/session are diagnostic
+ * ownership metadata; the nonce is the generation fence that keeps a reused
+ * prompt id from looking like the previous run.
+ */
+export function createRunCompletionKey(routeId, sessionId, promptId, nonce = null) {
+  const route = typeof routeId === "string" ? routeId.trim() : "";
+  const prompt = promptId == null ? "" : String(promptId).trim();
+  if (!route || !prompt) return null;
+  const salt =
+    typeof nonce === "string" && nonce.trim()
+      ? nonce.trim()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return JSON.stringify([route, sessionId == null ? null : String(sessionId), prompt, salt]);
+}
+
+/**
  * @param {object} opts
- * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:number}) => void} opts.onFlush
+ * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:(number|null), completionKey?:string, reconciled?:boolean, replayed?:boolean}) => void} opts.onFlush
+ *   `finishedAt` is epoch ms. On the LIVE paths it is the flush clock; on the
+ *   RECONCILED path (`reconciled:true`) it is the run's real execution_success
+ *   time recovered from /history, or **null** when that entry records none —
+ *   never the delivery time, which would present a stale replay as fresh (#1199).
  *   Called exactly once per completed prompt that buffered ≥1 image or video,
  *   with the FULL batch for that prompt_id, the correct start→finish duration,
  *   and the prompt_id (`key`/`promptId`) so the delivery can be attributed.
  * @param {() => number} [opts.now]        Clock (injectable for tests).
+ * @param {(promptId:(string|null)) => void} [opts.onRepend]  Called after
+ *   markUndelivered() re-pends a run, so the wiring can re-arm recovery
+ *   (the safety sweep) for the ledger the run just re-entered (#1739).
+ * @param {(entries:Array<object>) => void} [opts.onTerminalCompletionStateChange]
+ *   Called when a completion released without its prompt-scoped key changes
+ *   state, so teardown/reload can preserve the exact media batch.
  * @param {(fn:Function, ms:number) => any} [opts.setTimer]
  * @param {(t:any) => void} [opts.clearTimer]
  * @param {number} [opts.debounceMs]       Orphan-flush / re-arm interval (default 1500).
@@ -67,6 +93,15 @@ export function createRunCompletionTracker({
   onReconcileError,
   onReconcileInterrupted,
   onReconcileGiveUp,
+  onCompletionStateChange,
+  onTerminalCompletionStateChange,
+  // comfyui-mcp#1739 — called AFTER markUndelivered() has re-pended a run. The
+  // pending ledger is recovery-driven (reconnect edges + the safety sweep, which
+  // SELF-DISARMS the moment it observes an empty ledger), and flush() retires a
+  // run OPTIMISTICALLY before the async compose+send resolves — so a send that
+  // then fails re-pends a run into a ledger nothing is sweeping. This hook is how
+  // the wiring re-arms recovery; without it the re-pend is a silent dead end.
+  onRepend,
   now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (t) => clearTimeout(t),
@@ -93,6 +128,14 @@ export function createRunCompletionTracker({
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
   const deduper = createCompletionDeduper({ ttlMs: duplicateWindowMs, now });
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
+  // A live PreviewImage completion is retained until the caller CONFIRMS its
+  // frame reached the agent. If the bridge send fails after execution_success,
+  // replay this exact executed batch before falling back to /history. This
+  // matters when a remote proxy permits the panel websocket but rejects the
+  // separate history request: the panel already has the temp reference and
+  // must not throw it away with the failed send. SaveImage/video recovery keeps
+  // its existing /history behavior.
+  const liveReplays = new Map(); // key -> onFlush payload containing type:"temp"
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
   // Keys whose start came from a real lifecycle signal, not a fallback (#986).
@@ -133,6 +176,131 @@ export function createRunCompletionTracker({
   // doing its job) to bound memory.
   const terminal = new Map();
   const delivered = new Map();
+  // A success can arrive before the panel's delayed /prompt response registers
+  // this run as panel-queued. Keep only the media-less success that still needs
+  // the panel_run promise applied; onQueued consumes it exactly once.
+  const terminalNoMediaSuccess = new Map(); // key -> { promptId, durationMs, finishedAt, at }
+  // A panel_run completion can finish before the delayed /prompt response gives
+  // us the id's route-scoped delivery key. Hold the complete payload until
+  // onQueued can attach that key; otherwise the ordinary unkeyed path marks it
+  // delivered and the later prompt receipt has nothing to replay.
+  const terminalNoKeyCompletion = new Map(); // key -> payload
+  // The timeout fallback may already have emitted an unkeyed frame, but it must
+  // remain recoverable until the delayed /prompt identity binds it.
+  const terminalNoKeyFlushed = new Set(); // keys whose unkeyed fallback was sent
+  const panelRunDispatches = new Map(); // token -> timer
+  // Lifecycle prompt ids observed while a panel_run hold is active remain
+  // associated with that dispatch after the 30-second timer expires. Without
+  // this handoff fence, a long render finishing after the timer bypasses
+  // terminalNoKeyCompletion entirely and is marked delivered unkeyed.
+  const panelRunCompletionKeys = new Set();
+  let panelRunLateCapture = false;
+  // A panel_run completion is not retired when the browser socket accepts the
+  // frame. Keep every exact route+agent-session+prompt+nonce identity with the
+  // run so restored same-prompt rows cannot overwrite one another.
+  const completionKeys = new Map(); // composite identity -> completion key
+  const completionMeta = new Map(); // composite identity -> { promptId, completionKey, routeId, sessionId }
+  const completionIdentitiesByPrompt = new Map(); // prompt key -> Set(composite identity)
+
+  function completionIdentity(k, routeId, sessionId, completionKey) {
+    const route = routeId == null ? "" : String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    const exactKey = typeof completionKey === "string" ? completionKey.trim() : "";
+    if (!route || !exactKey) return null;
+    return JSON.stringify([route, session, k, exactKey]);
+  }
+
+  function completionRecords(k) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return [];
+    return [...identities]
+      .map((identity) => completionMeta.get(identity))
+      .filter(Boolean);
+  }
+
+  function hasCompletionRecords(k) {
+    return completionRecords(k).length > 0;
+  }
+
+  function addCompletionRecord(k, { routeId, sessionId, completionKey }) {
+    const identity = completionIdentity(k, routeId, sessionId, completionKey);
+    if (!identity || completionKeys.has(identity)) return false;
+    // #1837 — the identity tuple includes route/session, so the SAME completion key
+    // re-registered under a different route/session would land as a second record and
+    // flush a byte-identical duplicate frame. One key is one receipt no matter which
+    // context re-registers it; distinct SUPPLIED keys still get their own record.
+    if (completionRecords(k).some((record) => record.completionKey === String(completionKey).trim())) {
+      return false;
+    }
+    const route = String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    const exactKey = String(completionKey).trim();
+    completionKeys.set(identity, exactKey);
+    completionMeta.set(identity, {
+      promptId: promptIdOf(k),
+      completionKey: exactKey,
+      routeId: route,
+      sessionId: session,
+    });
+    let identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) {
+      identities = new Set();
+      completionIdentitiesByPrompt.set(k, identities);
+    }
+    identities.add(identity);
+    return true;
+  }
+
+  function removeCompletionRecord(k, completionKey) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return false;
+    let removed = false;
+    for (const identity of [...identities]) {
+      const meta = completionMeta.get(identity);
+      if (meta?.completionKey !== completionKey) continue;
+      completionKeys.delete(identity);
+      completionMeta.delete(identity);
+      identities.delete(identity);
+      removed = true;
+    }
+    if (!identities.size) completionIdentitiesByPrompt.delete(k);
+    return removed;
+  }
+
+  function clearCompletionRecords(k) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return;
+    for (const identity of identities) {
+      completionKeys.delete(identity);
+      completionMeta.delete(identity);
+    }
+    completionIdentitiesByPrompt.delete(k);
+  }
+
+  function completionRecordFor(k, routeId, sessionId) {
+    const records = completionRecords(k);
+    if (routeId === undefined && sessionId === undefined) return records.at(-1) ?? null;
+    const route = routeId == null ? null : String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    return records.find((record) => record.routeId === route && record.sessionId === session) ?? null;
+  }
+
+  function flushWithCompletionRecords(k, payload) {
+    const records = completionRecords(k);
+    if (!records.length) {
+      onFlush(payload);
+      return false;
+    }
+    for (const record of records) {
+      // #1842 — every KEYED frame leaving here is a potential agent turn, and it
+      // is retired only by a receipt, so it spends one of this run's bounded
+      // delivery slots. Counted at the single funnel deliberately: a later emit
+      // site added upstream cannot quietly escape the bound.
+      noteUnackedDelivery(k);
+      onFlush({ ...payload, completionKey: record.completionKey });
+    }
+    return true;
+  }
   // Far beyond any realistic WS-replay-after-reconnect delay, so pruning an entry
   // older than this can never re-open the double-delivery window it guards.
   const deliveredTtlMs = 10 * 60 * 1000;
@@ -146,15 +314,14 @@ export function createRunCompletionTracker({
   const retryCounts = new Map(); // key -> attempts already made
 
   // Pending is a RECOVERY LEDGER, not a debounce cache: it holds exactly the runs
-  // whose completion has NOT been confirmed delivered. Every entry is removed the
-  // instant its run reaches a confirmed terminal outcome — execution_success/error
-  // with a delivered frame, or a /history reconcile — so the map is self-limiting
-  // to the (normally ≤1–2) currently-undelivered runs. It is deliberately NOT
-  // size-capped: evicting an entry would permanently forfeit the ONLY record that
-  // lets a bridge-down completion be recovered on reconnect, defeating #370 for
-  // that prompt (codex P1). Entries are tiny ({promptId, at}); a large batch simply
-  // registers each of its accepted prompt_ids and drains them as they finish —
-  // ledger depth mirrors the actual ComfyUI queue depth, which the server bounds.
+  // whose completion has NOT been confirmed delivered. Ordinary canvas frames can
+  // retire it after transport confirmation; a keyed panel_run stays here until
+  // the orchestrator receipt, so a long render or lost ack remains recoverable.
+  // It is deliberately NOT size-capped: evicting an entry would permanently
+  // forfeit the ONLY record that lets a completion be recovered on reconnect,
+  // defeating #370 for that prompt (codex P1). Entries are tiny ({promptId, at});
+  // a large batch simply registers each accepted prompt_id and drains them as they
+  // finish — ledger depth mirrors the actual ComfyUI queue depth.
   function trackPending(id) {
     if (id == null) return; // no prompt_id ⇒ not reconcilable against /history
     const k = key(id);
@@ -189,6 +356,9 @@ export function createRunCompletionTracker({
     // normally; a `delivered` entry is never in `pending`, so it needs no guard.
     pruneFence(terminal, cutoff, (k) => pending.has(k));
     pruneFence(delivered, cutoff);
+    for (const [k, entry] of terminalNoMediaSuccess) {
+      if (entry.at < cutoff) terminalNoMediaSuccess.delete(k);
+    }
     // `unconfirmedDelivery` is deliberately NOT pruned here — see its declaration:
     // ageing the flag out would turn "we don't know whether the agent was told"
     // back into a claim that it was. It is size-capped instead.
@@ -236,6 +406,12 @@ export function createRunCompletionTracker({
     markTerminal(id);
     touchFence(delivered, k);
     pending.delete(k);
+    // #1842 — the replay budget is scoped to runs still in `pending`; a key
+    // retired from it can never be re-composed by reconcile, so drop the record
+    // rather than let the map outlive what it counts. Deliberately does NOT
+    // touch `awaitingDelivery`/`unconfirmedDelivery` — see the note below on why
+    // this optimistic retire must not release the #585 delivery hold.
+    clearUnackedDeliveries(k);
     // #356 Bug 2 — panelQueued deliberately SURVIVES this. `markDelivered` here is
     // OPTIMISTIC (flush/execution_success/reconcile all call it before the caller has
     // confirmed the frame reached the agent), and markUndelivered can re-pend the run.
@@ -287,6 +463,79 @@ export function createRunCompletionTracker({
   // would already be the real problem, and trading a correctness property for that
   // is a bad trade.
   const unconfirmedDelivery = new Map(); // key -> ts
+  // ── #1842: BOUND the pre-receipt reconcile REPLAY ─────────────────────────
+  //
+  // A keyed panel_run completion deliberately STAYS in `pending` until the
+  // orchestrator's receipt, and #1824 deliberately lets a /history reconcile
+  // REPLAY that completion under the SAME completion key before the receipt
+  // arrives — that is how a frame lost in transit is recovered, and the key is
+  // what makes the replay idempotent downstream.
+  //
+  // What was missing is a BOUND. `reconcileKey`'s only entry guard was
+  // `delivered.has(k) || !pending.has(k)`, and a run awaiting a receipt
+  // satisfies neither — so `hasPending()` stayed true forever, the 20-second
+  // safety sweep re-armed forever, and the same finished run was re-composed and
+  // re-emitted on EVERY tick, for as long as the panel was open. Six such runs
+  // became the reported forty-plus consecutive agent turns of nothing but
+  // replays, continuing long after the agent stopped calling panel_run.
+  //
+  // The premise the unbounded replay rests on — "the key makes it idempotent
+  // downstream" — is a property of the OTHER process, and it was simply false
+  // for the orchestrator the reporters were running: comfyui-mcp did not send
+  // `ack {kind:"completion"}` at all before v0.52.122, so no receipt could ever
+  // arrive and every replay minted a fresh agent turn. A retry whose success
+  // depends on a peer capability it cannot observe must be bounded, or a peer
+  // that never answers turns it into an infinite loop.
+  //
+  // So: the replay stays, and what is counted is the only thing that can
+  // actually reach the agent — a completion frame the TRANSPORT ACCEPTED for
+  // this run which no receipt has retired. Past the budget the panel stops
+  // re-sending; the run simply remains pending-and-unconfirmed, which the #585
+  // machinery already reports honestly (isDeliveryUnconfirmed).
+  //
+  // A transport REFUSAL (markUndelivered) DECREMENTS this by one; it must never
+  // reset it. A refused frame never left the browser, so it must not spend
+  // budget — but it is not evidence about the frames that DID leave, and
+  // treating it as such is how a bound becomes decorative: with a reset, a
+  // flapping bridge (refuse → accept → refuse → accept …) mints one fresh agent
+  // turn per flap, forever, which is the exact failure this exists to stop
+  // (codex gate R1 P1). Decrementing yields precisely the wanted quantity —
+  // emissions minus known failures, i.e. frames that plausibly reached someone —
+  // so a run whose frames are ALWAYS refused is retried without limit (#370 /
+  // #1739 untouched: nothing ever landed), while the number that can LAND is
+  // capped however the transport behaves.
+  //
+  // Cleared outright only when the run is retired: a confirmed delivery
+  // (markDelivered / acknowledgeDelivery) or an eviction. Nothing else may clear
+  // it, because nothing else is evidence about frames already accepted.
+  //
+  // Deliberately NOT keyed off `awaitingDelivery`: that is a 120s watchdog whose
+  // expiry is a #585 DISCLOSURE signal, not permission to compose another frame.
+  const unackedDeliveries = new Map(); // key -> frames accepted, none acked yet
+  // Three (~60s at RUN_RECONCILE_SWEEP_MS: one live delivery + two sweeps) is a
+  // generous allowance for a frame genuinely lost in transit and still finite. A
+  // fourth would not recover anything the first three did not — nothing about
+  // the run changes between ticks except the clock.
+  const maxUnackedDeliveries = 3;
+  function clearUnackedDeliveries(k) {
+    unackedDeliveries.delete(k);
+  }
+  /** A completion frame for `k` has just been handed to the caller. */
+  function noteUnackedDelivery(k) {
+    if (k === NO_PROMPT_KEY) return;
+    if (!hasCompletionRecords(k)) return; // an unkeyed run is retired by its caller
+    unackedDeliveries.set(k, (unackedDeliveries.get(k) ?? 0) + 1);
+  }
+  /** …and the caller has reported that THAT one never left the browser. */
+  function releaseUnackedDelivery(k) {
+    const outstanding = unackedDeliveries.get(k);
+    if (outstanding === undefined) return;
+    if (outstanding <= 1) unackedDeliveries.delete(k);
+    else unackedDeliveries.set(k, outstanding - 1);
+  }
+  function unackedDeliveriesExhausted(k) {
+    return (unackedDeliveries.get(k) ?? 0) >= maxUnackedDeliveries;
+  }
   // Bound the in-flight window well past any realistic compose (metadata HEADs +
   // video storyboard sampling).
   const deliveryConfirmTimeoutMs = 120000;
@@ -313,6 +562,89 @@ export function createRunCompletionTracker({
         flagUnconfirmedDelivery(k);
       }, deliveryConfirmTimeoutMs),
     );
+  }
+
+  function releaseUnkeyedCompletion(k, payload, { retire = false } = {}) {
+    if (terminalNoKeyFlushed.has(k)) {
+      if (retire) {
+        terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        markDelivered(k);
+        notifyTerminalCompletionStateChange();
+      }
+      return;
+    }
+    if (k !== NO_PROMPT_KEY && !pending.has(k)) {
+      pending.set(k, { promptId: k, at: now() });
+    }
+    terminalNoKeyFlushed.add(k);
+    markTerminal(k);
+    markDispatched(k);
+    onFlush({
+      ...payload,
+      key: k,
+      promptId: payload.promptId ?? promptIdOf(k),
+      awaitingCompletionKey: true,
+    });
+    if (retire) {
+      terminalNoKeyCompletion.delete(k);
+      terminalNoKeyFlushed.delete(k);
+      markDelivered(k);
+    }
+    notifyTerminalCompletionStateChange();
+  }
+
+  function releaseHeldUnkeyedCompletions() {
+    if (panelRunDispatches.size) return;
+    for (const [k, payload] of [...terminalNoKeyCompletion]) {
+      releaseUnkeyedCompletion(k, payload);
+    }
+  }
+
+  function notePanelRunLifecycle(k) {
+    if (k === NO_PROMPT_KEY) return;
+    if (panelRunDispatches.size || panelRunLateCapture) {
+      panelRunCompletionKeys.add(k);
+      if (!panelRunDispatches.size) panelRunLateCapture = false;
+    }
+  }
+
+  function completionMetadataSnapshot() {
+    return [...completionMeta.values()].map((value) => ({ ...value }));
+  }
+
+  function terminalCompletionMetadataSnapshot() {
+    return [...terminalNoKeyCompletion.entries()].map(([promptId, payload]) => ({
+      promptId,
+      payload: {
+        promptId,
+        images: Array.isArray(payload?.images) ? [...payload.images] : [],
+        videos: Array.isArray(payload?.videos) ? [...payload.videos] : [],
+        durationMs: Number.isFinite(payload?.durationMs) ? payload.durationMs : null,
+        finishedAt: Number.isFinite(payload?.finishedAt) ? payload.finishedAt : null,
+        ...(typeof payload?.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
+        ...(typeof payload?.looksCached === "boolean" ? { looksCached: payload.looksCached } : {}),
+      },
+      unkeyedFlushed: terminalNoKeyFlushed.has(promptId),
+    }));
+  }
+
+  function notifyCompletionStateChange() {
+    if (typeof onCompletionStateChange !== "function") return;
+    try {
+      onCompletionStateChange(completionMetadataSnapshot());
+    } catch {
+      /* persistence is best-effort and must never affect delivery */
+    }
+  }
+
+  function notifyTerminalCompletionStateChange() {
+    if (typeof onTerminalCompletionStateChange !== "function") return;
+    try {
+      onTerminalCompletionStateChange(terminalCompletionMetadataSnapshot());
+    } catch {
+      /* persistence is best-effort and must never affect delivery */
+    }
   }
 
   function clearReconcileRetry(k) {
@@ -415,17 +747,11 @@ export function createRunCompletionTracker({
     // A panel-queued delivery still records its signature, so a canvas re-queue of
     // the SAME output afterwards is recognised rather than getting one free pass.
     if (panelQueued.has(k)) deduper.record({ signature, promptId: promptIdOf(k) });
-    // Optimistically mark delivered so a reconnect-triggered reconcile racing
-    // this flush can't double-deliver the same prompt. If the caller reports the
-    // send FAILED (bridge down), it calls markUndelivered() to re-pend it (#370).
-    markDelivered(k);
-    // …but that optimism is NOT proof the agent was told: the caller composes and
-    // sends asynchronously. Hold the run as "delivery in flight" until the caller
-    // confirms via markDelivered()/markUndelivered(), so isSettled() can't report
-    // it settled mid-window (#585). Set synchronously, before onFlush, so no
-    // observer can sample the gap.
-    markDispatched(k);
-    onFlush({
+    // A successful browser write is not proof the orchestrator received the
+    // completion. Keep panel_run in pending until the matching completion ack;
+    // the stable key makes every /history replay idempotent downstream.
+    const hasCompletionKey = hasCompletionRecords(k);
+    const payload = {
       key: k,
       promptId: promptIdOf(k),
       images: buf.images,
@@ -438,7 +764,34 @@ export function createRunCompletionTracker({
       ...(verdict.duplicateOf
         ? { duplicateOf: verdict.duplicateOf, looksCached: !!verdict.looksCached }
         : {}),
-    });
+    };
+    if (
+      !hasCompletionKey &&
+      (panelRunDispatches.size || panelRunCompletionKeys.has(k)) &&
+      k !== NO_PROMPT_KEY
+    ) {
+      // Do not retire this as an ordinary canvas completion while a panel_run
+      // dispatch is waiting for its delayed prompt receipt. The bounded dispatch
+      // hold lets onQueued re-key the exact media batch; its timer is the explicit
+      // compatibility fence for a legacy/aborted queue response.
+      terminalNoKeyCompletion.set(k, payload);
+      markTerminal(k);
+      notifyTerminalCompletionStateChange();
+      // Once the bounded hold has expired, release the unkeyed best-effort
+      // frame immediately but retain the terminal record for keyed replay.
+      if (!panelRunDispatches.size) releaseUnkeyedCompletion(k, payload);
+      return;
+    }
+    markTerminal(k);
+    markDispatched(k);
+    if (!hasCompletionKey) markDelivered(k);
+    if (
+      k !== NO_PROMPT_KEY &&
+      payload.images.some((image) => image?.type === "temp")
+    ) {
+      liveReplays.set(k, payload);
+    }
+    flushWithCompletionRecords(k, payload);
   }
 
   /**
@@ -471,6 +824,33 @@ export function createRunCompletionTracker({
   async function reconcileKey(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
+    // #1842 — this run's bounded number of completion frames have already been
+    // handed over and no receipt has retired any of them. Refuse BEFORE the
+    // /history probe, so an orchestrator that never acks stops costing a fetch
+    // AND an agent turn on every sweep tick, forever. A frame the transport
+    // REFUSED does not count against this (markUndelivered gives that one slot
+    // back), so a run nothing ever accepted is still retried without limit —
+    // see `unackedDeliveries` for why that is a decrement and never a reset.
+    if (unackedDeliveriesExhausted(k)) return null;
+    // A timeout-released panel_run already owns the exact media batch, but its
+    // delayed /prompt identity has not supplied the completion key yet. Do not
+    // replace that recoverable record with an unkeyed /history delivery: the
+    // later onQueued callback must still be able to bind and replay it.
+    if (terminalNoKeyCompletion.has(k) && !hasCompletionRecords(k)) {
+      return { promptId, status: "success", delivered: false };
+    }
+    // #1619 — a live executed batch is stronger than a remote history probe:
+    // it is the exact output for this prompt, already observed on the panel's
+    // authenticated websocket. Retain the temp PreviewImage descriptor when a
+    // bridge send failed, and replay it without requiring /history to succeed.
+    const liveReplay = liveReplays.get(k);
+    if (liveReplay) {
+      if (hasCompletionRecords(k)) markTerminal(k);
+      else markDelivered(k);
+      markDispatched(k);
+      flushWithCompletionRecords(k, { ...liveReplay, replayed: true });
+      return { promptId, status: "success", delivered: true };
+    }
     let entry = null;
     let fetchThrew = false;
     try {
@@ -483,7 +863,9 @@ export function createRunCompletionTracker({
     if (delivered.has(k) || !pending.has(k)) return null;
 
     // parseHistoryEntry returns null for null/undefined/non-object entries.
-    const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo });
+    // `now` is threaded through so the future-skew rejection on the entry's own
+    // timestamps is measured against the SAME clock the tracker uses (#1199).
+    const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo, now });
 
     // ── NON-terminal outcomes (never deliver here; decide retry vs give-up) ──
     if (!parsed || !parsed.terminal) {
@@ -518,8 +900,8 @@ export function createRunCompletionTracker({
     }
 
     // ── Terminal. Retire ALL live state for this key so a stale partial buffer (from
-    // pre-drop `executed` events) can't double-deliver later, and mark it delivered
-    // BEFORE onFlush so a concurrent reconcile can't race it.
+    // pre-drop `executed` events) can't double-deliver later. The terminal fence is
+    // marked before onFlush; keyed panel_run delivery remains pending until its ack.
     const buf = buffers.get(k);
     if (buf?.timer) clearTimer(buf.timer);
     buffers.delete(k);
@@ -532,7 +914,17 @@ export function createRunCompletionTracker({
     // media-less recovery below would never fire — the mistake this line exists to
     // prevent, and the one the reconcile test caught.
     const wasPanelQueued = panelQueued.has(k);
-    markDelivered(k); // also clears any scheduled retry for this key
+    const hasCompletionKey = hasCompletionRecords(k);
+    const holdsForCompletionAck =
+      wasPanelQueued && parsed.status === "success" && hasCompletionKey;
+    if (holdsForCompletionAck) {
+      // The terminal fence is needed to suppress late ComfyUI lifecycle events,
+      // but the recovery ledger must remain until the orchestrator receipt.
+      markTerminal(k);
+      clearReconcileRetry(k);
+    } else {
+      markDelivered(k); // also clears any scheduled retry for this key
+    }
     if (parsed.status === "error") {
       // Deliver the terminal error through the SAME hook whether we're in the
       // reconcile loop OR a scheduled retry — otherwise a transient /history miss
@@ -569,7 +961,28 @@ export function createRunCompletionTracker({
     // promise, so only that one is worth waking the agent for when it finished empty.
     const mediaLessQueued = !hasBatch && wasPanelQueued;
     if (hasBatch || mediaLessQueued) {
-      const durationMs = startTs != null ? now() - startTs : null;
+      // #1199 — a completion recovered from /history must report when the run
+      // REALLY finished, not when the recovery happened. `now()` here is the
+      // DELIVERY time: a reconcile edge (tab wake / reconnect) that swept seven
+      // days-old prompts stamped every one of them with the same second, so the
+      // agent announced long-since-moved files as "finished 7:45:29 AM". The
+      // entry's own execution_success message carries the truthful moment; null
+      // when this ComfyUI build records none, which the composer states as an
+      // unknown rather than papering over with its own clock.
+      const historyFinishedAt = parsed.finishedAt ?? null;
+      // Duration is derived ONLY from two truthful wall-clock endpoints. The old
+      // `now() - startTs` measured the RECONCILE GAP, not the render — for the
+      // #1199 burst it reads "rendered in 2 days". Prefer the entry's own
+      // start→success span; fall back to the start we OBSERVED only when a real
+      // finish time bounds it. With neither, the duration is genuinely unknown
+      // and is reported as unknown rather than invented (the #986 discipline:
+      // a duration the tracker made up is not evidence of anything).
+      const span = (from, to) =>
+        from != null && to != null && Number.isFinite(from) && Number.isFinite(to) && to >= from
+          ? to - from
+          : null;
+      const durationMs =
+        span(parsed.startedAt ?? null, historyFinishedAt) ?? span(startTs, historyFinishedAt);
       // Same async-delivery hold as flush(): the reconciled batch is composed and
       // sent by the caller, so it is not "delivered" until the caller says so.
       markDispatched(k);
@@ -580,13 +993,14 @@ export function createRunCompletionTracker({
       // Recorded, never suppressed: a reconcile exists to deliver something the agent
       // has NOT been told about, so it always goes through.
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
-      onFlush({
+      flushWithCompletionRecords(k, {
         key: k,
         promptId,
         images: parsed.images,
         videos: parsed.videos,
         durationMs,
-        finishedAt: now(),
+        // Epoch ms of the REAL finish, or null when history records none (#1199).
+        finishedAt: historyFinishedAt,
         reconciled: true,
         ...(mediaLessQueued ? { noMedia: true } : {}),
       });
@@ -625,7 +1039,14 @@ export function createRunCompletionTracker({
     starts.delete(k);
     startObserved.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
+    clearUnackedDeliveries(k); // #1842 — the run is gone; nothing left to bound
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
+    liveReplays.delete(k);
+    clearCompletionRecords(k);
+    panelRunCompletionKeys.delete(k);
+    terminalNoKeyCompletion.delete(k);
+    terminalNoKeyFlushed.delete(k);
+    notifyTerminalCompletionStateChange();
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
     if (typeof onReconcileGiveUp === "function") {
       try {
@@ -696,6 +1117,7 @@ export function createRunCompletionTracker({
       // being RE-PENDED for retry (markUndelivered clears `delivered` but not
       // `terminal`). NO_PROMPT_KEY is never in `terminal`, so id-less runs proceed.
       if (terminal.has(k)) return;
+      notePanelRunLifecycle(k);
       // Runs are sequential: a new run beginning means EVERY prior run has ended
       // (even one whose end signal we missed). Flush every existing buffer under
       // ITS OWN key/timing first, so an older buffer — including a legacy
@@ -738,6 +1160,7 @@ export function createRunCompletionTracker({
       markStart(id, { observed: false });
       trackPending(id);
       const k = key(id);
+      notePanelRunLifecycle(k);
       const buf = ensureBuffer(k);
       if (images.length) buf.images.push(...images);
       if (videos.length) buf.videos.push(...videos);
@@ -757,6 +1180,7 @@ export function createRunCompletionTracker({
     startObserved.delete(k);
         return;
       }
+      notePanelRunLifecycle(k);
       // #356 Bug 2 — a run that produced NO image and NO video buffers nothing
       // (onExecuted discards a media-less `executed`), so flush() returns at its
       // `!buf` guard and the agent is never told the run finished. For a canvas run
@@ -768,18 +1192,33 @@ export function createRunCompletionTracker({
       // ones (onQueued populates it), so a user's own UI run stays silent and no new
       // wakeups are introduced.
       //
-      // Both reads happen BEFORE flush(): a flush that delivers calls markDelivered
-      // (removing the key from `pending`) and retires the duration start.
-      const mediaLess = !hasBufferedMedia(k) && panelQueued.has(k);
+      // Both reads happen BEFORE flush(): a flush that delivers an ordinary canvas
+      // completion calls markDelivered (removing the key from `pending`) and retires
+      // the duration start. A keyed panel_run remains pending until its receipt.
+      // Snapshot this before flush(): flush() consumes the media buffers, so
+      // checking hasBufferedMedia(k) afterwards would misclassify a media run
+      // as a late media-less success.
+      const hasMedia = hasBufferedMedia(k);
+      const mediaLess = !hasMedia && panelQueued.has(k);
       const mediaLessStart = mediaLess ? starts.get(k) : null;
       flush(k);
+      // `flush` deliberately held this media batch because the panel_run
+      // dispatch had not received its delayed prompt id yet. It is not an
+      // ordinary unkeyed canvas completion and must not be marked delivered
+      // before onQueued can replay it with the stable key.
+      if (terminalNoKeyCompletion.has(k)) {
+        starts.delete(k);
+        startObserved.delete(k);
+        return;
+      }
       if (mediaLess) {
-        // Same ordering as flush(): retire from pending first so a reconnect
-        // reconcile racing this cannot deliver the same run twice, then hold it as
-        // delivery-in-flight until the caller confirms (#585).
-        markDelivered(k);
+        // Keep the panel_run in the recovery ledger until the orchestrator
+        // acknowledges this exact completion. The terminal fence still blocks
+        // late lifecycle events while /history reconciliation remains active.
+        markTerminal(k);
+        clearReconcileRetry(k);
         markDispatched(k);
-        onFlush({
+        flushWithCompletionRecords(k, {
           key: k,
           promptId: promptIdOf(k),
           images: [],
@@ -788,14 +1227,26 @@ export function createRunCompletionTracker({
           finishedAt: now(),
           noMedia: true,
         });
+        terminalNoMediaSuccess.delete(k);
+      } else if (!hasMedia) {
+        // The success was terminal, but onQueued may still be waiting for the
+        // delayed /prompt response. Do not emit for an ordinary canvas run;
+        // retain the success so a late panel receipt can apply the promise.
+        const finishedAt = now();
+        terminalNoMediaSuccess.set(k, {
+          promptId: promptIdOf(k),
+          durationMs: starts.has(k) ? finishedAt - starts.get(k) : null,
+          finishedAt,
+          at: finishedAt,
+        });
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
       starts.delete(k);
     startObserved.delete(k);
-      // A terminal success we OBSERVED live needs no /history reconcile — clear it
-      // from pending. (If the completion frame is later reported undelivered, the
-      // caller's markUndelivered re-pends it, so a bridge-down drop still recovers.)
-      markDelivered(k);
+      // A panel_run remains owed until the orchestrator explicitly acknowledges
+      // the completion frame. Ordinary canvas runs retain the legacy transport
+      // confirmation behavior.
+      if (!hasCompletionRecords(k)) markDelivered(k);
     },
 
     /** ComfyUI `execution_error` — drop this prompt's buffer, deliver no batch. */
@@ -805,12 +1256,19 @@ export function createRunCompletionTracker({
       const buf = buffers.get(k);
       if (buf?.timer) clearTimer(buf.timer);
       buffers.delete(k);
+      terminalNoMediaSuccess.delete(k);
       starts.delete(k);
     startObserved.delete(k);
       // If already terminal (reconcile surfaced this run's outcome), don't re-mark
       // (which would clear a re-pend). The caller uses wasTerminal() BEFORE calling
       // this to suppress a duplicate run_error frame (codex P1).
-      if (!terminal.has(k)) markDelivered(k);
+      if (!terminal.has(k)) {
+        panelRunCompletionKeys.delete(k);
+        terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        notifyTerminalCompletionStateChange();
+        markDelivered(k);
+      }
     },
 
     /**
@@ -862,36 +1320,151 @@ export function createRunCompletionTracker({
      * execution_start/executing/executed ever reaches us — is still reconcilable
      * against /history because we recorded its prompt_id at queue time.
      */
-    onQueued(id) {
+    onQueued(id, { routeId, sessionId = null, completionKey, dispatchToken = null } = {}) {
+      const k = key(id);
       trackPending(id);
+      let nextKey = null;
       // #356 Bug 2 — records that THIS run carried panel_run's wait-for-it promise.
-      if (id != null) panelQueued.add(key(id));
+      if (id != null) {
+        panelQueued.add(k);
+        const suppliedKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
+        // #1837 — retaining several SUPPLIED identities for one prompt is deliberate:
+        // each one is a receipt the orchestrator opened, and each is owed its own
+        // frame. Minting is different. createRunCompletionKey salts with
+        // Date.now()+Math.random(), so a repeat registration of a run we already hold
+        // would invent an identity NO orchestrator ticket knows — and since the flush
+        // emits one frame per record, that invented row becomes a second agent turn
+        // for a single finished run. Reuse what the run already carries instead.
+        // This is the term 4641ed01 added alongside the salt, replacing a key its own
+        // comment called "deterministic across retries"; #1833 dropped it.
+        const existingKey = completionRecordFor(k)?.completionKey ?? null;
+        nextKey = suppliedKey || existingKey || createRunCompletionKey(routeId, sessionId, k);
+        if (nextKey) {
+          if (addCompletionRecord(k, { completionKey: nextKey, routeId, sessionId })) {
+            notifyCompletionStateChange();
+          }
+        }
+      }
+      if (dispatchToken && panelRunDispatches.has(dispatchToken)) {
+        // Keep the dispatch hold until its bounded timer expires. A batch may
+        // produce more than one prompt id, and a later id can still be waiting.
+      }
+      const lateMedia = id != null ? terminalNoKeyCompletion.get(k) : null;
+      if (lateMedia) {
+        terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        panelRunCompletionKeys.delete(k);
+        notifyTerminalCompletionStateChange();
+        delivered.delete(k);
+        if (hasCompletionRecords(k)) {
+          if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
+          markTerminal(k);
+          clearReconcileRetry(k);
+          markDispatched(k);
+          flushWithCompletionRecords(k, { ...lateMedia, key: k });
+        } else {
+          releaseUnkeyedCompletion(k, lateMedia, { retire: true });
+        }
+      }
+      // #1728 P2 — execution_success can win the race with the delayed /prompt
+      // response. The terminal fence correctly blocks re-pending, but before this
+      // handoff the media-less decision had already observed panelQueued=false.
+      // Consume the retained terminal success once, then use the same onFlush /
+      // delivery-fence path as an on-time panel queue.
+      const lateSuccess = id != null ? terminalNoMediaSuccess.get(k) : null;
+      if (lateSuccess) {
+        terminalNoMediaSuccess.delete(k);
+        panelRunCompletionKeys.delete(k);
+        delivered.delete(k);
+        if (hasCompletionRecords(k)) {
+          if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
+          markTerminal(k);
+          clearReconcileRetry(k);
+        } else {
+          markDelivered(k);
+        }
+        markDispatched(k);
+        flushWithCompletionRecords(k, {
+          key: k,
+          promptId: lateSuccess.promptId,
+          images: [],
+          videos: [],
+          durationMs: lateSuccess.durationMs,
+          finishedAt: lateSuccess.finishedAt,
+          noMedia: true,
+        });
+      }
+      return nextKey;
     },
 
     /**
-     * Caller reports the completion frame for `id` was CONFIRMED delivered to the
-     * agent (sendFrame succeeded / batch was empty). Retires it from pending.
+     * Caller reports the completion frame for `id` was confirmed delivered to the
+     * agent (legacy transport confirmation, an empty batch, or the keyed
+     * orchestrator receipt). Retires it from pending and drops any retained replay.
      */
-    markDelivered(id) {
+    markDelivered(id, completionKey) {
+      const k = key(id);
+      const exactKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
+      if (exactKey) {
+        if (!removeCompletionRecord(k, exactKey)) return;
+        if (hasCompletionRecords(k)) {
+          notifyCompletionStateChange();
+          return;
+        }
+      } else {
+        clearCompletionRecords(k);
+      }
       // The CALLER confirming delivery is the only proof the agent was told, so
       // this — not the tracker's own optimistic retire — is what releases the
       // delivery hold isSettled() reports on (#585).
-      clearAwaitingDelivery(key(id));
+      clearAwaitingDelivery(k);
       // #356 Bug 2 — and it is the only point at which the panel-queued mark can be
       // retired safely, for the same reason: before this, a re-pend is still possible.
-      panelQueued.delete(key(id));
+      panelQueued.delete(k);
+      liveReplays.delete(k);
+      terminalNoKeyCompletion.delete(key(id));
+      terminalNoKeyFlushed.delete(key(id));
+      panelRunCompletionKeys.delete(key(id));
+      notifyCompletionStateChange();
+      notifyTerminalCompletionStateChange();
       markDelivered(id);
     },
 
     /**
-     * Caller reports the completion frame for `id` could NOT be delivered (bridge
-     * down when the flush fired). Re-pend it so the next reconnect recovers it via
-     * /history — this is what makes a bridge-down drop, where we DID observe the
-     * terminal success, still deliver the result on reconnect (#370).
+     * The orchestrator accepted this exact completion frame. A prompt id alone
+     * is insufficient: a stale receipt must not retire a newer route's run.
      */
-    markUndelivered(id) {
+    acknowledgeDelivery(id, completionKey) {
+      if (id == null || typeof completionKey !== "string") return false;
+      const k = key(id);
+      if (!removeCompletionRecord(k, completionKey)) return false;
+      if (hasCompletionRecords(k)) {
+        notifyCompletionStateChange();
+        return true;
+      }
+      clearAwaitingDelivery(k);
+      panelQueued.delete(k);
+      liveReplays.delete(k);
+      terminalNoKeyCompletion.delete(k);
+      terminalNoKeyFlushed.delete(k);
+      panelRunCompletionKeys.delete(k);
+      notifyCompletionStateChange();
+      notifyTerminalCompletionStateChange();
+      markDelivered(k);
+      return true;
+    },
+
+    /**
+     * Caller reports the completion frame for `id` could NOT be delivered (bridge
+     * down when the flush fired). Re-pend it so the next reconnect first replays
+     * the live batch, then falls back to /history when the lifecycle output was
+     * not observed (#370/#1619).
+     */
+    markUndelivered(id, completionKey) {
       if (id == null) return;
       const k = key(id);
+      const exactKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
+      if (exactKey && !completionRecords(k).some((record) => record.completionKey === exactKey)) return;
       // Clear ONLY the delivery/reconcile fence so the outcome is re-reconciled and
       // re-delivered. The `terminal` REPLAY fence is deliberately LEFT intact: the
       // run already completed, so a late/replayed execution_start for it must stay
@@ -899,20 +1472,106 @@ export function createRunCompletionTracker({
       // cancel any in-flight retry so the re-pend restarts cleanly on the next edge.
       delivered.delete(k);
       clearReconcileRetry(k);
+      // #1842 — that frame never left the browser, so it must not spend a
+      // delivery slot. Give exactly IT back, and nothing more: a refusal says
+      // nothing about the frames that DID leave, and resetting the count on one
+      // would let a flapping transport mint an unbounded number of agent turns
+      // for one finished run — the bound this change exists to impose.
+      releaseUnackedDelivery(k);
       // It is back to being OWED, not in-flight — drop the delivery hold so the
       // 120s backstop can't be what decides isSettled() for it (#585).
       clearAwaitingDelivery(k);
       if (!pending.has(k)) pending.set(k, { promptId: k, at: now() }); // normalized string id
+      notifyCompletionStateChange();
+      // comfyui-mcp#1739 — the re-pend is only half the recovery: the ledger the
+      // run just re-entered may have NO sweeper left (the safety sweep disarmed
+      // during the optimistic-retire window), so notify the wiring to re-arm it.
+      if (typeof onRepend === "function") onRepend(promptIdOf(k));
+    },
+
+    /** Mark a panel_run dispatch as active before queuePrompt starts. */
+    beginPanelRun() {
+      const token = `panel-run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+      const timer = setTimer(() => {
+        panelRunDispatches.delete(token);
+        if (!panelRunDispatches.size) panelRunLateCapture = true;
+        releaseHeldUnkeyedCompletions();
+      }, 30_000);
+      panelRunDispatches.set(token, timer);
+      return token;
+    },
+
+    /** End a known dispatch without disturbing prompt ids already registered. */
+    endPanelRun(token) {
+      if (!token || !panelRunDispatches.has(token)) return;
+      const timer = panelRunDispatches.get(token);
+      if (timer != null) clearTimer(timer);
+      panelRunDispatches.delete(token);
+      releaseHeldUnkeyedCompletions();
+    },
+
+    /** Stable key used by the matching run_receipt control frame. */
+    completionKeyFor(id, routeId, sessionId) {
+      return completionRecordFor(key(id), routeId, sessionId)?.completionKey ?? null;
+    },
+
+    /** Persistable route/session/key metadata for pending panel-run ids. */
+    completionMetadata() {
+      return completionMetadataSnapshot();
+    },
+
+    /** Persistable terminal media held for a delayed prompt-scoped key. */
+    terminalCompletionMetadata() {
+      return terminalCompletionMetadataSnapshot();
+    },
+
+    /** Restore one held terminal record after teardown/reload. */
+    restoreTerminalCompletion(entry) {
+      const k = key(entry?.promptId);
+      const payload = entry?.payload;
+      if (
+        k === NO_PROMPT_KEY ||
+        !payload ||
+        typeof payload !== "object" ||
+        (!Array.isArray(payload.images) && !Array.isArray(payload.videos)) ||
+        (!payload.images?.length && !payload.videos?.length)
+      ) {
+        return false;
+      }
+      terminalNoKeyCompletion.set(k, {
+        key: k,
+        promptId: k,
+        images: Array.isArray(payload.images) ? [...payload.images] : [],
+        videos: Array.isArray(payload.videos) ? [...payload.videos] : [],
+        durationMs: Number.isFinite(payload.durationMs) ? payload.durationMs : null,
+        finishedAt: Number.isFinite(payload.finishedAt) ? payload.finishedAt : null,
+        ...(typeof payload.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
+        ...(typeof payload.looksCached === "boolean" ? { looksCached: payload.looksCached } : {}),
+      });
+      if (entry.unkeyedFlushed === true) terminalNoKeyFlushed.add(k);
+      else terminalNoKeyFlushed.delete(k);
+      panelRunCompletionKeys.add(k);
+      if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
+      markTerminal(k);
+      return true;
+    },
+
+    dispose() {
+      for (const timer of panelRunDispatches.values()) {
+        try { clearTimer(timer); } catch {}
+      }
+      panelRunDispatches.clear();
+      panelRunLateCapture = false;
     },
 
     /**
      * True when NO completion frame is still owed to the agent for `id` — the run
-     * is neither pending recovery NOR mid-delivery. This is the honest answer to
-     * "has the agent been told?", as opposed to `hasPending()`/`_pending`, which
-     * go false the instant flush() optimistically retires a run, before the
-     * caller's async compose+send has resolved. #585 gates the post-restart resume
-     * nudge on this so the nudge can never overtake the completion it is waiting
-     * for. An id the tracker has never heard of is settled (nothing is owed).
+     * is neither pending recovery NOR mid-delivery. For legacy canvas runs,
+     * `hasPending()` can go false when flush() optimistically retires the run,
+     * before async compose+send resolves; keyed panel_run completions remain in
+     * pending until the orchestrator receipt. #585 gates the post-restart resume
+     * nudge on this so it can never overtake the completion it is waiting for.
+     * An id the tracker has never heard of is settled (nothing is owed).
      */
     isSettled(id) {
       const k = key(id);
@@ -1009,10 +1668,11 @@ export function createRunCompletionTracker({
     async reconcile({ fetchHistory, fetchQueued, isVideo } = {}) {
       const summary = [];
       pruneFences(); // reconnect is a natural sweep point for old fences
-      if (typeof fetchHistory !== "function") return summary;
+      const canFetchHistory = typeof fetchHistory === "function";
       for (const [, info] of [...pending.entries()]) {
         const promptId = info.promptId;
         if (promptId == null) continue;
+        if (!canFetchHistory && !liveReplays.has(key(promptId))) continue;
         const row = await reconcileKey(promptId, fetchHistory, fetchQueued, isVideo);
         if (!row) continue; // resolved by a live event meanwhile — nothing to report
         const clean = { promptId: row.promptId, status: row.status };
@@ -1052,11 +1712,16 @@ export function createRunCompletionTracker({
     // Introspection for tests / diagnostics.
     _active: active,
     _buffers: buffers,
+    _liveReplays: liveReplays,
     _starts: starts,
     _pending: pending,
     _delivered: delivered,
     _terminal: terminal,
     _awaitingDelivery: awaitingDelivery,
     _unconfirmedDelivery: unconfirmedDelivery,
+    _unackedDeliveries: unackedDeliveries,
+    _terminalNoKeyCompletion: terminalNoKeyCompletion,
+    _terminalNoKeyFlushed: terminalNoKeyFlushed,
+    _panelRunCompletionKeys: panelRunCompletionKeys,
   };
 }

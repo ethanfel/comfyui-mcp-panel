@@ -1,5 +1,12 @@
+import { fireNodeWidgetChanged } from "./node-widget-changed.js";
 import { pressableWidgetHint } from "./pressable-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
+import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
+import {
+  boundPropertyFailure,
+  boundPropertyState,
+  boundPropertyUnverifiedNote,
+} from "./widget-bound-property.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -37,6 +44,55 @@ function describeThrown(err) {
   }
 }
 
+/**
+ * #976: the first stack frame OUTSIDE this write path, as scrubbed data.
+ *
+ * `describeThrown` renders the message and nothing else, and the Error is caught
+ * inside this lib so it never reaches the console — so a callback's throw used to
+ * leave NO evidence of WHERE it threw, and the maintainer was reduced to asking
+ * reporters for a stack the panel itself made unobtainable. This emits the single
+ * most useful fact: the innermost frame that is not this module or its set-widget
+ * driver, which names the FILE the throw surfaced from.
+ *
+ * A frame is an OBSERVATION, not an attribution — unlike `write_warning_source` it
+ * claims nothing about which construct failed, so it is emitted for the
+ * unattributed branch too.
+ *
+ * Totality, same contract as describeThrown: `err.stack` may be a throwing accessor
+ * (a hostile Proxy), a non-Error throw has no stack at all, and a frame line may be
+ * any shape — so every read is guarded and any surprise yields null, never a throw
+ * from the path that exists to report one.
+ *
+ * Scrubbing, because this text is pasted into public issues: the frame's ORIGIN
+ * (scheme://host:port, which identifies the reporter's machine) is stripped, keeping
+ * only the URL path — `/extensions/<pack>/<file>.js:LINE:COL` is what a maintainer
+ * needs. Length is capped so a minified single-line bundle cannot make the envelope
+ * unwieldy.
+ */
+function describeThrownFrame(err) {
+  try {
+    const stack = err?.stack;
+    if (typeof stack !== "string" || !stack) return null;
+    for (const line of stack.split("\n")) {
+      const trimmed = line.trim();
+      // V8 ("at fn (url:line:col)") and SpiderMonkey ("fn@url:line:col") both carry
+      // the URL; the message header and anything else is skipped.
+      if (!trimmed.startsWith("at ") && !trimmed.includes("@")) continue;
+      // Frames from the write path itself say where the PANEL was, not where the
+      // throw surfaced — step past them to the first frame that is not ours.
+      if (trimmed.includes("widget-write.js") || trimmed.includes("set-widget.js")) continue;
+      // Strip the origin, keep the path. If the URL shape is not recognized the
+      // frame is still usable — the path is what carries the information.
+      let frame = trimmed.replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s)]+(?=\/)/g, "");
+      if (frame.length > 240) frame = frame.slice(0, 237) + "...";
+      return frame;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
@@ -70,9 +126,23 @@ function describeThrown(err) {
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false, emptyOptions = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false, unreadableOptions = false, partialWrite = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // #1126 — the graph WAS MUTATED and the rollback did not fully take. Every other
+    // WidgetWriteError is a pre-mutation refusal: nothing was applied, and a caller may
+    // safely reword it as "refused". This one must never be reworded that way, because
+    // telling a caller "nothing was applied" when something was is precisely the class of
+    // false report this change exists to eliminate. Callers that frame refusals check it.
+    this.partialWrite = partialWrite;
+    // #1126 — `unreadableOptions` narrows `combo` to the OTHER unknowable case: the
+    // option list could not be READ AT ALL, because `options.values` is a callback that
+    // threw, returned a non-list, or is absent. That is an OBSERVATION about the LIST,
+    // not a verdict about the VALUE — nothing was ever compared — so runSetWidget's
+    // #1126 last-resort may act on it, and never on a "not a valid option" miss against
+    // a list it read successfully. Destructured explicitly: this constructor drops meta
+    // it does not name, so a flag that is not added here is silently lost.
+    this.unreadableOptions = unreadableOptions;
     // `emptyOptions` narrows `combo` to the ONE case runSetWidget's #507 last-resort
     // path may act on: the option list was READ successfully and is EMPTY. It is set
     // ONLY by that branch, so the caller never has to pattern-match a message, and a
@@ -88,21 +158,77 @@ export class WidgetWriteError extends Error {
 }
 
 /**
- * The current option list for a combo widget, or null if it cannot be read.
- * `options.values` may be an array or a function `(widget) => string[]`
- * (litegraph dynamic combos). A function that throws yields null (unreadable).
+ * #1126 — READ a combo's current option list ONCE and report WHAT WAS OBSERVED.
+ *
+ * `options.values` may be an array or a function `(widget) => string[]` (litegraph
+ * dynamic combos). That function is the node's own code: it can mutate the widget and
+ * it can fail. So there are two materially different outcomes, and collapsing them into
+ * a bare `null` is what made the panel answer "not a valid option" for a list it had
+ * never actually read:
+ *
+ *   * READ  — `{ options: [...] }`. Membership is decidable. An off-list value is a
+ *             genuine rejection (a typo, a model that is not installed).
+ *   * UNREADABLE — `{ options: null, unreadable: true, reason }`. Nothing was compared
+ *             against anything. The valid set is not knowable from here, so a refusal
+ *             phrased as a verdict on the VALUE is a false statement about the write.
+ *
+ * `reason` records WHICH observation, so callers can say it rather than guess it.
+ *
+ * INVOKED EXACTLY ONCE per call, by design: the callback has side effects (it commonly
+ * repopulates the widget), and a second read of a stateful source can disagree with the
+ * first — which would turn any decision keyed on it into an escape hatch. Callers keep
+ * the returned snapshot; they never re-read to re-derive a verdict.
  */
-export function comboOptions(widget) {
+export function readComboOptions(widget) {
   const raw = widget?.options?.values;
-  let vals = raw;
   if (typeof raw === "function") {
+    let vals;
     try {
       vals = raw(widget);
-    } catch {
-      return null;
+    } catch (err) {
+      return { options: null, unreadable: true, reason: "threw", detail: describeThrown(err) };
     }
+    return Array.isArray(vals)
+      ? { options: vals, unreadable: false, reason: null }
+      : {
+          options: null,
+          unreadable: true,
+          reason: "not_a_list",
+          detail: `the callback returned ${vals === null ? "null" : typeof vals}, not an array`,
+        };
   }
-  return Array.isArray(vals) ? vals : null;
+  if (Array.isArray(raw)) return { options: raw, unreadable: false, reason: null };
+  return {
+    options: null,
+    unreadable: true,
+    reason: "absent",
+    detail:
+      raw === undefined
+        ? "the widget declares no options.values"
+        : `options.values is a ${typeof raw}, neither an array nor a callback`,
+  };
+}
+
+/**
+ * The current option list for a combo widget, or null if it cannot be read.
+ * Thin wrapper over `readComboOptions` — one invocation of the callback, same
+ * null-means-unreadable contract every existing caller was written against.
+ */
+export function comboOptions(widget) {
+  return readComboOptions(widget).options;
+}
+
+/** #1126 — the human-readable half of a `readComboOptions` UNREADABLE outcome. */
+function describeUnreadable(read) {
+  const why = read?.detail ? ` (${read.detail})` : "";
+  switch (read?.reason) {
+    case "threw":
+      return `its option list could not be READ: the widget's own options.values callback threw${why}`;
+    case "not_a_list":
+      return `its option list could not be READ: the widget's own options.values callback did not return a list${why}`;
+    default:
+      return `its option list could not be READ${why}`;
+  }
 }
 
 export function isComboWidget(widget) {
@@ -132,14 +258,141 @@ function optionLabelIndex(options, value) {
 }
 
 // litegraph "number"/"slider" and Comfy "INT"/"FLOAT" all render numeric.
+// VHS annotated INT/FLOAT widgets (#1533) use type "VHS.ANNOTATED" / "VHS.TIMESTAMP"
+// rather than those names; they still store a number (custom_width/custom_height
+// on VHS_LoadVideo) and their callback snaps one. `config[0]` is the backend
+// declared type VHS stashes on the widget (`["INT", {…}]`).
 export function isNumericWidget(widget) {
   const t = String(widget?.type ?? "").toLowerCase();
-  return t === "number" || t === "slider" || t === "int" || t === "float";
+  if (t === "number" || t === "slider" || t === "int" || t === "float") return true;
+  if (t === "vhs.annotated" || t === "vhs.timestamp") return true;
+  const cfg0 = Array.isArray(widget?.config) ? widget.config[0] : null;
+  return cfg0 === "INT" || cfg0 === "FLOAT";
+}
+
+/**
+ * #1533 — put a finite number back when the widget's own callback stored
+ * null/NaN/Infinity in its place.
+ *
+ * VHSINT (Video Helper Suite `getCustomWidgets.VHSINT`, type `VHS.ANNOTATED`)
+ * snaps with `Math.round((v - mod) / step) * step + mod`. VHS_LoadVideo's
+ * `custom_width`/`custom_height` declare `disable: 0` and no `step`; when the
+ * format preset has not injected a dim-step, `step` is undefined, that formula
+ * stores NaN, and `JSON.stringify(NaN)` is `"null"` — the write "applied and
+ * immediately became null". An INT widget cannot hold NaN/null; the assignment
+ * already put the number there, so restore it. A callback that stored a
+ * DIFFERENT finite number is still drift (#240 / #805).
+ */
+function restoreFiniteNumberIfUnstored(widget, expected) {
+  if (!widget || typeof expected !== "number" || !Number.isFinite(expected)) return;
+  let actual;
+  try {
+    actual = widget.value;
+  } catch {
+    return;
+  }
+  if (actual == null || (typeof actual === "number" && !Number.isFinite(actual))) {
+    widget.value = expected;
+  }
+}
+
+/**
+ * Does `node.widgets` have a STABLE IDENTITY — is it one array the node keeps, so that
+ * comparing the array OBJECT says something and re-pointing it restores something — or
+ * is it rebuilt on every read?
+ *
+ * Answered by OBSERVATION (two reads), not by the property descriptor, because the
+ * descriptor does not settle it: an accessor that memoises one array is every bit as
+ * identity-stable as a plain data property, and it is only a getter that BUILDS A NEW
+ * ARRAY per read that makes an identity compare meaningless. Classifying by descriptor
+ * kind would relax the check for memoising accessors that never needed relaxing.
+ *
+ * A real ComfyUI SubgraphNode is the rebuilding kind. Read off the installed
+ * comfyui-frontend 1.49.6, its constructor installs
+ *
+ *   Object.defineProperty(this, "widgets", {
+ *     get: () => [...this.inputs.flatMap(i => project(i) ?? []), ...this._extraWidgets],
+ *     set: () => {}, configurable: true, enumerable: true });
+ *
+ * — a fresh array every read, behind a setter that swallows assignment. The MEMBERS are
+ * stable (`_projectPromotedWidget` memoises each proxy onto `input._widget`); only the
+ * containing array is not.
+ *
+ * The one place this matters is #477 P1's rollback read-back, which compared the outer
+ * widget list by ARRAY IDENTITY. On a rebuilt list that compare can only ever fail, so
+ * every failed promoted write on a subgraph node reported a partial state for a
+ * rollback that had been perfect. The caller gets `false` there and compares
+ * MEMBERSHIP/ORDER instead — still by per-widget identity, which is what authenticates
+ * a rail, and which the memoised projection preserves.
+ */
+function widgetsListHasStableIdentity(node) {
+  let first;
+  let second;
+  try {
+    first = node.widgets;
+    second = node.widgets;
+  } catch {
+    // Unreadable: identity can say nothing. Answering the other way would hand the
+    // identity compare a verdict it has no basis for.
+    return false;
+  }
+  return first === second;
 }
 
 export function isBooleanWidget(widget) {
   const t = String(widget?.type ?? "").toLowerCase();
   return t === "toggle" || t === "boolean";
+}
+
+/**
+ * #1735 — whether `value` has the exact accessor shape installed by Impact Pack's
+ * comboBoolMigration. That migration defines an OWN accessor without setting
+ * configurable/enumerable, so the descriptor is non-configurable and non-enumerable;
+ * its setter can apply the value and then throw when the node's bound-property
+ * copy-back invokes that setter a second time.
+ *
+ * This deliberately does not walk the prototype chain: an ordinary custom accessor
+ * must remain on the existing exception-disclosure path. Descriptor reads are
+ * best-effort; an unreadable or differently shaped property is not evidence that the
+ * write is recoverable.
+ */
+function hasImpactBooleanAccessor(widget) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(widget, "value");
+    return (
+      descriptor?.configurable === false &&
+      descriptor.enumerable === false &&
+      typeof descriptor.get === "function" &&
+      typeof descriptor.set === "function"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #1735 — the one accessor failure that may be recovered after read-back.
+ *
+ * The initial assignment and the node's property assignment have already happened
+ * before this is called. The caller still runs the ordinary callback/update path, and
+ * the existing widget + bound-property verification remains authoritative. A setter
+ * that throws for any other reason stays a warning/refusal, so this cannot turn an
+ * arbitrary custom-node side-effect failure into a clean success.
+ */
+function isRecoverableBooleanAccessorDelete(widget, expected, err) {
+  if (!isBooleanWidget(widget) || !hasImpactBooleanAccessor(widget)) return false;
+  let message;
+  try {
+    message = String(err?.message ?? err);
+  } catch {
+    return false;
+  }
+  if (!/^Cannot delete property ['"]value['"]/i.test(message)) return false;
+  try {
+    return Object.is(widget.value, expected);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -177,6 +430,350 @@ function resolveWidgetByName(node, widgetName) {
   return matches[0] ?? null;
 }
 
+// #2146 — Fast Groups Bypasser rows are action controls. Their callback can set the mode of
+// every node in the selected group, and rgthree's Mute / Bypass Repeater can continue that
+// change through linked inputs. The ordinary widget rollback knows only about widget/property
+// projections, so keep a deliberately small mode journal for this one runtime shape.
+const FAST_GROUPS_BYPASSER_TYPE = "Fast Groups Bypasser (rgthree)";
+const FAST_GROUPS_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
+const NODE_MODE_REPEATER_TYPE = "Mute / Bypass Repeater (rgthree)";
+const NODE_MODE_RELAY_TYPE = "Mute / Bypass Relay (rgthree)";
+
+function runtimeNodeType(node) {
+  try {
+    if (typeof node?.type === "string") return node.type;
+    if (typeof node?.constructor?.type === "string") return node.constructor.type;
+  } catch {
+    // An unreadable third-party node is handled by the fail-closed transaction capture below.
+  }
+  return "";
+}
+
+function widgetBaseName(widgetName) {
+  if (typeof widgetName !== "string") return "";
+  const dot = widgetName.indexOf(".");
+  return dot === -1 ? widgetName : widgetName.slice(0, dot);
+}
+
+function normalizedWidgetBaseName(widgetName) {
+  return widgetBaseName(widgetName).toLowerCase();
+}
+
+function isModePassThrough(node) {
+  const type = runtimeNodeType(node);
+  return type.includes("Reroute") || type.includes("Node Combiner") || type.includes("Node Collector");
+}
+
+function modeTransactionFailure(node, detail) {
+  return new WidgetWriteError(
+    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the Fast Groups ` +
+      `Bypasser mode rollback boundary (${detail}); refusing before the callback can mutate ` +
+      `linked node modes (#2146).`,
+  );
+}
+
+function relayDispatchesMode(node, owner) {
+  try {
+    const inputs = node.inputs;
+    if (!Array.isArray(inputs)) {
+      throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s inputs are unreadable`);
+    }
+    // rgthree's NodeModeRelay dispatches only when it has at most one input slot,
+    // input 0 is unconnected, and an output is connected. A multi-input relay with
+    // empty slots is not an input-less dispatcher.
+    if (inputs.length > 1) return false;
+    if (typeof node.isInputConnected !== "function" || typeof node.isAnyOutputConnected !== "function") {
+      throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s runtime connection contract is unreadable`);
+    }
+    return !node.isInputConnected(0) && node.isAnyOutputConnected();
+  } catch {
+    throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s connection state is unreadable`);
+  }
+}
+
+/**
+ * Capture only the mode targets a Fast Groups Bypasser row can reach:
+ *   - members of each Fast Bypasser group row on this node;
+ *   - descendants of those members in a subgraph;
+ *   - non-pass-through inputs of rgthree repeaters; and
+ *   - non-pass-through outputs of input-less rgthree relays.
+ *
+ * This intentionally does not walk or snapshot the graph generally. The returned journal is
+ * used to verify the canonical action changed a reachable mode and to roll it back on failure.
+ */
+function captureFastBypasserModeTransaction(node, writtenWidget) {
+  if (
+    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
+    normalizedWidgetBaseName(writtenWidget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
+  ) {
+    return null;
+  }
+
+  const rows = [
+    writtenWidget,
+    ...(Array.isArray(node?.widgets) ? node.widgets : []),
+  ].filter((candidate, index, all) => {
+    if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
+      return false;
+    }
+    return all.indexOf(candidate) === index;
+  });
+  const groups = [];
+  for (const row of rows) {
+    let group;
+    try {
+      group = row.group;
+    } catch {
+      throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+    }
+    if (!group || (typeof group !== "object" && typeof group !== "function")) {
+      throw modeTransactionFailure(node, "a toggle row has no live group");
+    }
+    if (!groups.includes(group)) groups.push(group);
+  }
+  if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
+
+  const entries = [];
+  const seenNodes = new Set();
+  const entriesByNode = new Map();
+  const propagationQueue = [];
+  const propagationEdges = new Map();
+
+  const addNodeTree = (candidate) => {
+    if (!candidate || typeof candidate !== "object" || seenNodes.has(candidate)) return;
+    const type = runtimeNodeType(candidate);
+    let mode;
+    try {
+      mode = candidate.mode;
+    } catch {
+      throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s mode is unreadable`);
+    }
+    seenNodes.add(candidate);
+    const propagates =
+      type === NODE_MODE_REPEATER_TYPE ||
+      (type === NODE_MODE_RELAY_TYPE && relayDispatchesMode(candidate, node));
+    const entry = { node: candidate, previous: mode, propagates };
+    entries.push(entry);
+    entriesByNode.set(candidate, entry);
+    if (propagates) {
+      propagationQueue.push(candidate);
+    }
+
+    let subgraph = null;
+    try {
+      const isSubgraph =
+        typeof candidate.isSubgraphNode === "function"
+          ? candidate.isSubgraphNode()
+          : !!candidate.subgraph;
+      subgraph = isSubgraph ? candidate.subgraph : null;
+    } catch {
+      throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s subgraph is unreadable`);
+    }
+    if (subgraph != null) {
+      if (!Array.isArray(subgraph.nodes)) {
+        throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s subgraph nodes are unreadable`);
+      }
+      for (const child of subgraph.nodes) addNodeTree(child);
+    }
+  };
+
+  const recordPropagationEdge = (source, target) => {
+    const sourceEntry = entriesByNode.get(source);
+    const targetEntry = entriesByNode.get(target);
+    if (!sourceEntry?.propagates || !targetEntry?.propagates || source === target) return;
+    let targets = propagationEdges.get(source);
+    if (!targets) {
+      targets = new Set();
+      propagationEdges.set(source, targets);
+    }
+    targets.add(target);
+  };
+
+  const graphFor = (candidate, group) => candidate?.graph ?? group?.graph ?? node?.graph;
+  const connectedRoots = (start, direction, group, skipRelays) => {
+    const queue = [{ node: start, source: start }];
+    const walked = new Set();
+    while (queue.length) {
+      const { node: current, source } = queue.shift();
+      if (!current || walked.has(current)) continue;
+      walked.add(current);
+      const graph = graphFor(current, group);
+      const slots = direction === "input" ? current.inputs : current.outputs;
+      if (!graph || !Array.isArray(slots)) continue;
+      for (const slot of slots) {
+        let linkId;
+        try {
+          linkId = direction === "input" ? slot?.link : null;
+          if (direction === "output") {
+            for (const outputLinkId of Array.isArray(slot?.links) ? slot.links : []) {
+              const link = graph.links?.[outputLinkId];
+              const connected = graph.getNodeById?.(link?.target_id);
+              if (!connected) continue;
+              if (isModePassThrough(connected)) queue.push({ node: connected, source });
+              else {
+                addNodeTree(connected);
+                recordPropagationEdge(source, connected);
+              }
+            }
+            continue;
+          }
+        } catch {
+          throw modeTransactionFailure(node, "a linked mode path is unreadable");
+        }
+        if (linkId == null) continue;
+        let link;
+        let connected;
+        try {
+          link = graph.links?.[linkId];
+          connected = graph.getNodeById?.(link?.origin_id);
+        } catch {
+          throw modeTransactionFailure(node, "a linked mode path is unreadable");
+        }
+        if (!connected) continue;
+        if (skipRelays && runtimeNodeType(connected) === NODE_MODE_RELAY_TYPE) continue;
+        if (isModePassThrough(connected)) queue.push({ node: connected, source });
+        else {
+          addNodeTree(connected);
+          recordPropagationEdge(source, connected);
+        }
+      }
+    }
+  };
+
+  for (const group of groups) {
+    let members;
+    try {
+      group.recomputeInsideNodes?.();
+      members = group._children;
+    } catch {
+      throw modeTransactionFailure(node, "a toggle-row group is unreadable");
+    }
+    if (members == null) throw modeTransactionFailure(node, "a toggle-row group has no members");
+    let groupNodes;
+    try {
+      groupNodes = Array.from(members);
+    } catch {
+      throw modeTransactionFailure(node, "a toggle-row group member list is unreadable");
+    }
+    for (const groupNode of groupNodes) addNodeTree(groupNode);
+  }
+
+  while (propagationQueue.length) {
+    const current = propagationQueue.shift();
+    const type = runtimeNodeType(current);
+    if (type === NODE_MODE_REPEATER_TYPE) {
+      const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
+      connectedRoots(current, "input", group, true);
+    } else if (type === NODE_MODE_RELAY_TYPE) {
+      if (entriesByNode.get(current)?.propagates) {
+        const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
+        connectedRoots(current, "output", group, false);
+      }
+    }
+  }
+
+  const propagationRestoreOrder = () => {
+    const propagating = entries.filter((entry) => entry.propagates);
+    const indegree = new Map(propagating.map((entry) => [entry.node, 0]));
+    for (const [source, targets] of propagationEdges) {
+      if (!indegree.has(source)) continue;
+      for (const target of targets) {
+        if (indegree.has(target)) indegree.set(target, indegree.get(target) + 1);
+      }
+    }
+    const ready = propagating.filter((entry) => indegree.get(entry.node) === 0);
+    const ordered = [];
+    while (ready.length) {
+      const entry = ready.shift();
+      ordered.push(entry);
+      for (const target of propagationEdges.get(entry.node) ?? []) {
+        if (!indegree.has(target)) continue;
+        const next = indegree.get(target) - 1;
+        indegree.set(target, next);
+        if (next === 0) ready.push(entriesByNode.get(target));
+      }
+    }
+    // A cyclic mode graph cannot be topologically ordered; keep the captured order and
+    // let the authoritative read-back report any irreconcilable mode conflict honestly.
+    return ordered.length === propagating.length ? ordered : propagating;
+  };
+
+  return {
+    changed() {
+      let unreadable = false;
+      for (const entry of entries) {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) return true;
+        } catch {
+          unreadable = true;
+        }
+      }
+      return unreadable ? null : false;
+    },
+    restore() {
+      const restoreEntry = (entry) => {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) entry.node.mode = entry.previous;
+        } catch {
+          // Read-back below turns this into an honest partial-state error.
+        }
+      };
+      // Restore mode-propagating roots in upstream-to-downstream order, then restore every
+      // ordinary node after the last propagation. This handles a group whose iteration order
+      // places a linked node before its repeater: the repeater may overwrite it during restore,
+      // so linked nodes must be the final writes.
+      for (const entry of propagationRestoreOrder()) restoreEntry(entry);
+      for (const entry of entries) {
+        if (!entry.propagates) restoreEntry(entry);
+      }
+    },
+    unrestored() {
+      const failed = [];
+      for (const entry of entries) {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) failed.push(entry);
+        } catch {
+          failed.push(entry);
+        }
+      }
+      return failed;
+    },
+  };
+}
+
+function resolveFastBypasserAction(node, widget, coerced, previous) {
+  if (
+    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
+    normalizedWidgetBaseName(widget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
+  ) {
+    return null;
+  }
+  if (
+    coerced === null ||
+    typeof coerced !== "object" ||
+    Array.isArray(coerced) ||
+    typeof coerced.toggled !== "boolean"
+  ) {
+    throw modeTransactionFailure(node, "the toggle action value is unreadable");
+  }
+  let toggle;
+  let doModeChange;
+  try {
+    toggle = widget.toggle;
+    doModeChange = widget.doModeChange;
+  } catch {
+    throw modeTransactionFailure(node, "the toggle action is unreadable");
+  }
+  if (typeof toggle !== "function" || typeof doModeChange !== "function") {
+    throw modeTransactionFailure(node, "the live row has no canonical toggle action");
+  }
+  return {
+    toggle,
+    requested: coerced.toggled,
+    requiresModeChange: previous?.toggled !== coerced.toggled,
+  };
+}
+
 // DECLARED field schema for known composite widgets. Types are enforced from THIS
 // schema, never inferred from the current value — a field whose current value is `null`
 // still enforces the correct type, so a scalar of the wrong type (e.g. a number into a
@@ -198,7 +795,11 @@ const RGTHREE_LORA_SLOT_SCHEMA = {
 // the row is repaired-forward — never fall back to inferring a type from a corrupt value,
 // which would accept a further wrong-type write and deepen the corruption.
 const RGTHREE_LORA_SLOT_KEYS = new Set(["on", "lora", "strength", "strengthTwo"]);
-function isLoraSlotObject(obj) {
+// EXPORTED for #757's creation route (`rgthree-lora-row.js`), which must decide whether an
+// incoming value is a lora row before it will mint a slot for it. Exported rather than
+// re-implemented there: two copies of a shape test drift, and the drift would show up as a
+// slot created for a value the writer then refuses.
+export function isLoraSlotObject(obj) {
   if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return false;
   const keys = Object.keys(obj);
   if (keys.length === 0) return false;
@@ -240,13 +841,42 @@ function coerceByType(type, value, where) {
   return value;
 }
 
+// True when `value` has the SAME recursive type shape as `existing` — every leaf the
+// same primitive type, arrays element-compatible, plain objects carrying no key the
+// existing object lacks. Used to validate an unknown composite's OBJECT/ARRAY field
+// against its own current value (comfyui-mcp#1711): UI-heavy node packs (e.g.
+// ComfyUI-Pixaroma) store state as JSON blobs with nested composites like
+// `sizes: [[608,352],...]`, whose element types are perfectly inferable from the
+// existing value — so a same-shaped write (including the byte-identical pass-through
+// a read-modify-write agent sends back) is provably not a mistype and must be accepted,
+// while a shape-DIVERGENT value (string where an array sits, a foreign key) still fails
+// closed. An EMPTY existing array/object carries no element type to infer, so only an
+// equally-empty value matches it.
+function matchesExistingShape(existing, value) {
+  if (Array.isArray(existing)) {
+    if (!Array.isArray(value)) return false;
+    if (existing.length === 0) return value.length === 0;
+    return value.every((v) => existing.some((e) => matchesExistingShape(e, v)));
+  }
+  if (existing !== null && typeof existing === "object") {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    return Object.keys(value).every(
+      (k) =>
+        Object.prototype.hasOwnProperty.call(existing, k) &&
+        matchesExistingShape(existing[k], value[k]),
+    );
+  }
+  return typeof value === typeof existing && (existing !== null || value === null);
+}
+
 /**
  * Validate + coerce a composite field value. The expected type comes FIRST from the
  * declared schema (so a null current field still enforces the right type, #560 P0), and
  * `null` is accepted only for a nullable field (#560 P2). For an UNKNOWN composite with
- * no schema, fall back to the existing NON-null value's type; a null/undefined current
- * value with no schema is genuinely untyped, so only a primitive is accepted verbatim.
- * Throws WidgetWriteError on a mismatch.
+ * no schema, fall back to the existing NON-null value's type — a scalar field coerces
+ * strictly, and an object/array field is accepted when the value matches the existing
+ * value's recursive shape (comfyui-mcp#1711). A null/undefined current value with no
+ * schema is genuinely untyped and refused. Throws WidgetWriteError on a mismatch.
  */
 function coerceCompositeFieldValue(widgetName, base, field, value) {
   const where = `sub-field "${widgetName}.${field}"`;
@@ -263,10 +893,16 @@ function coerceCompositeFieldValue(widgetName, base, field, value) {
   if (typeof existing === "boolean") return coerceByType("boolean", value, where);
   if (typeof existing === "number") return coerceByType("number", value, where);
   if (typeof existing === "string") return coerceByType("string", value, where);
-  // No schema AND an untyped current value (null/undefined/object): the field's type is
-  // genuinely unknowable, so we REFUSE rather than write a possibly-wrong-typed value —
-  // #560's principle is a loud, safe failure over silent corruption. (A KNOWN composite,
-  // e.g. rgthree, is handled by the schema above and its nullable fields still clear.)
+  // comfyui-mcp#1711: the existing value is an object/array, so the field is a NESTED
+  // composite — not untyped. Validate the value against the existing value's recursive
+  // shape; a same-shaped value (typically the read-modify-write pass-through of the
+  // field's own current content) is safe to write verbatim.
+  if (existing != null && matchesExistingShape(existing, value)) return value;
+  // No schema AND an untyped current value (null/undefined) OR a shape-DIVERGENT value
+  // for a nested composite: the write cannot be proven correctly-typed, so we REFUSE
+  // rather than write a possibly-wrong-typed value — #560's principle is a loud, safe
+  // failure over silent corruption. (A KNOWN composite, e.g. rgthree, is handled by the
+  // schema above and its nullable fields still clear.)
   throw new WidgetWriteError(
     `${where}: cannot validate the value — this composite is not a recognized type and the ` +
       `field's current value is ${existing === undefined ? "undefined" : JSON.stringify(existing)}, ` +
@@ -306,7 +942,7 @@ export function coerceWidgetValue(
   value,
   mergeBaseWidget = widget,
   subFieldPath = null,
-  { acceptEmptyComboOptions = false, out } = {},
+  { acceptEmptyComboOptions = false, acceptUnreadableComboOptions = false, out } = {},
 ) {
   const name = widget?.name ?? "(widget)";
 
@@ -376,15 +1012,68 @@ export function coerceWidgetValue(
   }
 
   if (isComboWidget(widget)) {
-    const options = comboOptions(widget);
-    // A declared combo whose option list we cannot read cannot be validated —
-    // refuse rather than write a value that may be reinterpreted as an index
-    // (#240 fail-open). Covers missing options.values and a throwing fn.
+    // ONE read, kept as a snapshot. Never re-read to re-derive a verdict below (#1126).
+    const read = readComboOptions(widget);
+    const options = read.options;
+    // #1126 — the list COULD NOT BE READ. That is an observation about the LIST, and the
+    // panel used to answer it with a flat refusal — which, after the ladder in
+    // set-widget.js re-tried and gave up, reached the user as a message about their
+    // VALUE. It was never compared to anything: a node whose runtime handler takes an
+    // absolute path had its path refused as though the path were wrong.
+    //
+    // So the two outcomes are answered differently, and BOTH from what was observed:
+    //
+    //   * The list was read and the value is not in it  ⇒ REFUSE (below). There is a
+    //     real, closed set of choices, and an off-list value is a typo worth catching
+    //     before a run fails deep in model loading. #240/#507 unchanged.
+    //   * The list could not be read at all ⇒ the valid set is not knowable from here,
+    //     exactly like #507's empty list, and #240's reason for strict membership (a
+    //     number silently reinterpreted as an INDEX into a real list) has no list to
+    //     index into. Accept — but only under `acceptUnreadableComboOptions`, which
+    //     runSetWidget sets LAST, after every authoritative recovery has been tried and
+    //     the server has confirmed it publishes no list for this input either.
+    //
+    // Default is unchanged: a retryable combo refusal, so a merely-transient callback
+    // failure is refreshed and re-read before anything is decided.
     if (!options) {
+      if (acceptUnreadableComboOptions) {
+        // A NON-EMPTY STRING only. Two separate rules, neither traded away:
+        //   * #347 — clearing a combo to "" is refused, and an unreadable list must not
+        //     become a new door to it.
+        //   * #240 — a real option list exists on this widget, we simply cannot read it,
+        //     so a NUMBER could still be reinterpreted as an index into it. No file path
+        //     or model name is a number, so nothing legitimate is lost by refusing one.
+        // Marked NON-retryable: no refresh can turn a number into a string.
+        if (typeof value !== "string" || value === "") {
+          throw new WidgetWriteError(
+            `Combo widget "${name}": ${describeUnreadable(read)}, so ` +
+              `${JSON.stringify(value)} cannot be validated against it. A value written to a ` +
+              `combo whose options cannot be enumerated must be a NON-EMPTY STRING — a number ` +
+              `could be reinterpreted as an index into the list that exists but cannot be read, ` +
+              `and "" clears the widget. Refusing to write.`,
+          );
+        }
+        // This path's OWN marker. It gates the promoted-write rail cross-check below and
+        // drives the reply's disclosure; it is deliberately NOT the empty-list marker,
+        // which is a different (stronger) observation and carries a label-adoption rule
+        // that must not run here.
+        //
+        // The observation travels WITH it. A success reply has no error message to carry
+        // the reason, and there are three distinct ones (the callback threw, it returned a
+        // non-list, there is no callback) — a disclosure that picks one and states it
+        // would be wrong two-thirds of the time.
+        if (out) {
+          out.unreadableAcceptanceUsed = true;
+          out.unreadableObservation = describeUnreadable(read);
+        }
+        return value;
+      }
       throw new WidgetWriteError(
-        `Combo widget "${name}" has no readable option list; cannot validate ` +
-          `value ${JSON.stringify(value)} — refusing to write.`,
-        { combo: true },
+        `Combo widget "${name}": ${describeUnreadable(read)}, so ` +
+          `${JSON.stringify(value)} could not be checked against it — this is NOT a verdict ` +
+          `that the value is wrong, nothing was compared. Refusing to write until the list ` +
+          `can be read.`,
+        { combo: true, unreadableOptions: true },
       );
     }
     // #507: a DYNAMIC, CLIENT-POPULATED combo declared with an EMPTY option list —
@@ -450,10 +1139,18 @@ export function coerceWidgetValue(
     // (options ["alpha","beta","gamma"] with value 1 matches no label).
     const labelIdx = optionLabelIndex(options, value);
     if (labelIdx >= 0) return options[labelIdx];
+    // The other half of #1126, and the direction that must NOT move: this list WAS read,
+    // it holds real choices, and the value is not one of them. That is a verdict about
+    // the VALUE, and it is worth keeping — a typo'd sampler or a model that is not
+    // installed is caught here instead of failing 40 seconds into a run. The message says
+    // which of the two happened, so an agent can tell "your value is wrong" apart from
+    // "the panel could not look" and stop treating them as the same failure.
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
-        `"${name}". Valid options (${options.length}): ${preview}` +
+        `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
+        `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
+        `rejected VALUE, not an unreadable list. Valid options (${options.length}): ${preview}` +
         (options.length > 40 ? ", …" : ""),
       { combo: true },
     );
@@ -611,6 +1308,59 @@ export function resolveHostPromotedWidget(subgraphNode, hostInput) {
 }
 
 /**
+ * comfyui-mcp#1707 — WHERE a promoted subgraph widget's value actually lives.
+ *
+ * A `Subgraph` DEFINITION object is SHARED by every instance placed on the canvas:
+ * `SubgraphNode.subgraph` is the same object for wrappers 279, 293 and 300 of one
+ * reusable subgraph, and so is every node inside it. So an assignment to the inner
+ * widget is an assignment to the DEFINITION — a write aimed at one wrapper that
+ * every sibling wrapper inherits.
+ *
+ * The ComfyUI frontend does NOT store a promoted value there. It gives each host
+ * input a `widgetId` — `"<rootGraphId>:<encoded nodeId>:<encoded input name>"` —
+ * and keeps the value in a per-widgetId store. Both projections it can build for
+ * the rail read and write through that key: the plain store-backed projection
+ * (`get/set value` → the store) and the app-layer promoted DOM widget (whose
+ * `options.getValue/setValue` do the same). It is also the ONLY value the queue
+ * compiler reads for an unlinked promoted input — `ExecutableNodeDTO.resolveInput`
+ * returns `store.getWidget(input.widgetId)?.value` and never looks at the inner
+ * widget. And an on-canvas edit of the promoted control writes ONLY that entry.
+ *
+ * The node id is IN the key, so the key itself proves the scope: when the key's
+ * node segment is THIS wrapper's id, no sibling wrapper can read the entry this
+ * write lands in — the scope is established from the data, not assumed from a
+ * frontend version. Parsed the way the frontend's own `parseWidgetId` parses it
+ * (exactly three colon-separated segments; the id builder percent-encodes the
+ * node id and the name, so neither can introduce a colon).
+ *
+ * Anything else — no `widgetId` at all (an older frontend, where the rail is a live
+ * VIEW of the inner widget and there is no per-instance home to write) or a key that
+ * does not name this wrapper (an unknown keying whose sharing we cannot establish) —
+ * is reported as `"subgraph_definition"`. That is a statement about where the write
+ * then goes, not a prediction about siblings, and the caller is told which one it got.
+ *
+ * @returns {"instance"|"subgraph_definition"}
+ */
+export function promotedValueScope(subgraphNode, hostInput) {
+  let id;
+  try {
+    id = hostInput?.widgetId;
+  } catch {
+    return "subgraph_definition";
+  }
+  if (typeof id !== "string" || id === "") return "subgraph_definition";
+  const parts = id.split(":");
+  if (parts.length !== 3) return "subgraph_definition";
+  let own;
+  try {
+    own = encodeURIComponent(String(subgraphNode?.id));
+  } catch {
+    return "subgraph_definition";
+  }
+  return parts[1] === own ? "instance" : "subgraph_definition";
+}
+
+/**
  * Classify a widget request on `subgraphNode` against `widgetName` and, when it
  * is a PROMOTED subgraph widget, resolve it to the ACTUAL inner (node, widget)
  * AND the authoritative parent rail widget (via the promotion relationship).
@@ -646,12 +1396,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   const matches = [];
   for (const input of subgraphNode.inputs ?? []) {
     const subgraphInput = input?._subgraphSlot ?? null;
-    const aliases = [
-      input?.name,
-      input?.label,
-      subgraphInput?.name,
-      subgraphInput?.label,
-    ].map((a) => (a == null ? null : String(a).toLowerCase()));
+    const aliases = promotedInputAliases(input, subgraphInput).map((a) => a.toLowerCase());
     // Labels are used ONLY to DETECT which promotion the caller meant (a caller
     // may address by a renamed promotion's display label). Locating the parent's
     // authoritative rail widget is done LATER by the promotion RELATIONSHIP
@@ -744,20 +1489,53 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
  *   { node: null, widget: null, error }     → a deeper promotion link is unresolvable
  *   { node, widget, cycle: true }           → a promotion cycle was detected (defensive)
  */
+/** Maximum number of nested promoted containers the write path will traverse.
+ * A cycle is handled separately, but a bounded walk is still required for
+ * hostile/malformed graphs whose resolver keeps producing fresh objects. */
+export const MAX_PROMOTION_CHAIN_DEPTH = 16;
+
 export function followPromotionToConcrete(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) return { node, widget, cycle: true };
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) {
+      return {
+        node: null,
+        widget: null,
+        error: `promoted chain exceeded the maximum depth of ${MAX_PROMOTION_CHAIN_DEPTH}`,
+      };
+    }
     seen.add(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted) return { node, widget, terminalVirtual: true };
     if (!res.target) return { node: null, widget: null, error: res.error };
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
-  return { node, widget };
+  return { node, widget, depth };
+}
+
+/** Every addressable spelling of a promoted host rail. Frontend versions have
+ * carried the programmatic name/label on the input, its backing subgraph slot,
+ * or the rail widget projection. Keep graph_get_subgraph's witness enumeration
+ * and graph_set_widget's live resolver on this exact shared alias contract. */
+export function promotedInputAliases(input, subgraphInput = input?._subgraphSlot ?? null) {
+  return [
+    input?.name,
+    input?.label,
+    input?.widget?.name,
+    input?.widget?.label,
+    input?._widget?.name,
+    input?._widget?.label,
+    subgraphInput?.name,
+    subgraphInput?.label,
+  ]
+    .filter((value) => value != null && String(value).length > 0)
+    .map((value) => String(value));
 }
 
 /**
@@ -775,14 +1553,17 @@ export function collectPromotionIntermediates(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) break;
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) break;
     seen.add(node);
     out.push(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted || !res.target) break;
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
   return out;
 }
@@ -853,6 +1634,39 @@ export function resolveWidgetWrite(
             ? [promotedParentWidget]
             : [];
       if (!promotedParentWidget) {
+        // #1181 — when the host input's OUTER link originates at a frontend-only
+        // VIRTUAL source (a canvas PrimitiveNode), the generic advice below is
+        // wrong in both directions: editing "the outermost subgraph node" cannot
+        // help (that IS this node, and its rail is non-authoritative because of
+        // the link), and the link itself carries NOTHING — the prompt compiler
+        // drops the virtual origin, so the inner node's STORED widget value is
+        // what executes. Say so, and point at the two repairs that work. The
+        // refusal itself stands: a write here would still report success over a
+        // rail nothing serializes from (#366's fail-closed posture is untouched).
+        if (promotedHostInput?.link != null) {
+          const links = node.graph?.links ?? {};
+          const l = links[promotedHostInput.link];
+          const originId = l ? (l.origin_id ?? l[1]) : null;
+          const origin =
+            originId != null && node.graph
+              ? (typeof node.graph.getNodeById === "function"
+                  ? node.graph.getNodeById(originId)
+                  : (node.graph._nodes ?? []).find((nd) => String(nd?.id) === String(originId)))
+              : null;
+          if (isNonSerializingValueSource(origin)) {
+            throw new WidgetWriteError(
+              `promoted widget "${widgetName}" on subgraph node ${node.id} is fed by ` +
+                `${origin.type ?? "a frontend-only virtual node"} #${originId}, which the prompt ` +
+                `compiler DROPS — the value on that link does NOT cross the subgraph boundary, so ` +
+                `no write to this rail can take effect and editing the outermost subgraph node ` +
+                `cannot help either. What executes is each INNER node's stored widget value: set ` +
+                `the widget on the inner node directly (enter the subgraph, then panel_set_widget ` +
+                `there), or replace the virtual source with a BACKEND node (e.g. ` +
+                `PrimitiveStringMultiline), whose value does cross (#1181). Refusing to write, ` +
+                `which would report success over a value that cannot serialize.`,
+            );
+          }
+        }
         throw new WidgetWriteError(
           `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
             `widget, but its AUTHORITATIVE parent rail widget could not be identified (the value ` +
@@ -971,6 +1785,11 @@ export function applyWidgetWrite(
     // and take the value as written. Default false ⇒ the empty case is a RETRYABLE
     // combo rejection, so a merely-stale empty list is refreshed before any decision.
     acceptEmptyComboOptions = false,
+    // #1126: only the FINAL attempt may treat an UNREADABLE option list (the widget's
+    // own options.values callback threw / returned a non-list) as "not knowable" and take
+    // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
+    // combo rejection, so a transient callback failure is re-read before any decision.
+    acceptUnreadableComboOptions = false,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -988,8 +1807,11 @@ export function applyWidgetWrite(
   let { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
-      // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
-      // membership) is what admitted the value. Read below — never re-derived.
+      acceptUnreadableComboOptions,
+      // Filled in by coerceWidgetValue with WHICH acceptance admitted the value — the
+      // EMPTY-LIST one (#507) or the UNREADABLE-LIST one (#1126) — rather than ordinary
+      // membership. Read below; NEVER re-derived by reading the option list again, since
+      // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
     });
 
@@ -1013,6 +1835,31 @@ export function applyWidgetWrite(
       ? promotedParentWidgets.filter((dw) => dw && dw !== w && dw !== parentWidget)
       : [];
 
+  // comfyui-mcp#1707 — WHICH STORE THIS WRITE OWNS.
+  //
+  // The promoted rail and the inner widget are not two views of one value: in a
+  // frontend that gives the host input a `widgetId`, the rail is this WRAPPER's own
+  // store entry and the inner widget is the SHARED DEFINITION, read by every sibling
+  // instance of the subgraph. Writing both therefore turned a write aimed at wrapper
+  // 293 into a write every sibling inherits (279 and 300 both went to 1024x1024) —
+  // and the definition write is one the UI itself never performs: an on-canvas edit
+  // of a promoted control writes the store entry and nothing else.
+  //
+  // So on the instance-scoped path this write owns the RAIL, and the shared
+  // definition is left exactly as it was — which is also VERIFIED below, because
+  // "the rail is instance-scoped" is a claim about the frontend's plumbing that this
+  // module must not take on trust: if the rail turns out to forward to the inner
+  // widget after all, the definition changes, and that is a failure, not a success.
+  const valueScope = promotedFrom ? promotedValueScope(node, promotedHostInput) : null;
+  const instanceScoped = valueScope === "instance";
+  // The widget this write's VALUE lands on, and the node that OWNS that widget.
+  // Everything downstream — the bound-property binding, the widget callback, the
+  // read-back verification, normalization and the reported result — keys on these,
+  // so each one describes the write that actually happened. On every non-promoted
+  // and every definition-scoped write they are the inner/own target, unchanged.
+  const valueWidget = instanceScoped ? parentWidget : w;
+  const valueNode = instanceScoped ? node : targetNode;
+
   // #507 (codex round-3, MODERATE): coerceWidgetValue validated the value against the
   // IMMEDIATE inner widget's option list only — but a promoted write assigns the SAME
   // value to the parent's authoritative RAIL widget and to every display proxy, whose
@@ -1032,7 +1879,40 @@ export function applyWidgetWrite(
   // and never re-derived by reading the list again: a second read of a stateful dynamic
   // source can disagree with the first, which would turn the narrowing into an escape
   // hatch around this very check (codex confirmation round).
-  if (coerceOutcome.emptyAcceptanceUsed) {
+  //
+  // #1126 extends the SAME gate to the UNREADABLE-list acceptance, for the identical
+  // reason: it too writes a value the inner list did not validate, so a rail/proxy with a
+  // real closed list must still be satisfied. What it does NOT inherit is the #667
+  // label-ADOPTION below. Adoption replaces the caller's value with the rail list's own
+  // original — sound when the inner list is EMPTY (any scalar was admissible there, so the
+  // rail's own option is at least as valid), but wrong here: the inner list EXISTS and
+  // could not be read, so a rail label like the NUMBER 4444 would be written to a widget
+  // whose real, unread list may not contain it — reintroducing exactly the #240 index
+  // hazard the string-only rule above preserves. Unreadable ⇒ verify or refuse, never
+  // substitute.
+  const emptyAccepted = coerceOutcome.emptyAcceptanceUsed === true;
+  const unreadableAccepted = coerceOutcome.unreadableAcceptanceUsed === true;
+  // The inner-widget OBSERVATION, stated once and reused in every refusal below so the
+  // message can never describe the wrong one (the empty-list wording on an unreadable
+  // list said "the inner widget's option list is empty" about a list nobody had read).
+  const innerObservation = emptyAccepted
+    ? "the inner widget's option list is empty"
+    : "the inner widget's option list could not be READ";
+  // #1126 — set when the AUTHORITATIVE PARENT RAIL's readable, non-empty list contains the
+  // value. Only meaningful on the unreadable path, where it narrows an otherwise-unqualified
+  // "nothing validated this" down to the truth.
+  //
+  // Deliberately NOT "any sibling". A promotion can mutate two kinds of widget: the parent
+  // subgraph's RAIL — the one that SERIALIZES at queue time — and #477's display proxies,
+  // which are read-only mirrors the outer node shows. On a dual-projection promotion a
+  // display proxy can hold a list the rail does not, so a match there would emit
+  // `promoted_rail_validated` and make the reply and the activity summary both claim the
+  // serializing rail vouched for a value it never listed. On a change whose whole value is
+  // telling the truth about what was and was not validated, an overstated disclosure is
+  // worse than a missing one — a proxy match therefore stays silent and the write is
+  // reported as fully unvalidated, which is what it is as far as the rail is concerned.
+  let railValidated = false;
+  if (emptyAccepted || unreadableAccepted) {
     let adoptedOption = false;
     // Each sibling's option list AS READ during admission. A STATEFUL non-function
     // source (an accessor/proxy answering differently per read) must not be read a
@@ -1052,7 +1932,7 @@ export function applyWidgetWrite(
         throw new WidgetWriteError(
           `Cannot verify value ${JSON.stringify(coerced)} against the parent subgraph's combo ` +
             `widget "${other.name}", which this promoted write also mutates: its option list is ` +
-            `computed dynamically and the inner widget's list is empty, so nothing authoritative ` +
+            `computed dynamically and ${innerObservation}, so nothing authoritative ` +
             `validates the value. Refusing to write.`,
         );
       }
@@ -1074,14 +1954,32 @@ export function applyWidgetWrite(
         snapshot = null;
       }
       siblingSnapshots.push({ name: other.name, options: snapshot });
-      if (otherOptions.includes(coerced)) continue;
+      if (otherOptions.includes(coerced)) {
+        // #1126 — a POSITIVE validation, recorded, but ONLY from the authoritative rail.
+        // Its list WAS readable and WAS non-empty and DOES contain the value, so on the
+        // unreadable path the claim "nothing checked the value" stops being true: the target
+        // widget's own list could not be read, but the widget that SERIALIZES at queue time
+        // vouched for it. A #477 display proxy matching proves nothing about what gets
+        // queued, so it is not recorded — see the declaration above. Reported as data so the
+        // reply and the activity summary can scope their disclosure to what was actually
+        // unchecked instead of asserting a blanket "unvalidated" the code itself contradicts.
+        if (other === parentWidget) railValidated = true;
+        continue;
+      }
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
       // a numeric request (4444) against a rail list holding the string "4444" must
       // not refuse an option the rail itself publishes. On a label match ADOPT the
       // rail list's ORIGINAL value for the whole write (the inner's empty list
       // accepted any scalar, so writing the rail's own option there is at least as
       // valid), never the incoming scalar — the #240 no-index guarantee holds.
-      const siblingLabelIdx = optionLabelIndex(otherOptions, coerced);
+      //
+      // #1126 — EMPTY-list acceptance ONLY. Its justification is "the inner list admitted
+      // any scalar", which is true of an empty list and FALSE of one that exists but could
+      // not be read: adopting there would write a rail's NUMBER onto a widget whose own
+      // (unread) list may not hold it, and would silently replace the value the caller
+      // sent. The unreadable path therefore falls straight through to the refusal below —
+      // recoverable, and it never invents a value.
+      const siblingLabelIdx = emptyAccepted ? optionLabelIndex(otherOptions, coerced) : -1;
       if (siblingLabelIdx >= 0) {
         adoptedOption = true;
         coerced = otherOptions[siblingLabelIdx];
@@ -1090,8 +1988,8 @@ export function applyWidgetWrite(
       throw new WidgetWriteError(
         `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
           `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
-          `write also mutates — the inner widget's option list is empty, but this one is not. ` +
-          `Refusing to write.`,
+          `write also mutates — ${innerObservation}, but this one WAS read and does not ` +
+          `contain the value. Refusing to write.`,
       );
     }
     // Codex delta-gate: an adoption REPLACES the value mid-loop, and a later sibling
@@ -1132,6 +2030,11 @@ export function applyWidgetWrite(
   const objectWrite = coerced !== null && typeof coerced === "object";
   const expected = objectWrite ? JSON.parse(JSON.stringify(coerced)) : coerced;
 
+  // #2146 — the live Fast Bypasser row's supported action mutates `value.toggled` in place.
+  // Resolve it before taking the prior-value snapshot so rollback can isolate the complete
+  // row object from that mutation without changing generic widget-write identity semantics.
+  const fastBypasserAction = resolveFastBypasserAction(targetNode, w, coerced, w.value);
+
   const matchesExpected = (actual) =>
     objectWrite
       ? actual !== null &&
@@ -1150,13 +2053,17 @@ export function applyWidgetWrite(
   // outer rail, not the (potentially divergent) inner widget's prior value (#583).
   // Keep the latter separately for diagnostics; it is not the API-level
   // `previous` for a promoted request.
-  const previous = w.value;
   const previousParent = parentWidget ? parentWidget.value : undefined;
   const deepClone = (v) => (v !== null && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
   const structurallyEqual = (a, b) =>
     (a !== null && typeof a === "object") || (b !== null && typeof b === "object")
       ? JSON.stringify(a) === JSON.stringify(b)
       : Object.is(a, b);
+  // #2146 — toggle(value) mutates the live row's value object in place. Keep a complete
+  // structural snapshot for this action path so `w.value = previous` cannot reattach the
+  // already-mutated object and leave a false partial-write result. Generic widgets retain
+  // their historical prior-reference behavior; only this known action shape needs isolation.
+  const previous = fastBypasserAction ? deepClone(w.value) : w.value;
   const previousClone = deepClone(previous);
   const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
   // #477: prior values (+ deep clones) of the secondary display proxies, so rollback
@@ -1164,6 +2071,57 @@ export function applyWidgetWrite(
   // caught structurally, mirroring the rail's rollback rigor.
   const previousDisplays = displayWidgets.map((dw) => dw.value);
   const previousDisplayClones = displayWidgets.map((dw) => deepClone(dw.value));
+  // #1268 / comfyui-mcp#1658 — the SECOND STORE this write has to keep in step, when
+  // litegraph declares one. `w.value` read back after `w.value = coerced` cannot tell a
+  // write that took effect from a write that landed on a view of state held elsewhere;
+  // a widget carrying `options.property` names that elsewhere itself. Classified BEFORE
+  // the envelope so the write, the verification and the rollback all act on ONE reading
+  // (`node.setProperty` mutates `properties`, so a second classification taken later
+  // would describe the state this write already produced). See widget-bound-property.js
+  // for the two litegraph paths that make the binding load-bearing.
+  // comfyui-mcp#1707 — taken on the widget this write actually assigns, and on the
+  // node that owns it. On an instance-scoped promoted write that is the RAIL on the
+  // WRAPPER: litegraph's `BaseWidget.setValue` calls `setProperty` on the node whose
+  // widget is being edited, and the inner node's property is definition state this
+  // write deliberately does not touch. Every other write passes the same pair it
+  // always did.
+  const boundProperty = boundPropertyState(valueNode, valueWidget);
+  const previousPropertyClone = boundProperty?.reachable ? deepClone(boundProperty.previous) : undefined;
+  // #1492 — WHAT AN INSTANCE-SCOPED PROMOTED WRITE DELIBERATELY DOES NOT DO.
+  //
+  // On that path the shared subgraph DEFINITION is left exactly as it was (see the
+  // envelope below), and so is the inner widget's OWN callback: it is never invoked,
+  // because invoking it would run a SHARED node's side effects for an edit made on
+  // ONE instance. That trade is right and it was also SILENT — the reply carried
+  // `parent_widget_synced: true` and `value_scope: "instance"` and nothing else, so a
+  // caller whose inner widget does more than store a value read a clean success while
+  // the things that callback drives stayed exactly as they were. The reported case: a
+  // promoted BOOLEAN feeding a status-switch node that flips ANOTHER node's mode — the
+  // wrapper's controls moved, the bypassed/active nodes did not, and nothing said so.
+  //
+  // So OBSERVE whether there was a callback to skip, and disclose it when there was.
+  // Read ONCE and BEFORE the envelope: the rail's callback can install or remove one,
+  // and the claim is about the callback this write declined to invoke — not about
+  // whatever happens to be on the widget afterwards.
+  //
+  // Read TOTALLY. `callback` may be an accessor, and a throw while merely CLASSIFYING
+  // must never fail a write that is otherwise fine. A throw is also not evidence of
+  // ABSENCE, and absence is the only thing that justifies staying silent — so an
+  // unreadable callback discloses too, worded so it never claims one exists.
+  //
+  // Scoped to `instanceScoped`. On every other path the inner widget IS the written
+  // widget and its callback fires as it always did, so those replies are unchanged.
+  let innerCallbackSkipped = false;
+  let innerCallbackUnreadable = false;
+  if (instanceScoped) {
+    try {
+      const innerCallback = w.callback;
+      innerCallbackSkipped = innerCallback !== null && innerCallback !== undefined;
+    } catch {
+      innerCallbackSkipped = true;
+      innerCallbackUnreadable = true;
+    }
+  }
   // The ACTUAL serialization binding for an unlinked subgraph input is its
   // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
   // could keep the SAME host input and projection objects but re-point `widgetId` to
@@ -1184,10 +2142,23 @@ export function applyWidgetWrite(
   // node.widgets (natural cleanup when substituting a live proxy) detaches a captured
   // proxy while leaving a replacement live. Restoring only the host refs would leave
   // node.widgets corrupt yet pass read-back. Snapshot the array REFERENCE + its contents
-  // so rollback re-points and refills it, and read-back verifies membership/order.
+  // so rollback can re-point and refill it — where the node KEEPS one array — and
+  // read-back verifies membership/order either way.
   const prevOuterWidgetsRef = promotedFrom && Array.isArray(node.widgets) ? node.widgets : null;
   const prevOuterWidgets = prevOuterWidgetsRef ? prevOuterWidgetsRef.slice() : null;
+  // Whether that list KEEPS its identity or is rebuilt per read decides how the
+  // rollback restores it and how the read-back verifies it — see the helper. Read
+  // BEFORE the write, so the recheck can also notice the list changing from one kind
+  // to the other mid-write, which would otherwise slip past the identity compare.
+  const prevOuterWidgetsIdentityStable = prevOuterWidgetsRef ? widgetsListHasStableIdentity(node) : false;
 
+  // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
+  // If the live row shape cannot be bounded, refuse before invoking the action rather than
+  // allowing it to mutate linked modes that this writer cannot restore.
+  const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
+  // #2146 — Fast Bypasser rows do not expose a widget.callback. Their supported UI action is
+  // the row's own toggle(value), which mutates the row value and invokes doModeChange().
+  // Bridge that canonical action instead of assigning the value and falsely reporting success.
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
   // partial write; a stateful hook that mutates values is still caught because ALL
@@ -1234,27 +2205,84 @@ export function applyWidgetWrite(
   let widgetCallback = null;
   safeBefore();
   try {
-    // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
-    // the inner widget; its own callback typically FORWARDS to the inner one, so we
-    // fire the SEMANTIC widget callback exactly ONCE (the inner target's), NOT the
-    // rail's — otherwise a forwarding view would double-invoke the side effect. The
-    // rail's value serializes directly from `parentWidget.value`, which we set here,
-    // so it needs no callback of its own.
-    w.value = coerced;
+    // Assign BOTH values first — EXCEPT on an instance-scoped promoted write, where
+    // the inner widget is not a second copy of this value but the SHARED SUBGRAPH
+    // DEFINITION every sibling instance reads (comfyui-mcp#1707). There the rail IS
+    // the store, so assigning the inner widget would not make this write land — it
+    // would only broadcast it to wrappers the caller never addressed.
+    //
+    // On the definition-scoped path (a frontend that gives the host input no
+    // per-instance key) nothing changes: the parent's projected promoted widget is a
+    // VIEW of the inner widget; its own callback typically FORWARDS to the inner one,
+    // so we fire the SEMANTIC widget callback exactly ONCE (the inner target's), NOT
+    // the rail's — otherwise a forwarding view would double-invoke the side effect.
+    // The rail's value serializes directly from `parentWidget.value`, which we set
+    // here, so it needs no callback of its own.
+    if (!instanceScoped) {
+      if (fastBypasserAction) {
+        Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
+      } else {
+        w.value = coerced;
+      }
+    }
     if (parentWidget) parentWidget.value = coerced;
     // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
     // promoted value (no semantic callback of their own — the inner target's fires
     // once below), so we assign their value directly, same as the rail.
     for (const dw of displayWidgets) dw.value = coerced;
-    // Fire the inner widget's own callback so combo/number side effects run — the
+    // #1268 / comfyui-mcp#1658 — drive the BOUND PROPERTY, in litegraph's own position:
+    // `BaseWidget.setValue` assigns the widget, then calls `node.setProperty(...)`, then
+    // fires the callback. Placed here so a programmatic write leaves the node in the SAME
+    // state an on-canvas edit leaves it in — rather than in the half-updated state that
+    // reads back clean and is overwritten by the node's next `setProperty`.
+    //
+    // Inside the SAME undo envelope as the value assignments, so this cannot land while
+    // the widget write rolls back.
+    //
+    // WHAT THE COPY-BACK COSTS, stated rather than waved at. `setProperty`'s last step
+    // assigns the value into the bound widget. On a plain data-property widget that is a
+    // no-op — `w.value` already holds `coerced`. On a widget whose `value` is an ACCESSOR
+    // (ComfyUI's DOM widgets are: `set value(v) { options.setValue?.(v); callback?.(…) }`)
+    // it runs that setter a second time, so a bound DOM widget's callback fires once more
+    // than it would for an unbound one. That is not a regression introduced here: it is
+    // exactly what `BaseWidget.setValue` does on an on-canvas edit of the same widget —
+    // assign, `setProperty`, then the callback. Matching the interactive path is the whole
+    // point, and the alternative (assigning `properties` and invoking `onPropertyChanged`
+    // by hand) would skip a `setProperty` a pack has overridden.
+    //
+    // A throw from here is captured by the same catch as everything else in this envelope
+    // and stays UNATTRIBUTED — `onPropertyChanged` is a node's own code and this is not
+    // the widget-callback invocation #976 can name.
+    if (boundProperty?.reachable) {
+      try {
+        valueNode.setProperty(boundProperty.property, coerced);
+      } catch (err) {
+        // #1735: Impact Pack's accessor-backed BooleanWidget can throw after the
+        // property and widget already hold the requested value, when setProperty's
+        // normal copy-back invokes its setter a second time. Continue into the same
+        // callback path only for that exact, verified shape; the read-back below still
+        // fails closed if either store did not actually take the value.
+        if (!isRecoverableBooleanAccessorDelete(valueWidget, expected, err)) throw err;
+      }
+    }
+    // Fire the WRITTEN widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
+    //
+    // comfyui-mcp#1707: on an instance-scoped promoted write that is the RAIL's
+    // callback on the WRAPPER, not the inner definition widget's. This is not a
+    // preference — it is the only coherent choice once the definition is left alone:
+    // invoking the inner node's callback would announce a new value for a widget
+    // whose value did not change, and would run that shared node's side effects for
+    // an edit made on ONE instance. It is also what the UI does, for the same reason:
+    // a canvas edit of a promoted control runs the projection's callback (which
+    // writes the store) and never reaches the inner widget's.
     //
     // #976: the flagged span contains the INVOCATION and nothing else, because the
     // flag is an attribution and an attribution that can be raised by anything but
     // the callback body is a lie. Hoisted out of it, in order:
-    //   - the `w.callback` LOOKUP: it may be a throwing accessor, which is not the
-    //     callback failing (it never ran)
-    //   - the ARGUMENTS, including `targetNode.pos`, which may be a throwing getter
+    //   - the `valueWidget.callback` LOOKUP: it may be a throwing accessor, which is
+    //     not the callback failing (it never ran)
+    //   - the ARGUMENTS, including `valueNode.pos`, which may be a throwing getter
     //   - and they are built INSIDE the nullish guard, because the original
     //     `w.callback?.(…)` short-circuited: with no callback, `pos` was never read,
     //     and a node with a throwing `pos` getter and no callback must keep the clean
@@ -1269,13 +2297,21 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    widgetCallback = w.callback;
-    if (widgetCallback !== null && widgetCallback !== undefined) {
-      const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
-      threwFromCallback = true;
-      reflectApply(widgetCallback, w, callbackArgs);
-      threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+    if (!fastBypasserAction) {
+      widgetCallback = valueWidget.callback;
+      if (widgetCallback !== null && widgetCallback !== undefined) {
+        const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
+        threwFromCallback = true;
+        reflectApply(widgetCallback, valueWidget, callbackArgs);
+        threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+      }
     }
+    // #1533 — AFTER the callback, still inside this envelope so afterChange
+    // captures the restored number. A VHSINT missing-step snap stores NaN (and a
+    // Vue setter may coerce that to null); neither is a retained INT value.
+    restoreFiniteNumberIfUnstored(valueWidget, expected);
+    if (parentWidget) restoreFiniteNumberIfUnstored(parentWidget, expected);
+    for (const dw of displayWidgets) restoreFiniteNumberIfUnstored(dw, expected);
   } catch (err) {
     // #639 (codex round-3 + delta-gate): WHICH construct threw is not recorded for
     // anything but the callback invocation — a value setter can invoke the callback
@@ -1299,9 +2335,12 @@ export function applyWidgetWrite(
   //
   // #639: a THROWN callback is deliberately NOT a verdict in this chain. The value
   // assignments above run BEFORE the callback fires, so when the callback throws the
-  // write may ALREADY be in effect (MiniMaxH3Director's `duration`: the extension's
-  // own callback throws on `options` of undefined on ANY programmatic invocation,
-  // which made the widget permanently unwritable when any throw forced a refusal).
+  // write may ALREADY be in effect — #976's MiniMaxH3Director `duration` write was
+  // verified present by read-back while its callback's throw was still reported.
+  // (An earlier draft of this note claimed that callback throws on ANY programmatic
+  // invocation; that was never measured — the only repro was a synthetic probe on a
+  // stock node — and the installed pack version has no `duration` widget at all, so
+  // the claim is withdrawn. `write_warning_frame` now carries the evidence instead.)
   // Rolling a VERIFIED write back and refusing would report failure for work that
   // succeeded and invite a destructive retry — so the structural checks below
   // decide. A throw on a verified write is DISCLOSED on the success result
@@ -1311,6 +2350,27 @@ export function applyWidgetWrite(
   let originalErr = null;
   let driftFailure = false;
   let writeWarning = null;
+  let threwFrame = null;
+  // #1268 — read the bound property TOTALLY. It is ordinary node state on every real
+  // node, but `properties` can be swapped for a Proxy or the key defined as a throwing
+  // accessor by a callback that ran inside the envelope above, and a verification that
+  // throws would escape past the rollback with the write left applied. A read that could
+  // not be taken yields a sentinel that matches nothing, so the write fails CLOSED and
+  // rolls back rather than being reported as verified.
+  const UNREADABLE_PROPERTY = Symbol("bound property unreadable");
+  const readBoundProperty = () => {
+    if (!boundProperty) return UNREADABLE_PROPERTY;
+    try {
+      const props = valueNode.properties;
+      if (!props || typeof props !== "object") return UNREADABLE_PROPERTY;
+      return props[boundProperty.property];
+    } catch {
+      return UNREADABLE_PROPERTY;
+    }
+  };
+  // Read ONCE, after the envelope closed. Two reads of a stateful accessor can disagree,
+  // and the verdict and the message it prints must be the same observation.
+  const boundPropertyActual = boundProperty?.reachable ? readBoundProperty() : undefined;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
   // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
@@ -1321,21 +2381,77 @@ export function applyWidgetWrite(
   // Only an EXACTLY reproducible snap counts. If the config does not explain the
   // observed value, this stays the failure it was — no tolerance, because a
   // tolerance would eventually swallow a real revert that landed nearby.
-  const normalization = matchesExpected(w.value)
+  const normalization = matchesExpected(valueWidget.value)
     ? null
-    : explainNumericNormalization(expected, w.value, w);
-  if (!matchesExpected(w.value) && !normalization) {
+    : explainNumericNormalization(expected, valueWidget.value, valueWidget);
+  // comfyui-mcp#1707 — the SHARED DEFINITION must be exactly as it was.
+  //
+  // This is the check that makes the scope classification safe rather than merely
+  // hopeful. `promotedValueScope` reads the frontend's own store key and concludes
+  // the rail is this wrapper's alone; if that plumbing is not what this frontend
+  // actually does — a rail that still forwards to the inner widget — the inner value
+  // moves, and the write silently becomes the cross-instance write this change
+  // exists to stop. Observed, not assumed: a definition that moved is a FAILURE, so
+  // the write rolls back and says so instead of reporting an instance-scoped write it
+  // did not perform. Compared structurally against the pre-mutation clone, so a
+  // callback mutating a captured object in place is caught too.
+  const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
+  if (!matchesExpected(valueWidget.value) && !normalization) {
     failure =
-      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
-      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.` +
+      `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(valueWidget.value)}.` +
       // #698 — "did not retain" reads as a transient failure worth retrying. For a
       // non-value-bearing DOM widget it is STRUCTURAL: the widget is a view, its
       // real state lives on the node, and no number of retries will change that.
       // Appended ONLY here, in the branch where the revert has already been
       // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
       // that would have worked. Diagnosis, never a gate.
-      describeNonValueBearingWidget(w, targetNode);
-  } else if (parentWidget && !matchesExpected(parentWidget.value)) {
+      describeNonValueBearingWidget(valueWidget, valueNode);
+  } else if (definitionMoved) {
+    // comfyui-mcp#1707 — the rail took the value AND the shared definition moved, so
+    // the two are not independent after all and this write did reach every sibling
+    // instance. Reported as a failure and rolled back: the alternative is a success
+    // result whose `value_scope: "instance"` would be false, which is the exact class
+    // of claim this change exists to remove.
+    failure =
+      `Promoted widget "${valueWidget.name}" on subgraph node ${node.id} is backed by a ` +
+      `per-instance value store (widgetId ${JSON.stringify(promotedHostWidgetId)}), but writing it ` +
+      `ALSO changed the shared subgraph definition's inner widget "${w.name}" on node ` +
+      `${targetNode.id} (${JSON.stringify(previous)} → ${JSON.stringify(w.value)}). That value is ` +
+      `read by every other instance of this subgraph, so the write is not scoped to the ` +
+      `instance it was addressed to. Rolled back rather than report an instance-scoped write ` +
+      `that was not one (comfyui-mcp#1707).`;
+  } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
+    // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
+    // property did NOT. This is the read the old verification never took: `w.value` came
+    // back equal to what was assigned to it two statements earlier, which is true whether
+    // or not the write reached anything the node reads.
+    //
+    // Compared against `expected` — the value that was WRITTEN to the property — and not
+    // against `w.value`. That distinction is what keeps a legitimate write passing: when a
+    // widget callback normalizes `w.value` (a numeric grid snapping 4096 to 4097, #805),
+    // the property still holds 4096 and the two stores diverge, but an ON-CANVAS edit
+    // leaves them diverged in exactly the same way — litegraph's `BaseWidget.setValue`
+    // calls `setProperty` BEFORE the callback runs. Failing there would refuse a write the
+    // UI itself performs. What this branch catches is the property not holding what was
+    // written to it at all: `onPropertyChanged` returning false, which litegraph documents
+    // as the abort signal and honours by restoring the previous value.
+    failure = boundPropertyFailure({
+      property: boundProperty.property,
+      widgetName: valueWidget.name,
+      nodeId: valueNode.id,
+      expected,
+      actual: boundPropertyActual,
+      unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
+    });
+  } else if (parentWidget && parentWidget !== valueWidget && !matchesExpected(parentWidget.value)) {
+    // comfyui-mcp#1707 — `parentWidget !== valueWidget` because on an instance-scoped
+    // promoted write the rail IS the widget this write assigned, and the branch above
+    // has already verified it — with the #805 normalization allowance this one does not
+    // have. Checking it a second time by strict equality would fail a rail that did
+    // exactly what a numeric widget is supposed to do, reporting "did not retain" for a
+    // write that applied. Nothing is verified less: it is the same object, checked once,
+    // by the check that knows about grids.
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
@@ -1401,6 +2517,21 @@ export function applyWidgetWrite(
     }
   }
 
+  // #2146 — a canonical Fast Bypasser action is not a successful widget write unless the
+  // action actually changed a reachable linked mode when the requested toggle changed. This
+  // catches the old false success path where only the composite row value was assigned.
+  if (!failure && fastBypasserAction?.requiresModeChange) {
+    const modeChanged = fastBypasserModes?.changed();
+    if (modeChanged !== true) {
+      failure =
+        modeChanged === null
+          ? `Fast Bypasser row action changed the toggle, but its linked node modes could not be ` +
+            `verified.`
+          : `Fast Bypasser row action did not change any linked node modes; refusing to report ` +
+            `the toggle as applied.`;
+    }
+  }
+
   // #639: reconcile a captured throw with the verification verdict. The write
   // VERIFIED (value + rail + proxies retained, promotion topology intact) — the
   // throw came from applying the write: DISCLOSE it on the success result, never
@@ -1445,6 +2576,13 @@ export function applyWidgetWrite(
   // An attribution that overshoots just relocates the wrong blame.
   if (didThrow) {
     const threwDetail = describeThrown(threw);
+    // #976: WHERE the throw surfaced, as scrubbed data — emitted for BOTH the
+    // attributed and the unattributed branch, because a stack frame is an
+    // observation (unlike `write_warning_source`, it claims nothing about which
+    // construct failed). Without it the Error is swallowed inside this lib and the
+    // one fact that could route the report — the file the throw came from — is
+    // destroyed.
+    threwFrame = describeThrownFrame(threw);
     // "ATTEMPT to invoke", uniformly (codex round 3). A class constructor and a
     // revoked Proxy both satisfy `typeof === "function"` and then throw before any
     // body runs, so any wording that says the callback RAN is false for them — and
@@ -1543,8 +2681,14 @@ export function applyWidgetWrite(
       // replacement/reorder a callback did, so a detached captured proxy is re-attached
       // and a swapped-in replacement is dropped. ONLY when the original host input is
       // still wired (else a wholesale-replaced promotion is left for partial-state
-      // reporting rather than masked).
-      if (prevOuterWidgetsRef && hostStillWired) {
+      // reporting rather than masked) — and only when the node KEEPS one array.
+      //
+      // On a real SubgraphNode the list is rebuilt per read from `node.inputs`:
+      // refilling the array a read handed out mutates a throwaway, and the assignment
+      // is swallowed by a no-op setter, so this would be theatre. Its members follow
+      // `inputs` / `hostInput.widget` / `hostInput._widget`, which the block above has
+      // already restored; the by-value read-back below judges whether that landed.
+      if (prevOuterWidgetsRef && prevOuterWidgetsIdentityStable && hostStillWired) {
         try {
           prevOuterWidgetsRef.length = 0;
           for (const wd of prevOuterWidgets) prevOuterWidgetsRef.push(wd);
@@ -1553,10 +2697,31 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
-      try {
-        w.value = previous;
-      } catch {
-        /* restore best-effort; read-back below is authoritative */
+      // #1268 — restore the BOUND PROPERTY before the widget values, through the same
+      // `setProperty` litegraph uses, so the node's own `onPropertyChanged` sees the
+      // rollback the way it sees any other property change. Its last step copies the
+      // restored value into the bound widget, and `w.value = previous` follows, so the
+      // widget ends on its own captured value either way.
+      if (boundProperty?.reachable) {
+        try {
+          valueNode.setProperty(boundProperty.property, boundProperty.previous);
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+      // comfyui-mcp#1707 — restore the inner definition widget only when this write
+      // could have moved it: it was written (the definition-scoped path), or it moved
+      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
+      // write that left it alone must not assign it here either — the assignment is a
+      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
+      // write this path never made is exactly the shared-definition touch it avoided.
+      // The read-back below still compares it against the captured clone either way.
+      if (!instanceScoped || definitionMoved) {
+        try {
+          w.value = previous;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
       }
       if (parentWidget) {
         try {
@@ -1574,6 +2739,10 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
+      // #2146 — restore the Fast Bypasser's group/repeater mode journal inside the same
+      // rollback envelope. Repeater setters may themselves propagate to linked nodes, so the
+      // journal restores the roots first and then verifies every captured primitive mode below.
+      fastBypasserModes?.restore();
     } finally {
       safeAfter();
     }
@@ -1583,6 +2752,19 @@ export function applyWidgetWrite(
     // object IN PLACE (which an identity compare would miss), are ALL detected.
     let rollbackFailed = null;
     if (!structurallyEqual(w.value, previousClone)) rollbackFailed = `inner "${w.name}"`;
+    // #1268 — the bound property must be back to its captured value too. A node whose
+    // `onPropertyChanged` refuses the write ALSO refuses the restore, which leaves the
+    // node holding a value neither the caller nor the previous state asked for; that is
+    // an honest partial state and is reported as one rather than hidden behind a clean
+    // rollback. Compared structurally against the pre-mutation clone, exactly as the
+    // widget values are, so a hook mutating a restored object in place is caught.
+    if (boundProperty?.reachable) {
+      const restored = readBoundProperty();
+      if (restored === UNREADABLE_PROPERTY || !structurallyEqual(restored, previousPropertyClone)) {
+        const label = `bound property "${boundProperty.property}"`;
+        rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
+      }
+    }
     if (parentWidget && !structurallyEqual(parentWidget.value, previousParentClone)) {
       rollbackFailed = rollbackFailed
         ? `${rollbackFailed} and rail "${parentWidget.name}"`
@@ -1595,6 +2777,11 @@ export function applyWidgetWrite(
         const label = `display "${displayWidgets[i].name}"`;
         rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
       }
+    }
+    const unrestoredFastModes = fastBypasserModes?.unrestored() ?? [];
+    if (unrestoredFastModes.length) {
+      const label = `Fast Bypasser linked node modes (${unrestoredFastModes.length} node(s))`;
+      rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
     }
     // The serialization binding must be back to its original store key, else queue
     // compilation still reads whatever entry a callback re-pointed it to.
@@ -1626,12 +2813,39 @@ export function applyWidgetWrite(
     // different widgetId — serializes differently). This holds whether or not the gated
     // restore above ran.
     if (promotedFrom) {
+      // Read the list ONCE: a projected `widgets` rebuilds on every access, so four
+      // reads would compare four different arrays.
+      let liveOuterWidgets;
+      let outerWidgetsReadable = true;
+      try {
+        liveOuterWidgets = node.widgets;
+      } catch {
+        // A list we cannot read is a list we cannot clear. Report the partial state —
+        // and, just as importantly, keep the throw from escaping and replacing the
+        // WidgetWriteError that explains why the write failed with a bare TypeError.
+        outerWidgetsReadable = false;
+      }
       const listExact =
         prevOuterWidgets == null ||
-        (node.widgets === prevOuterWidgetsRef &&
-          Array.isArray(node.widgets) &&
-          node.widgets.length === prevOuterWidgets.length &&
-          node.widgets.every((wd, i) => wd === prevOuterWidgets[i]));
+        (outerWidgetsReadable &&
+          // A `widgets` that swapped KIND between snapshot and read-back has been cut
+          // off from what feeds it — a rebuilt list frozen into a plain array no
+          // longer tracks `node.inputs`. That is outer-topology drift in its own
+          // right, and catching it is what stops the relaxed identity rule below from
+          // being a door: a list cannot buy its exemption after the fact.
+          widgetsListHasStableIdentity(node) === prevOuterWidgetsIdentityStable &&
+          Array.isArray(liveOuterWidgets) &&
+          // Array identity is evidence only for a list the node KEEPS. A rebuilt one
+          // hands out a FRESH array per read, so this compare could only ever fail —
+          // which is how a PERFECT rollback on a subgraph node came to be reported as
+          // a partial state. Membership/order below is the real #477 P1 check: a
+          // replaced or reordered list, an added proxy, or a dropped rail all still
+          // fail it, because each member is compared by the same object identity that
+          // authenticates a rail (and the frontend memoises each projected proxy onto
+          // `input._widget`, so those identities are stable across reads).
+          (!prevOuterWidgetsIdentityStable || liveOuterWidgets === prevOuterWidgetsRef) &&
+          liveOuterWidgets.length === prevOuterWidgets.length &&
+          liveOuterWidgets.every((wd, i) => wd === prevOuterWidgets[i]));
       let liveInput = undefined;
       try {
         const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
@@ -1688,9 +2902,13 @@ export function applyWidgetWrite(
     setDirty?.();
     if (rollbackFailed) {
       throw new WidgetWriteError(
-        `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) write failed: ${failure} ` +
+        `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) write failed: ${failure} ` +
           `Rollback of ${rollbackFailed} did not take effect (a value setter or history hook ` +
           `rejected/overrode it) — the graph may be in a partial state; re-set the widget or undo.`,
+        // The one WidgetWriteError raised AFTER the graph was mutated and NOT cleanly
+        // restored. Marked so no caller can reword it into a "refused, nothing applied"
+        // frame — see the flag's declaration.
+        { partialWrite: true },
       );
     }
     // Rollback succeeded: preserve the original WidgetWriteError message where there
@@ -1700,6 +2918,55 @@ export function applyWidgetWrite(
   }
 
   setDirty?.();
+
+  // #1519 — FIRE THE NODE-LEVEL HOOK, here and nowhere else.
+  //
+  // `node.onWidgetChanged(name, value, prevValue, widget)` is the litegraph hook a pack
+  // patches onto a node TYPE (in `beforeRegisterNodeDef`) to rebuild slot topology from
+  // a widget. It is not the widget's own callback and a pack cannot use the callback
+  // instead — the callback lives on a widget the rebuild replaces. The frontend fires
+  // both, in this order, on every interactive edit; this file fired only the callback,
+  // so a programmatic write left such a node holding the NEW widget value and its OLD
+  // slots, silently. See lib/node-widget-changed.js for the frontend call sites this
+  // reproduces and the reported `SWF_Subworkflow` case.
+  //
+  // PLACED AFTER THE VERIFICATION VERDICT, which is the whole of the ordering question
+  // the report raised. Every failure path above has already rolled back and THROWN by
+  // the time control reaches here, so the hook cannot run for a write that did not
+  // stick — a pack rebuilt against a value that was subsequently restored is the one
+  // outcome worse than the stale slots this fixes. Nothing in the rollback machinery is
+  // touched; this is reachable only from the success path.
+  //
+  // FIRED ONCE, on the node/widget pair whose callback this write fired — `valueNode`
+  // and `valueWidget`, which on an instance-scoped promoted write are the wrapper and
+  // its rail, and otherwise the concrete target. Announcing the change a second time
+  // for the other end of a promotion would report a change for a widget whose value
+  // did not move, which is the same reasoning the callback note above records.
+  //
+  // ARGUMENTS: the VERIFIED value read back off the widget, not `coerced`. Where a
+  // widget's own grid normalized the write (#805) the two differ, and handing a pack a
+  // value the widget does not hold is how a rebuild lands on state nothing agrees with.
+  // For every write that did not normalize they are identical. `previousForHook` is
+  // that same widget's own prior value, never the other end of the promotion's.
+  //
+  // Unlike the frontend's `BaseWidget.setValue`, this is NOT gated on the value having
+  // changed. The gate does not exist for the callback invocation above either, and
+  // adding one only here would make re-issuing the same `panel_set_widget` — the
+  // obvious way a caller recovers from exactly this bug — a silent no-op.
+  //
+  // It NEVER decides this write's verdict: a throwing hook is disclosed on the success
+  // result, the same containment the widget callback and #1282's refresh press get.
+  const verifiedValue = valueWidget.value;
+  const verifiedName = valueWidget.name;
+  const previousForHook = instanceScoped ? previousParent : previous;
+  const widgetChanged = fireNodeWidgetChanged(valueNode, valueWidget, {
+    name: verifiedName,
+    value: verifiedValue,
+    previous: previousForHook,
+    beforeChange,
+    afterChange,
+    setDirty,
+  });
 
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).
@@ -1711,15 +2978,105 @@ export function applyWidgetWrite(
   // #976: `write_warning_source` carries the attribution as DATA, so a caller does not
   // have to pattern-match prose to render it. Present ONLY for the establishable case;
   // its absence means "not attributable", never "the panel's fault".
+  // comfyui-mcp#1707 — `node_id`/`widget`/`value` name the widget this write ACTUALLY
+  // assigned. For an instance-scoped promoted write that is the wrapper the caller
+  // addressed and its promoted widget — not the inner definition widget, which this
+  // path deliberately leaves untouched, and which the panel's own activity line would
+  // otherwise announce as "Set width = 1024 on node 54" for a node whose value did not
+  // change. Provenance is not lost: `promoted_from.inner_node_id` still names the inner
+  // node and `inner_previous` still reports its (unchanged) value. Every definition-scoped
+  // and non-promoted write reports exactly the fields it always did.
+  // #1519 — `widget`/`value` are the captures taken BEFORE the node hook fired, not a
+  // fresh read. They are what the verification above ESTABLISHED, and a hook that
+  // rebuilds a node can replace the widget object or move its value; reporting a
+  // post-hook read would put a value in the reply that nothing verified. With no hook
+  // (every stock node) the captures are the same reads this returned before.
   return {
-    node_id: targetNode.id,
-    widget: w.name,
+    node_id: valueNode.id,
+    widget: verifiedName,
     previous: parentWidget ? previousParent : previous,
-    value: w.value,
+    value: verifiedValue,
+    // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
+    // inferring it from the rejection that led here. `options.values` is a callback and
+    // can answer differently per call: the final attempt may well have been admitted by
+    // ordinary membership after the list became readable, and claiming an unvalidated
+    // write then would be false. Set ONLY when the unreadable-list acceptance is what
+    // admitted the value — same never-read-twice discipline `emptyAcceptanceUsed` follows.
+    ...(coerceOutcome.unreadableAcceptanceUsed
+      ? {
+          option_list_unreadable: true,
+          // WHICH observation, verbatim from the read that decided it — so the reply
+          // states the reason instead of a plausible-sounding default.
+          option_list_unreadable_detail: coerceOutcome.unreadableObservation,
+          // #1126 — and whether the AUTHORITATIVE parent rail's real list nonetheless
+          // vouched for the value. Emitted only when it is TRUE, so a reader that does not
+          // know the field sees exactly what it saw before, and the disclosure never claims
+          // a check that did not happen. The cross-check above is what establishes it, and
+          // only a match on the serializing rail counts — never a #477 display proxy.
+          ...(railValidated ? { promoted_rail_validated: true } : {}),
+        }
+      : {}),
+    // #1268 / comfyui-mcp#1658 — WHAT THE VERIFICATION ACTUALLY ESTABLISHED for a widget
+    // litegraph binds to one of its node's own properties. Two mutually exclusive shapes,
+    // and the second is the whole point of this pair of issues:
+    //
+    //   bound_property             the property was driven with `setProperty` and READ BACK
+    //                              holding the written value. The effect is established, not
+    //                              just the assignment.
+    //   bound_property_unverified  the node declares the property but exposes no way to
+    //                              drive or read it from here. The widget's stored value was
+    //                              verified and the value the NODE reads was not — reported
+    //                              as UNKNOWN on a successful write, because "success" for a
+    //                              value that may be about to be replaced is the false claim
+    //                              both reporters received, and a refusal would block writes
+    //                              that are very likely fine.
+    //
+    // Neither field appears for a widget with no `options.property`, which is every stock
+    // ComfyUI widget built from /object_info — those replies are byte-identical to before.
+    ...(boundProperty?.reachable
+      ? { bound_property: { name: boundProperty.property, previous: boundProperty.previous } }
+      : {}),
+    ...(boundProperty && !boundProperty.reachable
+      ? {
+          bound_property_unverified: { name: boundProperty.property, reason: boundProperty.reason },
+          bound_property_note: boundPropertyUnverifiedNote({
+            property: boundProperty.property,
+            widgetName: w.name,
+            nodeId: targetNode.id,
+            reason: boundProperty.reason,
+          }),
+        }
+      : {}),
+    // #507/#1126 — the empty-list acceptance is what admitted the value. Reported here so a
+    // caller reaching that acceptance from EITHER ladder branch sees one field with one
+    // name, rather than the #507 branch alone naming it at the runSetWidget level.
+    ...(coerceOutcome.emptyAcceptanceUsed ? { empty_option_list: true } : {}),
+    // #1519 — what the node's own onWidgetChanged hook did, as DATA. Both fields are
+    // emitted ONLY on an OBSERVATION, so every node without the hook — which is every
+    // stock ComfyUI node — replies byte-identically to before:
+    //
+    //   widget_changed_slots        the hook rebuilt the node's slots synchronously;
+    //                               these are the input/output names AFTER it, so the
+    //                               caller can wire the node without a re-read.
+    //   widget_changed_hook_failed  attempting to invoke the hook threw. The WRITE is
+    //                               unaffected — it is verified and was not rolled back
+    //                               — but the state the hook rebuilds may be stale or
+    //                               partially rebuilt, and that is stated rather than
+    //                               left for a later `panel_connect` to discover.
+    //
+    // A hook that ran and changed no slots reports NOTHING, because a pack that rebuilds
+    // from a `fetch` (the reported `SWF_Subworkflow` does) resolves after this returns:
+    // a synchronous snapshot showing no change means "not yet", not "nothing happened".
+    ...(widgetChanged?.changed ? { widget_changed_slots: widgetChanged.changed } : {}),
+    ...(widgetChanged?.failed ? { widget_changed_hook_failed: widgetChanged.failed } : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,
           ...(threwFromCallback ? { write_warning_source: "widget_callback" } : {}),
+          // #976: the innermost non-panel stack frame, scrubbed of origin — present
+          // whenever the throw cooperated, on either attribution branch. Its absence
+          // means "no readable stack", never "no throw".
+          ...(threwFrame ? { write_warning_frame: threwFrame } : {}),
         }
       : {}),
     // #805 — the write applied and the node quantized it. Report BOTH values so the
@@ -1730,9 +3087,11 @@ export function applyWidgetWrite(
           requested_value: expected,
           normalization_rule: normalization.rule,
           normalization_note: normalizationNote({
-            name: w.name,
+            // #1519 — the same pre-hook captures the verdict was computed from, so the
+            // note cannot describe a value the normalization check never saw.
+            name: verifiedName,
             requested: expected,
-            actual: w.value,
+            actual: verifiedValue,
             rule: normalization.rule,
           }),
         }
@@ -1744,10 +3103,95 @@ export function applyWidgetWrite(
             ...promotedFrom,
             parent_widget_synced: parentWidget != null,
             ...(displayWidgets.length ? { display_widgets_synced: displayWidgets.length } : {}),
+            // comfyui-mcp#1707 — WHOSE value this changed, as DATA rather than something
+            // a caller has to infer from the shape of the reply:
+            //
+            //   "instance"            the wrapper's own promoted-value store entry was
+            //                         written and the shared subgraph definition was
+            //                         verified UNCHANGED, so sibling instances of the same
+            //                         subgraph keep their own values.
+            //   "subgraph_definition" this frontend exposes no per-instance store for this
+            //                         promoted widget, so the value was written into the
+            //                         subgraph DEFINITION's inner widget — which every
+            //                         instance of this subgraph reads.
+            //
+            // Always present on a promoted write, so "the field is missing" can never be
+            // read as either verdict, and never emitted for a write that took the other
+            // path — the failure branch above rolls back rather than let "instance" stand
+            // for a write that moved the definition.
+            value_scope: valueScope,
+            // #1492 — the side effects this write did NOT run, stated as DATA next to
+            // the scope decision that caused it. Emitted ONLY when a callback was
+            // actually observed on the shared inner widget (or could not be read at
+            // all): an instance-scoped write of a plain stock widget skipped nothing,
+            // and an unconditional flag there would train a caller to ignore the one
+            // case that matters. Every definition-scoped, non-promoted and
+            // callback-free reply is byte-identical to what it always was.
+            ...(innerCallbackSkipped
+              ? {
+                  inner_callback_not_invoked: true,
+                  inner_callback_note: innerCallbackNotInvokedNote({
+                    widgetName: w?.name,
+                    innerNodeId: targetNode?.id,
+                    innerNodeType: targetNode?.type,
+                    innerValue: previous,
+                    subgraphNodeId: node?.id,
+                    unreadable: innerCallbackUnreadable,
+                  }),
+                }
+              : {}),
           },
         }
       : {}),
   };
+}
+
+/**
+ * #1492 — say what an instance-scoped promoted write left undone, and what to do about it.
+ *
+ * The value itself IS in effect: it landed on the wrapper's own promoted-value store,
+ * which is what queue compilation reads for an unlinked promoted input. What did not
+ * happen is the inner (shared definition) widget's own callback, and a callback that
+ * mutates OTHER nodes — a status switch flipping a branch between ACTIVE and BYPASS is
+ * the reported one — leaves the graph in a state no field on the old reply described.
+ *
+ * WORDED FOR WHAT IS ESTABLISHED, not for what is likely:
+ *   * "was not invoked" — observed, not inferred: this path never calls it.
+ *   * it does NOT claim the callback has side effects. Plenty do nothing but store a
+ *     value, and telling every caller their graph is stale would be its own false alarm.
+ *   * on the unreadable branch it does not claim a callback EXISTS, because the read
+ *     that would have established it threw.
+ *
+ * The remedy is named because the report's own workaround was to drive the affected
+ * nodes by hand and it had to be discovered: `panel_set_node_mode` for a node mode,
+ * `panel_enter_subgraph` to look at the inner nodes. Deliberately NOT a refusal — the
+ * write is correct and the caller usually wants exactly it.
+ */
+export function innerCallbackNotInvokedNote({
+  widgetName,
+  innerNodeId,
+  innerNodeType,
+  innerValue,
+  subgraphNodeId,
+  unreadable = false,
+} = {}) {
+  const inner = `node ${innerNodeId}${innerNodeType ? ` (${innerNodeType})` : ""}`;
+  return (
+    `The value IS in effect on subgraph node ${subgraphNodeId} — it was written to this ` +
+    `instance's own promoted-value store, which is what serializes at queue time. What this ` +
+    `write did NOT do is run the shared subgraph definition's inner widget callback: ` +
+    `"${widgetName}" on ${inner} still holds ${JSON.stringify(innerValue)} and its own callback ` +
+    (unreadable
+      ? `could not even be READ here, so it certainly was not invoked. `
+      : `was not invoked. `) +
+    `That is deliberate — the inner node is SHARED by every instance of this subgraph, so ` +
+    `running its callback for an edit made on one instance would apply that instance's change ` +
+    `to all of them. But if that callback does more than store a value — toggling another ` +
+    `node's mode, bypassing a branch, refreshing dependent widgets — none of it ran, and the ` +
+    `nodes it drives are still in their PREVIOUS state. Check them before treating this write ` +
+    `as complete: panel_enter_subgraph to inspect the inner nodes, and panel_set_node_mode to ` +
+    `set a node ACTIVE/BYPASS/MUTE explicitly.`
+  );
 }
 
 /**

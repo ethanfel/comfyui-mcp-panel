@@ -15,6 +15,9 @@
 //      on a genuinely-resolved direct node (never a placeholder).
 //   3. applyWidgetWrite with the resolved-target registry guard, which runs
 //      BEFORE value coercion and any mutation/callback.
+// Post-write, inside the same synchronous boundary (#1282): refresh the node's
+// dynamic input slots via its own "Update inputs"-style control when it exposes
+// one — disclosed on the success result, never thrown over a verified write.
 
 import {
   applyWidgetWrite,
@@ -34,13 +37,34 @@ import {
   freshBackendDefinesType,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
+import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
+import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
   addComboOption,
   serverDeclaresEmptyComboOptions,
+  serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
+
+/**
+ * Fire an undo-history hook that can never escape.
+ *
+ * Mirrors widget-write.js's own `safeBefore`/`safeAfter`: history bookkeeping is best-effort,
+ * and a throwing `graph.onBeforeChange` / `onAfterChange` must never decide the outcome it is
+ * merely bracketing. Used around the created-target cleanup, where an escaping OPEN would
+ * skip the cleanup entirely (leaving the row and the row name it spent) and an escaping CLOSE
+ * would replace the refusal the caller actually needs to read.
+ */
+function safeHistoryHook(hook) {
+  try {
+    hook?.();
+  } catch {
+    /* history hook is best-effort */
+  }
+}
 
 /** A never-throwing rendering of an advisory failure. Used on the POST-WRITE path, where
  *  a second exception (a getter on `message`, a null throw) must not escape either. */
@@ -52,6 +76,106 @@ function coerceAdvisoryMessage(err) {
   } catch {
     return "the reason could not be rendered";
   }
+}
+
+/**
+ * #1418 — what the panel's refreshCombos returns instead of REFRESH_JOIN_ABANDONED when the
+ * abandoned wait STARTED NOTHING: the command's budget was already spent before the recovery
+ * could begin (the seed wait and the authorization /object_info are drawn against it too),
+ * so no node-def refresh is running and none is coming. REFRESH_JOIN_ABANDONED alone cannot
+ * say this — the coalescer returns it both for "stopped waiting on a run that is still
+ * going" and for "joinMs was already non-positive with an empty slot", and the refusal below
+ * must not claim a refresh is running in the second case. The coalescer is deliberately NOT
+ * changed to return this itself: graph_add_node reads REFRESH_JOIN_ABANDONED and its wording
+ * is out of scope here, so the distinction is made by THIS command's wrapper, from the same
+ * two facts the coalescer's decision is made from (the slot, and the bound), read BEFORE the
+ * call so the two can never disagree.
+ */
+export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
+
+/**
+ * #1413/#1418 — the refusal for a stale-combo recovery that never revalidated the value.
+ *
+ * RECOVERABLE BY CONSTRUCTION, and worded to say so — the same shape as #1192's
+ * addNodeRefreshBusyMessage. What it must NOT say is "not a valid option": the revalidation
+ * never completed, so this refusal cannot tell a genuinely-invalid value from one a refresh
+ * would have accepted — and claiming the former is how a retryable busy reads as a permanent
+ * rejection.
+ *
+ * `refreshStillRunning` is the panel's VERIFIED statement about the coalescer's slot, not a
+ * guess (#1418): TRUE means a run is occupying it and still registering the very list this
+ * write needs, so the retry joins work in progress. FALSE means the budget was spent before
+ * the recovery could start and NO refresh is running — the retry rests on what is true in
+ * that state: it re-enters the recovery with a fresh budget. Naming only the first state is
+ * the false claim #1409 had to correct in refresh_nodes' own verdict ("a detail naming only
+ * the first is flatly wrong on an uncontended big install").
+ */
+function staleComboRefreshRefusalMessage(refreshStillRunning) {
+  const state = refreshStillRunning
+    ? "the authoritative refresh that would have re-read the list — a node-def refresh " +
+      "started by a ComfyUI reconnect, a finished install, or another tool call — was still " +
+      "running when this command's time budget ran out waiting for it, so the revalidation " +
+      "did NOT complete. That refresh is still running and is registering exactly the list " +
+      "this write needs, so RETRY in a few seconds — this normally succeeds on the next " +
+      "attempt, joining the work already in progress."
+    : "the authoritative refresh that would have re-read the list never started: this " +
+      "command's time budget was already spent (on the startup schema seed and the " +
+      "authorization /object_info read) before the recovery could run. No node-def refresh " +
+      "is running and none is coming. RETRY re-enters the recovery with a fresh budget and " +
+      "normally succeeds once those reads answer faster — if this recurs, the schema read " +
+      "itself is the slow part.";
+  return (
+    "the value is not in this combo's current option list, and " +
+    state +
+    " This refusal cannot tell a genuinely-invalid value from one the refresh would have " +
+    "accepted. NOTHING WAS WRITTEN and nothing was changed. If it keeps happening, call " +
+    "panel_refresh_nodes once and wait for it to report, then retry the write."
+  );
+}
+
+/**
+ * #1560 — the COMPLETE set of class types this write is about to be authorized against,
+ * derived from the GRAPH with no schema and no I/O.
+ *
+ * This is what makes a type-scoped `/object_info` read answer the RIGHT question. The three
+ * guards below ask about exactly these:
+ *
+ *   - `assertTypeAgainstFreshBackend` on the ULTIMATE CONCRETE target's type;
+ *   - `assertMutatedNodeAuthorized` on the OUTER subgraph node's type;
+ *   - `assertMutatedNodeAuthorized` on EVERY intermediate container's type;
+ *   - and the #612 not-promoted diagnosis, on the outer node's type again.
+ *
+ * MEASURED, not reasoned: driving the real helpers on the nested A→B→KSampler shape the #458
+ * suite uses returns SubgraphA / SubgraphB / KSampler with nothing fetched. That is the
+ * "TWO types for a promoted write" the oracle's header warns about, named up front instead of
+ * discovered after the fetch.
+ *
+ * A SUPERSET IS SAFE; A SUBSET IS A REFUSAL, NEVER A WRONG ANSWER. An extra type costs one
+ * ~3KB request. A missing one is a type the returned map was not asked to cover, and reading
+ * it throws rather than reporting it absent — which is the #716/#821 failure this exists to
+ * make impossible.
+ */
+export function scopedAuthorizationTypes(node, promotedResolution, isResolvedPromotion, resolveSource) {
+  const types = [];
+  const push = (t) => {
+    if (typeof t === "string" && t !== "" && !types.includes(t)) types.push(t);
+  };
+  push(node?.type);
+  if (isResolvedPromotion) {
+    // Both helpers walk injected, caller-supplied link data and can throw on a malformed or
+    // cyclic promotion. An incomplete list must never be returned as though it were the whole
+    // set, so a throw yields NOTHING and the scoped read is simply not attempted — the write
+    // then refuses on the unchanged path below.
+    try {
+      push(followPromotionToConcrete(promotedResolution.target, resolveSource)?.node?.type);
+      for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
+        push(intermediate?.type);
+      }
+    } catch {
+      return [];
+    }
+  }
+  return types;
 }
 
 export async function runSetWidget(
@@ -80,8 +204,131 @@ export async function runSetWidget(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
+    // #1223 × #1126 — WHERE the schema `getFreshObjectInfo` answered with actually came
+    // from. Read as a FUNCTION, at the moment of decision, because the answer is only known
+    // AFTER the oracle has run.
+    //
+    //   "live"        the server answered this call's own request and nothing retired it
+    //   "cache"        #716's ≤1.5s burst cache answered, or this call joined another's
+    //                  in-flight request — nobody asked the server just now
+    //   "reconnected"  this call DID issue the request, but the backend reconnected before it
+    //                  resolved, so the payload describes a ComfyUI process that has since
+    //                  been replaced
+    //   "retired"      this call DID issue the request, but an `invalidate()` — a refresh, a
+    //                  pack install, a download completing — retired it mid-flight. The panel
+    //                  itself superseded that schema; a list it declares empty may have been
+    //                  filled by the very refresh that retired it
+    //   "snapshot"     #1223's last-observed schema stood in while both live probes were
+    //                  silent. NOTE it is a detached map of TYPE NAMES ONLY — see the
+    //                  fallback below for why that makes it unable to answer this question
+    //                  at all, rather than merely answering it staleley
+    //   "scoped"       #1560's TYPE-SCOPED read stood in while both whole-map probes were
+    //                  silent. It is the server answering NOW, but only about the handful of
+    //                  types this write resolves to — so it can authorize a type and it
+    //                  cannot answer anything that ranges over the install
+    //   "none"         nothing was established
+    //
+    // The first four are ONE answer from object-info-cache.js, which owns the generation
+    // counter that retires requests and decides how each read is served. They are emphatically
+    // NOT four conditions for a caller to assemble: that was tried, and four review rounds
+    // each found another way a response could fail to be live while the reconstructed test
+    // still said it was. A retirement mechanism added to that file is classified by that file.
+    //
+    // Only the #1126 blind-write fallback consults it, and it must: that fallback's entire
+    // justification is "the SERVER authoritatively declares this input's option list empty",
+    // and only "live" is the server answering. Every other value is the server's PAST word,
+    // retained across a window in which nobody re-asked — a snapshot across a disconnection
+    // (#1223), a cache entry across ≤1.5s of a write burst (#716), a response the backend
+    // was replaced underneath, a response the panel's own refresh superseded. Options change
+    // without a reconnect and without a cache drop (a model downloaded while the node's own
+    // live callback stays unreadable), so any stale `[]` would authorize an unvalidated write
+    // against a list that is no longer empty.
+    //
+    // Defaults to "live" when unwired, which is the pre-#716/#1223 world every other caller
+    // and test still models: an oracle with no cache and no snapshot branch could only ever
+    // have fetched. The panel threads the fact rather than letting this infer it — only the
+    // oracle knows which branch answered.
+    schemaProvenance,
+    // #1126 — force a genuinely LIVE re-read on the last-resort blind-write path, bypassing
+    // the #716 burst cache. Deliberately NOT "invalidate, then re-read": that spelling is
+    // global, so two writes reaching this path together each retired the other's just-issued
+    // request (one caller refusing another's valid write), and nothing coalesced, so a burst
+    // paid for one multi-megabyte /object_info per caller. The capability now names the
+    // OUTCOME the ladder needs — a fresh answer — and leaves the cache to decide how to get
+    // one without disturbing anybody else.
+    refetchObjectInfoLive,
+    // #1560 — the LAST-RESORT, TYPE-SCOPED route: `(types) => { defs, covered, reason }`,
+    // asking the backend about EXACTLY the class types this write is about to be authorized
+    // against, one `/object_info/<Type>` request each.
+    //
+    // Consulted ONLY when the whole-map oracle AND #1223's snapshot have both produced
+    // nothing — on a ~1023-model install the whole dump never lands inside any budget, so
+    // the snapshot is never populated and every write refuses for the LIFE OF THE TAB.
+    //
+    // It is wired here rather than inside `getFreshObjectInfo` for a reason the oracle's own
+    // header names: a per-class payload "answers one question and reads the other as absent
+    // (#716/#821)", and the set of questions is only known once the promotion has been
+    // resolved — which happens BELOW the fetch. By the time this is called the outer node,
+    // every intermediate and the ultimate concrete target are all known, so the map can be
+    // asked to cover all of them and to THROW for anything else (see scoped-object-info.js).
+    //
+    // The panel gates it on the SAME `noBackendAnswerEstablished` licence #1223's snapshot
+    // uses, so a client that ANSWERED deny-all is never overruled by a broader per-class read.
+    fetchScopedObjectInfo,
+    // #757 — SYNCHRONOUS target preparation. Some write targets do not exist until
+    // something creates them (an rgthree Power Lora Loader `lora_N` row is minted only by
+    // the node's own method), and the creation is a graph MUTATION. Injected here, rather
+    // than done by the caller before this function, so the mutation lands at the write
+    // boundary below where NO await follows it — see the note at `write`.
+    prepareWriteTarget,
   } = {},
 ) {
+  // Never re-derived, and never cached: the oracle may not have run yet when this closure is
+  // built, and a caller that answers differently per call is answering about a different
+  // fetch. A non-function is the unwired default ("live", see above); a THROWING one, or one
+  // answering something unrecognized, is UNKNOWN provenance — which fails CLOSED for the one
+  // branch that asks, because nothing established must never read as the server answering.
+  const readSchemaProvenance = () => {
+    if (typeof schemaProvenance !== "function") return "live";
+    try {
+      const p = schemaProvenance();
+      return p === "live" ||
+        p === "cache" ||
+        p === "reconnected" ||
+        p === "retired" ||
+        p === "snapshot" ||
+        p === "scoped" ||
+        p === "none"
+        ? p
+        : "unknown";
+    } catch {
+      return "unknown";
+    }
+  };
+  /**
+   * The provenance of THE MAP THIS DECISION IS ABOUT — asked of the PAYLOAD first, and only
+   * then of the stamp.
+   *
+   * `readSchemaProvenance` deliberately holds the QUESTION rather than an answer, because a
+   * verdict computed before an await can be superseded during it (#1126). That is right for
+   * the whole-map routes and WRONG for #1560's type-scoped one, because the ladder below
+   * re-asks the panel for a live map: the re-ask re-enters the panel's shared
+   * `readObjectInfo`, which re-stamps the provenance on EVERY exit path it has. So a FAILED
+   * re-ask — the normal case on an install whose whole map never lands — overwrites "scoped"
+   * with "none" while `authDefs` is still the scoped map. The branch keyed on "scoped" then
+   * never fires, and what fires instead tells the caller the provenance could not be
+   * established AT ALL and to reconnect: false twice over, since a type-scoped read did
+   * answer, live, moments earlier, and reconnecting cannot help a backend whose whole map
+   * never arrives. That is the misattribution class #982/#1223 exist to stop, committed by
+   * the change written to extend them.
+   *
+   * #1223's OWN snapshot branch was dead code for the same reason once — `node-resolve.js`'s
+   * suite records it — so this is that defect one field over, and the reason the answer is
+   * not simply a second stamp captured earlier: a brand belongs to the very object being
+   * ruled on, so when the re-ask DOES replace `authDefs` with a whole live map this answers
+   * for the NEW payload with no flag anyone has to remember to clear.
+   */
+  const provenanceOf = (defs) => (isTypeScopedObjectInfo(defs) ? "scoped" : readSchemaProvenance());
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
 
   // (0) FRESH-BACKEND TYPE AUTHORIZATION (#458 set_widget gap, found in review of
@@ -140,6 +387,32 @@ export async function runSetWidget(
   } catch {
     freshDefs = null;
   }
+  // The whole-schema reader may return a retired/reconnected payload to explain why the
+  // request was superseded. That payload is not current authority: refuse it before any
+  // type guard can mistake its old membership for a live backend answer. The explicit
+  // wording keeps the provenance diagnosis actionable, while the panel's scoped fallback
+  // remains unavailable because the superseded whole response did not establish current
+  // silence.
+  if (freshDefs && typeof schemaProvenance === "function") {
+    const provenance = readSchemaProvenance();
+    if (provenance === "reconnected") {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id}: the backend RECONNECTED ` +
+          `while that /object_info request was in flight, so the answer describes a process ` +
+          `that has since been replaced and did not come from the server answering now. ` +
+          `Refusing to write rather than trust a possibly-stale node schema (#1126).`,
+      );
+    }
+    if (provenance === "retired") {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id}: the panel REFRESHED ` +
+          `the node definitions while that /object_info request was in flight, so the answer ` +
+          `was superseded before it arrived and the refresh may be what filled this list. ` +
+          `It did not come from the server answering now; refusing to write rather than trust ` +
+          `a possibly-stale node schema (#1126).`,
+      );
+    }
+  }
 
   // Resolve the promoted inner target ONCE (PURE — no coercion/mutation). Threaded
   // into applyWidgetWrite so the write never re-resolves to a different node.
@@ -157,6 +430,94 @@ export async function runSetWidget(
   // into applyWidgetWrite so the write never re-resolves.
   const resolvedTargetNode = isResolvedPromotion ? promotedResolution.target.node : node;
   const promotedButUnresolvable = !!(promotedResolution && promotedResolution.promoted && !promotedResolution.target);
+
+  // #1560 — LAST RESORT: ask the backend about EXACTLY the types this write needs.
+  //
+  // Reached only when the whole-map oracle returned nothing AND #1223's snapshot could not
+  // stand in — on the reported install that is EVERY call, forever, because the whole dump
+  // never lands and so the snapshot is never populated. Reproduced by execution before this
+  // was written: two hung whole-map routes, zero per-class requests ever issued, the widget
+  // never written, the identical refusal 15,015 ms later on the second call.
+  //
+  // PLACED HERE, BELOW THE RESOLUTION, WHICH IS THE WHOLE POINT. The oracle's header rejects
+  // the per-class route for this fence because "set_widget authorizes two types for a
+  // promoted write and fetches BEFORE resolving which target it writes to, so a single-class
+  // payload answers one question and reads the other as absent (#716/#821)". By this line the
+  // promotion HAS been resolved — purely, with no schema and no I/O (measured: the real
+  // resolution helpers produce SubgraphA / SubgraphB / KSampler for a nested A→B→KSampler
+  // write with nothing fetched at all) — so the request can name all of them and the map it
+  // returns THROWS for any type outside that set instead of reading it as absent.
+  //
+  // The primary fetch above deliberately did NOT move. Resolving before it was tried and
+  // passes the whole unit suite, but it would make the resolution older by up to a full
+  // budget on every healthy call to buy something only this path needs.
+  //
+  // WHAT THE AWAIT THIS ADDS DOES AND DOES NOT COST — stated exactly, because the first
+  // version of this note claimed the scope trap guarded all of it, and it does not.
+  //
+  // The trap catches ONE of the two shapes: a promotion relinked mid-fetch that resolves
+  // deeper to a concrete node of a DIFFERENT type asks the map about a type it was never
+  // given, so it throws and the write refuses. A relink to a node of the SAME type is NOT
+  // caught, and does not need to be — the type authorization is still true of the node
+  // actually driven.
+  //
+  // What is genuinely older is `promotedResolution`, captured just above: `authTarget` and
+  // every guard below are still computed AFTER this await, exactly as they are after the
+  // whole-map fetch today, but the IMMEDIATE write target now predates one more await. So a
+  // caller who re-promotes a widget during this window can have the write land on the node
+  // the promotion pointed at when the command was resolved. That is a stale-target hazard,
+  // never a fail-open of the #458 fence: whatever is written is still registry-checked
+  // (`assertResolvedTargetRegistered`), still type-authorized against a live backend, and
+  // still fenced to the active workflow (`assertTargetStillCurrent`, re-checked synchronously
+  // inside `write` with no await after it).
+  //
+  // The window is this read alone — measured at 1.2 ms per class on this repo's own rig
+  // (#767), 15 ms in the reproduction — on a path where the alternative is a refusal that
+  // never succeeds. That is the trade, and it is taken deliberately.
+  //
+  // Skipped entirely for a promoted-but-unresolvable write: nothing consults freshDefs on
+  // that path, so a request would only add latency to a refusal that is already decided.
+  let scopedIneligibility = "";
+  if (!freshDefs && !promotedButUnresolvable && typeof fetchScopedObjectInfo === "function") {
+    let scoped = null;
+    try {
+      scoped = await fetchScopedObjectInfo(
+        scopedAuthorizationTypes(node, promotedResolution, isResolvedPromotion, resolveSource),
+      );
+    } catch {
+      // A last-resort route must never replace the refusal it was trying to avoid.
+      scoped = null;
+    }
+    if (scoped && scoped.defs) freshDefs = scoped.defs;
+    else if (scoped && typeof scoped.reason === "string" && scoped.reason) scopedIneligibility = scoped.reason;
+  }
+  // The refusal has to be able to say what the THIRD route did. Kept OUT of the transport
+  // list `objectInfoOracleFailureNote` renders — that array is what the two whole-map routes
+  // reported, and splicing a non-route entry into it makes a two-transport failure claim
+  // three routes tried, which is #982's own defect.
+  //
+  // SAYS WHAT THIS SITE KNOWS, WHICH IS NOT WHETHER A REQUEST WAS ISSUED (#1573). All this
+  // line has is a non-empty `reason`, meaning the type-scoped route produced no usable map;
+  // the reason itself says why, and only SOME of the reasons involve a request. An earlier
+  // wording led with "A type-scoped /object_info read was tried too", which asserted an
+  // attempt on every one of them — REPRODUCED BY EXECUTION against the merged head: with the
+  // panel's own unlicensed reason ("no whole-schema route was both CONTACTED and SILENT…")
+  // the refusal claimed a read "was tried" while `perClassCalls()` was EMPTY, not one request
+  // issued. That is the #982 shape — the clause after the dash self-corrects, but a reader
+  // stops at the lead-in and goes looking for a request that never left. So the lead-in
+  // reports the OUTCOME (it did not stand in) and lets the reason report the cause.
+  //
+  // The condition below is byte-for-byte what it was; nothing about WHEN this fires changed.
+  const describeObjectInfoFailureWithScope = () => {
+    let base = "";
+    try {
+      base = typeof describeObjectInfoFailure === "function" ? describeObjectInfoFailure() || "" : "";
+    } catch {
+      base = ""; // a diagnostic must never replace the refusal it is describing
+    }
+    if (!scopedIneligibility) return base;
+    return `${base} A type-scoped /object_info read did not stand in for the whole-schema routes either — ${scopedIneligibility}.`;
+  };
   // The node whose TYPE to fresh-authorize. For a promoted write, follow the promotion
   // chain through any NESTED SubgraphNodes to the ULTIMATE CONCRETE backend node and
   // authorize THAT type (a virtual intermediate subgraph type is never in /object_info
@@ -169,9 +530,16 @@ export async function runSetWidget(
   // name may differ from the concrete def's input name — this map bridges them (#458).
   const writeTargetWidgetName = isResolvedPromotion ? promotedResolution.target.widget?.name : undefined;
   let concreteWidgetName;
+  // #1126 — is the promotion NESTED (outer → intermediate subgraph → … → concrete), as
+  // opposed to a single hop straight to the concrete node? Keyed on exactly what
+  // followPromotionToConcrete's own `while (node && node.subgraph)` loop keys on, so the
+  // two can never disagree about whether the chain continues past the immediate target.
+  // Read only by the #1126 unreadable fallback; see its refusal for why it matters.
+  let nestedPromotion = false;
   if (promotedButUnresolvable) {
     authTarget = null;
   } else if (isResolvedPromotion) {
+    nestedPromotion = Boolean(promotedResolution.target?.node?.subgraph);
     const concrete = followPromotionToConcrete(promotedResolution.target, resolveSource);
     if (concrete.node && !concrete.node.subgraph && typeof concrete.node.type === "string") {
       // Reached a genuine concrete backend node WITH a real type string — authorize it.
@@ -273,7 +641,7 @@ export async function runSetWidget(
       // but absent from the current /object_info is a REMOVED backend node — refuse
       // (the non-forgeable trust root; client shape/name/markers cannot prove this).
       wasTypeEverDefined,
-      describeObjectInfoFailure,
+      describeObjectInfoFailure: describeObjectInfoFailureWithScope,
     });
   }
 
@@ -359,22 +727,167 @@ export async function runSetWidget(
   // resolveWidgetWrite — a real widget whose own name contains a dot still wins, and a
   // dotted form is only interpreted when no exact widget matches — so the split can
   // never silently misroute to a different widget.
+  // #1126 — the ONE place a WidgetWriteError becomes a `panel_set_widget refused …` message.
+  //
+  // That frame asserts something beyond the wrapped message: that this was a REFUSAL, so
+  // nothing was applied and the caller may retry or give up freely. Every pre-mutation
+  // validation error satisfies that. `partialWrite` does not — it is raised AFTER the graph
+  // was mutated and the rollback failed to restore it — and reporting it as a refusal tells
+  // the caller "nothing happened" about a graph that is now in a partial state, which is the
+  // exact class of false report this whole change exists to eliminate. It propagates verbatim
+  // so the caller reads the partial-state warning the write itself wrote, undiluted.
+  const refusalFrame = (err, after = "") =>
+    err?.partialWrite
+      ? err
+      : new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})${after}: ` +
+            `${err.message}`,
+        );
+
   const write = (extra = {}) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
     assertTargetStillCurrentNow();
-    return applyWidgetWrite(node, widgetName, value, {
-      resolveSource,
-      canvas,
-      beforeChange,
-      afterChange,
-      setDirty,
-      assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
-      promotedResolution,
-      ...extra,
-    });
+    // #757 — CREATE A MISSING TARGET HERE, INSIDE THE SAME SYNCHRONOUS STRETCH.
+    //
+    // A target that must be minted before it can be written (an rgthree `lora_N` row) used
+    // to be created by the CALLER, before `runSetWidget` was even entered. That put a live
+    // graph mutation on the far side of `await getFreshObjectInfo()`, and everything that
+    // went wrong with this feature came from that one gap:
+    //   - the row sat in the graph across a network request, so any ChangeTracker capture
+    //     in that window recorded a transient row and split the command's undo in two;
+    //   - a user hand-editing the node during the window could have their edit rolled back
+    //     by a failure that had nothing to do with them — losing a manual edit is worse
+    //     than the missing-widget refusal this feature exists to remove;
+    //   - a concurrent command frame could write the row and be told it succeeded, only
+    //     for the original call's rollback to delete it.
+    // Placed here, none of those windows exist: `applyWidgetWrite` is synchronous, so
+    // nothing — no other command frame, no user gesture, no user edit — can run between the
+    // creation, the write and the undo below. The guards those three defects each needed
+    // are removed rather than kept, because the interleaving they defended against is now
+    // unreachable. (The one thing that DOES happen in between is applyWidgetWrite's own
+    // history capture, which is the same one every ordinary write takes — see below.)
+    //
+    // AFTER the fence, so a workflow switch during the fetch refuses before the mutation.
+    // Called once per attempt and expected to be idempotent: the stale-combo and upload
+    // retries re-enter `write`, and by then the target it created already exists.
+    //
+    // THE CLEANUP GETS ITS OWN ENVELOPE, AND THE WRITE KEEPS ITS OWN VERIFICATION ORDER.
+    //
+    // An earlier version wrapped preparation, write and cleanup in ONE outer envelope so that
+    // a refused creating write took no capture until the very end. That inverted something
+    // load-bearing. `applyWidgetWrite` deliberately verifies AFTER its own afterChange has
+    // fired — see widget-write.js: "an afterChange hook can itself re-stale a widget or
+    // change the promotion topology, and that must be caught too". Nesting its envelope
+    // inside another one means its close never reaches zero, so the CAPTURE — and every pack
+    // `serializeValue` that the capture's serialization runs — happens after the last
+    // verification. An rgthree loader in Separate Model & Clip mode rewrites
+    // `strengthTwo: null` to 1 exactly there, and the creating path then reported plain
+    // success for a value an EXISTING-row write would have reported as normalized.
+    //
+    // THE ASYMMETRY WAS THE TELL. Creation must report whatever an ordinary write reports for
+    // the same value, and the only way it can is by being verified the same way. So
+    // applyWidgetWrite is called with nothing wrapped around it, exactly as every other write
+    // path calls it, and only the CLEANUP is bracketed.
+    //
+    // What the cleanup's own envelope buys is the sound half of that earlier finding: the
+    // NEWEST capture is the graph as it really finished, instead of a row-present snapshot of
+    // a command that was refused.
+    //
+    // WHAT IT DELIBERATELY DOES NOT BUY, because no write path can: a refused write is not a
+    // no-op in the undo history. applyWidgetWrite captures its write, then captures its
+    // rollback in a second envelope of its own, so an ORDINARY refused write already leaves
+    // two snapshots a Ctrl+Z can step back into. A refused creating write now leaves three and
+    // behaves the same way. Suppressing those intermediate captures is only reachable by
+    // holding one envelope across the verification — i.e. by reintroducing the defect above.
+    // Symmetry with the ordinary write is the property worth having; being better than the
+    // shared write path is not on offer, and pretending otherwise is what cost a round.
+    const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
+    try {
+      const set = applyWidgetWrite(node, widgetName, value, {
+        resolveSource,
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+        assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
+        promotedResolution,
+        ...extra,
+      });
+      // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
+      // landed on, inside the SAME synchronous stretch (no await since the fence, so
+      // the press cannot interleave with a workflow switch or another command frame).
+      //
+      // The write already fired the widget's own callback the way an interactive edit
+      // does — with the canvas argument — and KJNodes' *Multi nodes take that exact
+      // argument as the deliberate tell to SKIP their slot rebuild (scrubbing a count
+      // must not reflow the node under the user's cursor; their `setupDynamicInputs`
+      // rebuilds only on a bare, canvas-less invocation). Their deferred rebuild lives
+      // behind the node's own "Update inputs" button, so a verified write to
+      // `inputcount` reported success while image_3… never came into existence and
+      // every follow-up read served the stale slot list. Pressing that control after
+      // the write is the same gesture the interactive user performs, it is idempotent
+      // (a no-op when the slots already match), and it is verified by its EFFECT —
+      // a control that accepts the call and changes nothing is never reported as a
+      // refresh. See lib/dynamic-inputs-refresh.js for the keying and why it is not
+      // a node-type list.
+      //
+      // Runs AFTER applyWidgetWrite's own verification, so the write's verdict never
+      // depends on the refresh; a refresh failure is DISCLOSED on the success result,
+      // never thrown over a verified write. The press runs inside its own
+      // before/afterChange bracket so the slot changes join the command's undo
+      // history.
+      const refresh = refreshDynamicInputsAfterWrite(resolvedTargetNode ?? node, {
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+      });
+      if (!refresh) return set;
+      if (refresh.failed) {
+        return {
+          ...set,
+          dynamic_inputs_refresh_failed: refresh.failed,
+          ...(refresh.inputs ? { dynamic_inputs: refresh.inputs } : {}),
+        };
+      }
+      return { ...set, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
+    } catch (err) {
+      // The write refused over a target this attempt had just created. Undo it in the same
+      // synchronous stretch, so the graph the refusal is reported over is the graph the
+      // command started from — and so a retry below starts from a clean node rather than
+      // finding a row it would then decline to create again.
+      if (prepared) {
+        // BOTH HOOKS ARE BEST-EFFORT, mirroring widget-write's own safeBefore/safeAfter. A
+        // graph whose onBeforeChange throws must not cost us the cleanup — the row AND the
+        // row name it spent would be left behind while an error was returned. And a throwing
+        // close must never replace the refusal that is the entire reason we are here: the
+        // caller needs to know why its write was rejected, not that a history hook failed.
+        safeHistoryHook(beforeChange);
+        try {
+          // An undo that could NOT put everything back RETURNS A STRING SAYING SO, and the
+          // refusal carries it. Without this the caller hears only why the value was
+          // rejected, while a resource the preparation consumed stays consumed — and the
+          // obvious next move, retrying the corrected value under the same name, fails a
+          // second time for a reason the first message never mentioned.
+          //
+          // Annotated IN PLACE rather than rethrown as a new error: the recovery paths below
+          // dispatch on `instanceof WidgetWriteError` and on `.combo` / `.emptyOptions`, and
+          // wrapping would strip all three and turn a retryable combo miss into a hard fail.
+          const note = prepared.undo?.();
+          if (typeof note === "string" && note && typeof err?.message === "string") {
+            err.message = `${err.message} ${note}`;
+          }
+        } catch {
+          /* an undo that fails must never replace the refusal that caused it */
+        } finally {
+          safeHistoryHook(afterChange);
+        }
+      }
+      throw err;
+    }
   };
 
   // #558: the value widget being written may be governed by a non-`fixed`
@@ -547,9 +1060,7 @@ export async function runSetWidget(
     // (numeric/boolean/promotion/composite/stuck-check) fails closed immediately.
     if (!(err instanceof WidgetWriteError)) throw err;
     if (!err.combo) {
-      throw new Error(
-        `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ${err.message}`,
-      );
+      throw refusalFrame(err);
     }
 
     // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): a just-downloaded model /
@@ -559,6 +1070,15 @@ export async function runSetWidget(
     // upload-asset probe for a value the refreshed list still cannot contain.
     let latest = err;
     if (typeof refreshCombos === "function") {
+      // #1413 — the panel bounds this wait by the command's remaining budget, and a bound
+      // that runs out is reported back as a STRUCTURED TOKEN (REFRESH_JOIN_ABANDONED), not
+      // a throw — the catch below is the best-effort channel and would swallow one. The
+      // in-flight refresh is not cancelled by the abandonment; only THIS caller's wait ends.
+      // #1418 — COMBO_REFRESH_NEVER_RAN is the same abandonment with one fact flipped: the
+      // budget was spent before the recovery could begin, so NO refresh is running. The
+      // refusal below words the two states differently because the retry advice that is
+      // true for one ("join the work in progress") is false for the other.
+      let refreshAbandoned = null;
       try {
         // Reuse the /object_info payload already fetched for type authorization so a
         // combo miss does not round-trip /object_info a SECOND time (#458 P2). Key the
@@ -570,9 +1090,30 @@ export async function runSetWidget(
           writeTargetWidgetName && concreteWidgetName
             ? { [writeTargetWidgetName]: concreteWidgetName }
             : undefined;
-        await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
+        const refreshOutcome = await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
+        if (refreshOutcome === REFRESH_JOIN_ABANDONED || refreshOutcome === COMBO_REFRESH_NEVER_RAN) {
+          refreshAbandoned = refreshOutcome;
+        }
       } catch {
         /* refresh best-effort; fall through to re-raise the original rejection */
+      }
+      // #1413 — the refresh never re-read the list, so the retry CANNOT be trusted: it
+      // would re-fail against the same stale snapshot and the refusal would call the
+      // value "not a valid option" — a false cause for a retryable busy, and the exact
+      // report this issue exists to replace. Refuse IN WORDS instead, before the retry
+      // and before the upload probe: the budget that ran out is the command's, and an
+      // unbounded /view probe after it would reopen the relay-window overrun the bound
+      // just closed. On the retry the refresh has usually landed, so the value then
+      // takes the ordinary path — accepted against the fresh list, or probed, or refused
+      // for a reason that is true. A PARTIAL first write is the one case that outranks
+      // this wording: its own error reports a graph that could not be restored, and that
+      // must propagate undiluted rather than be replaced by "nothing was written".
+      if (refreshAbandoned) {
+        throw refusalFrame(
+          err.partialWrite
+            ? err
+            : new Error(staleComboRefreshRefusalMessage(refreshAbandoned === REFRESH_JOIN_ABANDONED)),
+        );
       }
       try {
         return withWarning({ set: write(), refreshed: true });
@@ -580,10 +1121,7 @@ export async function runSetWidget(
         if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
         // A NON-combo failure on the retry is terminal — fail closed loudly.
         if (!retryErr.combo) {
-          throw new Error(
-            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
-              `after refreshing combo options: ${retryErr.message}`,
-          );
+          throw refusalFrame(retryErr, " after refreshing combo options");
         }
         // Still a combo miss after the refresh — keep the freshest reason and try the
         // upload-asset fallback below.
@@ -597,10 +1135,7 @@ export async function runSetWidget(
         return withWarning({ set: write(), refreshed: true, server_confirmed: true });
       } catch (confErr) {
         if (confErr instanceof WidgetWriteError) {
-          throw new Error(
-            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
-              `after confirming the uploaded asset exists on the server: ${confErr.message}`,
-          );
+          throw refusalFrame(confErr, " after confirming the uploaded asset exists on the server");
         }
         throw confErr;
       }
@@ -650,7 +1185,372 @@ export async function runSetWidget(
       });
     }
 
-    // No recovery succeeded — refuse honestly with the freshest rejection.
+    // #1126 UNREADABLE OPTION LIST — the sibling of the #507 branch above, and decided
+    // the same way: from what the panel OBSERVED, never from a caller's assertion or a
+    // guess about the node.
+    //
+    // A dynamic combo's options come from `options.values(widget)`, which is the node's
+    // OWN callback: it can mutate the widget and it can fail. When it fails, nothing was
+    // ever compared to anything — yet the write was refused, and after the ladder gave up
+    // that refusal reached the user as a statement about their VALUE. A node whose runtime
+    // handler takes an absolute path had the path refused as though the path were wrong,
+    // and the only workaround left was copying the file into ComfyUI's input directory.
+    //
+    // The two conditions mirror #507's exactly, and both are observations:
+    //
+    //   1. The rejection really WAS the unreadable case (`err.unreadableOptions`, set
+    //      solely by that branch) — never a "not a valid option" miss against a list that
+    //      WAS read, which stays refused so a typo'd model name is still caught (#240).
+    //   2. The freshly-fetched /object_info does not publish a list for this input either
+    //      (serverDeclaresEmptyComboOptions). If the server DOES publish one, the valid
+    //      set is knowable after all and a blind write would be unjustified — the live
+    //      callback failing is not licence to ignore an authoritative list. Keyed on the
+    //      ULTIMATE CONCRETE type + concrete input name, exactly like the probes above.
+    //
+    // It runs LAST, so a merely-transient callback failure has already been re-read by the
+    // refresh and a server-confirmable upload asset already confirmed.
+    if (latest?.unreadableOptions) {
+      const comboDefInput = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+      // #1126 — a NESTED promotion is refused rather than blind-written, and this is the
+      // deliberate choice between the two defensible options.
+      //
+      // The rejection being answered describes the IMMEDIATE promoted projection. On a
+      // nested chain the value is ultimately driven into a DEEPER concrete widget that this
+      // path never read — and that widget's own client-populated list may be perfectly
+      // readable, in which case the fallback's premise ("the valid set is not knowable from
+      // here") is simply false and a live list was available all along.
+      //
+      // Refusing beats validating the concrete widget here. Validating it would mean running
+      // membership at another level on a last-resort path, against a dynamic source with the
+      // same never-read-twice and stateful-callback hazards the sibling cross-check already
+      // documents — new blind-write surface in the one place least able to carry it. A
+      // refusal is recoverable and names the shape; a wrong blind write into a nested chain
+      // lands on a serializing rail. The direct and single-hop promoted cases, where the
+      // widget that was read IS the one the value drives, are unaffected.
+      //
+      // Decided FIRST, ahead of everything below. The chain shape is already known and NO
+      // schema can make this writable, so establishing evidence for it is pure cost — and on
+      // a non-live provenance that cost is a cache drop plus a multi-megabyte /object_info
+      // re-fetch, paid to answer a question whose answer cannot change the outcome.
+      if (nestedPromotion) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} This is a NESTED promotion — the value is driven through one ` +
+            `or more intermediate subgraphs to a deeper concrete widget — and the unreadable ` +
+            `list observed here belongs to the intermediate projection, not to that concrete ` +
+            `widget, whose own option list may be readable. The panel will not write a value ` +
+            `nothing validated through a chain it has not checked end to end (#1126). Set the ` +
+            `widget on the concrete node directly (panel_enter_subgraph to reach it), or fix ` +
+            `the node's option callback so the list can be read.`,
+        );
+      }
+      // #1223/#716 × #1126 — ESTABLISH THE EVIDENCE BEFORE TESTING IT, because condition 2
+      // says "the SERVER declares this input's list empty" and only a LIVE read establishes
+      // that. Three different layers can answer with something else, and the shape test alone
+      // cannot tell them apart:
+      //
+      //   * "cache" — #716's ≤1.5s burst cache (or a joined in-flight read). It CAN answer the
+      //     question, but with the server's word from up to a TTL ago; nobody asked during
+      //     this call.
+      //   * "reconnected" — this call did issue the request, but the backend reconnected before
+      //     it resolved. object-info-cache deliberately still hands a retired response to its
+      //     original waiter, and objectInfoSnapshot.record refuses to file it as evidence for
+      //     exactly that reason. A schema describing the process that has been REPLACED must
+      //     not authorize a blind write against the replacement's option lists.
+      //   * "snapshot" — #1223's last-observed schema. This one cannot answer the question at
+      //     ALL: what it stores is a DETACHED MAP OF TYPE NAMES, every value the shared frozen
+      //     EMPTY_DEF with no `input` at all (the detachment is deliberate — retaining the
+      //     payload would let a beforeRegisterNodeDef hook launder frontend-mutated defs back
+      //     as backend evidence, and it would pin ~5.4MB per connection). So
+      //     serverDeclaresEmptyComboOptions is ALWAYS false against a snapshot. It can say
+      //     whether a TYPE exists; it can say nothing whatever about an input's option list.
+      //
+      // Options change without a reconnect and without a cache drop — a model downloaded while
+      // this node's own live callback keeps failing — so any of these would authorize an
+      // unvalidated write against a list that is no longer empty.
+      //
+      // So: RE-ASK before deciding. This is the last resort on a rare path, and one request is
+      // a far better trade than either refusing a legitimate write (which is what a cache hit
+      // would cause for writes 2..N of an ordinary burst — the exact multi-widget case this
+      // fix exists to serve) or writing blind. `refetchObjectInfoLive` bypasses only the stored
+      // entry and coalesces concurrent rereads, so it cannot be answered by the very entry that
+      // made this uncertain AND cannot retire another writer's in-flight request.
+      //
+      // READ HERE, not earlier. The provenance was established before `refreshCombos` and the
+      // upload probe were awaited, and both of those can supersede it — a refresh, an install,
+      // a download completing, a reconnect. A verdict is a statement about a moment, so it is
+      // asked at the moment it is used, on the near side of every await that could expire it.
+      let provenance = provenanceOf(freshDefs ?? undefined);
+      let authDefs = freshDefs ?? undefined;
+      // What the PRIOR evidence claimed, captured before it is replaced — the difference
+      // between "the server publishes a list, as it always did" and "the schema in hand said
+      // empty and the re-read disagrees" is the whole point of re-asking, and it cannot be
+      // recovered after `authDefs` is overwritten.
+      //
+      // "PRIOR", NOT "STALE" (#1573). This used to be called `staleDeclaredEmpty`, and the
+      // refusal it feeds told the caller the schema "was not fetched live". That premise
+      // predates #1560: the gate above is `provenance !== "live"`, and "scoped" is not
+      // "live" — but a type-scoped map WAS fetched live, per class, moments earlier. It is
+      // about fewer types, never about older ones. REPRODUCED BY EXECUTION on the merged
+      // head: a scoped map declaring this input's list empty, a whole-map re-ask that
+      // publishes a real list, and the refusal below asserting the scoped read "was not
+      // fetched live" while `/object_info/<Type>` sat in the issued-request list. All this
+      // line establishes is WHICH schema said empty — the one held before the re-ask — so
+      // that is all the name and the message may claim.
+      const priorDeclaredEmpty = serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput);
+      let reAsked = false;
+      if (provenance !== "live" && typeof refetchObjectInfoLive === "function") {
+        try {
+          const reread = await refetchObjectInfoLive();
+          if (reread) {
+            authDefs = reread;
+            reAsked = true;
+          }
+        } catch {
+          /* the re-ask failed; provenance stays non-live and the refusals below fire */
+        }
+        provenance = provenanceOf(authDefs);
+      }
+      // #1560 — a TYPE-SCOPED map is the server answering NOW, but only about the handful of
+      // types this write resolves to. It can authorize the node type; it even holds this
+      // input's own option list. It still may not license the blind write: the whole-schema
+      // probes went silent, so nothing establishes that the panel is looking at the CURRENT
+      // install rather than at one class of it, and widening a last-resort unvalidated write
+      // on a partial view of the schema is the one thing this route was built not to do.
+      //
+      // DECIDED HERE, ABOVE the empty-list shape test, and that placement is the fix rather
+      // than a tidy-up. Below it this branch is unreachable in BOTH directions: when the
+      // scoped map declares the list EMPTY the shape test fires first and refuses with a
+      // message about a provenance that "could not be established at all" — false, a
+      // type-scoped read answered — and when it declares a NON-empty list the ladder falls
+      // through to the generic end-of-ladder refusal, which sends the caller to look at their
+      // value while the actual cause is a backend whose whole map never lands. Verified by
+      // execution, not by reading: with this branch deleted the whole suite stayed green,
+      // which is what dead code looks like from inside a passing test run.
+      // NARROWER THAN IT FIRST READ, deliberately. An earlier wording said a scoped map is
+      // "not enough to license an unvalidated write, whether or not it shows this input's
+      // list as empty" — and that over-claims, because #507's branch above DOES accept one.
+      // The two cases are not the same observation and the asymmetry is correct:
+      //
+      //   - #507: the widget's OWN list read as EMPTY and the schema says empty too. Two
+      //     agreeing observations, and the per-class def is the live server answer for this
+      //     class — byte-identical to the whole map's entry for it (measured on 0.33.2). That
+      //     branch already accepts `cache`/`reconnected`/`retired` whole maps, all of them
+      //     older than this one.
+      //   - HERE: the widget's own list could not be READ AT ALL, so the schema is the only
+      //     witness there is. Standing in for the sole witness is a stronger claim than
+      //     agreeing with a second one, and a partial view of the install may not make it.
+      if (provenance === "scoped") {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The panel could have written it unvalidated if a WHOLE ` +
+            `/object_info declared this input's option list empty — but both whole-schema ` +
+            `probes went silent, so the only schema available is a TYPE-SCOPED read (#1560) ` +
+            `covering just the node types this write resolves to. That is enough to authorize ` +
+            `the node type. It is not enough to stand in for a list the panel could not read ` +
+            `at all, which is the one thing that would license THIS write. This is NOT a ` +
+            `stale or unreadable schema and reconnecting need not help: wait for /object_info ` +
+            `to answer as a whole again, then retry.`,
+        );
+      }
+      if (serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput)) {
+        // Fails closed: no live declaration, no blind write. The user is told WHICH fact is
+        // missing and which layer withheld it, because "refresh and retry" is only actionable
+        // if they know it is the schema — not their value — that could not be established.
+        //
+        // "snapshot" cannot reach here: its detached name-only map fails the shape test above,
+        // so it is answered by its own branch below, which says something true about it rather
+        // than calling a map that holds no lists "stale".
+        if (provenance !== "live") {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+              `${latest.message} The panel could have written it unvalidated — this widget's ` +
+              `option list could not be READ, and that is normally enough when /object_info ` +
+              `also declares the input's list empty — but that "empty" did not come from the ` +
+              `server answering now: ` +
+              (provenance === "cache"
+                ? `it came from the panel's short-lived /object_info burst cache (#716), and ` +
+                  `re-asking the server did not produce a live answer either. Retry in a moment.`
+                : provenance === "reconnected"
+                  ? `the backend RECONNECTED while that /object_info request was in flight, so ` +
+                    `the answer describes a ComfyUI process that has since been replaced — and ` +
+                    `a restart is the one event that changes what the server publishes. Retry.`
+                  : provenance === "retired"
+                    ? `the panel REFRESHED the node definitions while that /object_info request ` +
+                      `was in flight (a pack install, a model download completing, or an ` +
+                      `explicit refresh), so the answer was superseded before it arrived — and ` +
+                      `the very refresh that superseded it may be what filled this list. Retry.`
+                    : `the schema provenance could not be established at all, and nothing ` +
+                      `established must not read as the server answering. Reconnect to ComfyUI ` +
+                      `and retry.`) +
+              ` Options can change without a reconnect, so a stale empty list is not evidence ` +
+              `the valid set is unknowable.`,
+          );
+        }
+        let set;
+        try {
+          // BOTH acceptances, and the empty one is not incidental. `options.values` is a
+          // callback: a stateful one can throw on the initial read and on the refreshed read,
+          // then return `[]` on this final invocation. With only the unreadable acceptance
+          // enabled, coercion would fall through to the #507 empty-list branch, raise a
+          // RETRYABLE `emptyOptions` rejection, and refuse — telling the caller "the server's
+          // option list may simply be stale, refreshing it before deciding" at the end of a
+          // ladder that has already refreshed it, about the one transition that is unambiguously
+          // valid. By this line the LIVE server schema has ALREADY confirmed the list empty for
+          // this input, which is exactly #507's own precondition, so an empty final read is a
+          // weaker observation of the same fact — not a new doubt.
+          //
+          // Which acceptance actually admitted the value is still decided at COERCION time and
+          // reported from there, so the disclosure below names what happened rather than what
+          // this call hoped for: an empty final read discloses `empty_option_list` (and carries
+          // #507's rail label-adoption rule, correctly, because an empty list really does admit
+          // any scalar), an unreadable one discloses `option_list_unreadable`.
+          set = write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true });
+        } catch (unreadableErr) {
+          // A validation refusal from THIS attempt (a non-string value, a rail whose own
+          // list is real and lacks the value) must arrive framed like every other refusal:
+          // with the tool name, the widget, and the node. Unframed, the retry the caller was
+          // invited to make answers `Value 640 is not a valid option…` with nothing saying
+          // where it came from. Anything that is not a validation refusal — a partial write,
+          // or anything that is not a WidgetWriteError at all — propagates UNCHANGED rather
+          // than being reworded; `refusalFrame` enforces the partial-write half.
+          if (unreadableErr instanceof WidgetWriteError) {
+            throw refusalFrame(unreadableErr, " after finding the combo's option list unreadable");
+          }
+          throw unreadableErr;
+        }
+        return withWarning({
+          set,
+          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+          // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
+          // and that is reported as #507 reports it — the same field the branch above returns,
+          // so one outcome has one name wherever it is reached from.
+          ...(set?.empty_option_list ? { empty_option_list: true } : {}),
+          // The COERCION-TIME verdict, never re-derived: a stateful options callback can
+          // succeed on the final attempt, and the value would then have been validated by
+          // ordinary membership — claiming an unchecked write there would be false.
+          ...(set?.option_list_unreadable
+            ? {
+                option_list_unreadable: true,
+                ...(set.promoted_rail_validated ? { promoted_rail_validated: true } : {}),
+                // Scoped to the widget the claim is actually about. A promoted write also
+                // mutates the parent rail, and when that rail's list IS readable the sibling
+                // cross-check compares the value against it and only proceeds on membership —
+                // so a flat "nothing checked it" was false in exactly the case where the most
+                // checking happened. The two sentences are chosen by DATA the write emitted,
+                // never by re-deriving what the cross-check did.
+                option_list_unreadable_note:
+                  `Written WITHOUT validation against THIS widget's own option list, because that ` +
+                  `list could NOT BE READ — not because the value was checked and passed. ` +
+                  `Observed on the widget: ` +
+                  `${set.option_list_unreadable_detail ?? "its option list could not be READ"}. ` +
+                  `The server's own /object_info declares this input's option list EMPTY, so the ` +
+                  `valid set is not knowable from the widget itself (#1126). ` +
+                  (set.promoted_rail_validated
+                    ? `It was NOT written entirely unchecked: this promoted write also mutates the ` +
+                      `parent subgraph's rail widget, whose option list WAS readable and DOES ` +
+                      `contain this value — the write proceeded only because that list vouched for ` +
+                      `it. The rail is what serializes at queue time, so the value is a real option ` +
+                      `there. `
+                    : `Nothing compared your value to anything. `) +
+                  `If the node rejects it at runtime that is the node's answer, not a panel ` +
+                  `refusal to retry around. The graph now holds a value this widget's own option ` +
+                  `list does not vouch for, so a later reader — including the ComfyUI dropdown ` +
+                  `itself — may show it as out-of-range.`,
+              }
+            : {}),
+        });
+      }
+      // The shape test said the server does NOT declare this input's list empty — but when the
+      // only schema available is #1223's snapshot, that "no" is not the server publishing a
+      // list. It is a map that holds TYPE NAMES ONLY answering a question about an INPUT, and
+      // it would answer "no" for every input on every node in existence.
+      //
+      // CHOSEN BEHAVIOUR: a snapshot can NEVER authorize this fallback. Not "sometimes, if it
+      // happens to say empty" — it structurally cannot say empty, so there is no case to gate.
+      // The alternative (teach the snapshot to retain option lists) was rejected outright: the
+      // detachment is #1223's defence against beforeRegisterNodeDef mutating defs in place, and
+      // re-attaching payloads to widen a last-resort blind write would trade a real integrity
+      // guarantee for a convenience on the rarest path in the ladder.
+      //
+      // What it gets instead is an honest refusal. Falling through to the generic end-of-ladder
+      // message would tell the caller only that their combo could not be read, sending them to
+      // look at their value while the actual cause is a silent backend — the exact
+      // misattribution this whole change exists to stop.
+      if (provenance === "snapshot") {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The panel could have written it unvalidated if /object_info ` +
+            `declared this input's option list empty — but the live schema probe went silent, ` +
+            `so the only schema available is the LAST-OBSERVED one (#1223), which is stored as ` +
+            `a detached map of TYPE NAMES ONLY. It can say whether this node type still exists; ` +
+            `it holds no option lists at all, so it cannot establish that the valid set is ` +
+            `unknowable. Reconnect to ComfyUI (or wait for the backend to answer /object_info ` +
+            `again) and retry.`,
+        );
+      }
+      // The evidence held BEFORE the re-ask said EMPTY and the re-ask disagrees: the server
+      // does publish a list for this input after all. That is exactly the hole the re-ask
+      // exists to find, and it is worth its own message — the generic refusal below would
+      // report only that the widget's own callback failed, sending the caller to look at
+      // their value while the actionable fact is that a real list exists and they can pick
+      // from it.
+      //
+      // WHAT THE LEAD-IN MAY CLAIM (#1573). It used to say that schema "was not fetched
+      // live". Since #1560 that is reachable and FALSE: a type-scoped map is fetched live,
+      // per class, and is exactly the kind of schema that lands here. What this branch
+      // actually establishes is that the schema which said empty has been REPLACED and the
+      // replacement no longer says it — nothing about how the first one was obtained, which
+      // is why the sentence no longer mentions it.
+      if (reAsked && priorDeclaredEmpty) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The schema that appeared to declare this input's option list ` +
+            `empty has since been REPLACED, and the live re-read NO LONGER declares it empty — ` +
+            // What was actually observed is a NEGATIVE: `serverDeclaresEmptyComboOptions`
+            // returned false. That is true when the server publishes a real list, and equally
+            // true when the re-read does not describe this input (or this type) at all. Saying
+            // "the server DOES publish a list" picked one of those and asserted it as fact,
+            // which is the same over-claim this change exists to remove, committed by the
+            // message written to explain it. So the refusal states the observation and names
+            // the possibilities rather than choosing one.
+            `either it now publishes a real option list for this input, or it no longer ` +
+            `describes this input at all. Either way the premise for an unvalidated write ` +
+            `("the server itself says the valid set is empty") no longer holds. Refresh the ` +
+            `node definitions and retry, fix the node's option callback so the list can be ` +
+            `read, or set a value the server's list contains.`,
+        );
+      }
+    }
+
+    // #1696 — a live remote combo can expose no local values while /object_info correctly says
+    // that its source is a separate fetch. The generic `latest.message` below was written for
+    // a stale local empty list and therefore tells the caller to refresh the same thing again,
+    // while also claiming a fact the remote schema never established. Preserve the refusal, but
+    // report the source and uncertainty that actually blocked validation.
+    if (
+      latest?.emptyOptions &&
+      serverDeclaresRemoteComboOptions(
+        freshDefs ?? undefined,
+        authTarget?.type,
+        concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+      )
+    ) {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
+          `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ` +
+          `[combo_source=remote; option_list=unavailable; verdict=unknown] The server schema ` +
+          `exposes a REMOTE option source for this input, so the valid option set is not ` +
+          `currently enumerable by the panel. The requested value was not validated. ` +
+          `NOTHING WAS WRITTEN. Make the remote model list available and retry.`,
+      );
+    }
+
+    // No recovery succeeded — refuse honestly with the freshest rejection. The rejection's
+    // own message says WHICH observation it rests on: a list that was read and does not
+    // contain the value, or a list that could not be read at all. Nothing is appended
+    // here suggesting a retry, because at this point there is no argument the caller can
+    // add that changes the answer — the decision is the panel's observation, not theirs.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
         `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,

@@ -8,6 +8,15 @@
 // calls: the graph-touching bits live in cmcp-apps-ui.js, which passes plain
 // JSON (serialize() / graphToPrompt() output) into AppBuilder.
 
+import {
+  isVideoLoaderType,
+  isVideoGenInputHint,
+  appOutputKind,
+  collectAppRunMedia,
+  isAppRunVideoRef,
+  videoFamiliesOnGraph,
+} from "./lib/video-gen-families.js";
+
 const API_BASE = "/comfyui_mcp_panel/apps";
 
 /** Default registry base URL (the production Worker once deployed; override
@@ -176,6 +185,8 @@ export class AppBuilder {
    *  probe defensively (extra.* first, then top-level) so older/newer
    *  frontends keep importing. Each entry is a path array. */
   static APP_MODE_PATHS = [
+    // Official frontend App Mode (frontend ≥1.41 LinearData) — tuples, not objects.
+    ["extra", "linearData"],
     ["extra", "appMode"],
     ["extra", "app_mode"],
     ["extra", "apps"],
@@ -210,8 +221,34 @@ export class AppBuilder {
       const n = Number(v);
       return Number.isFinite(n) ? n : null;
     };
+    // extra.linearData stores [id, widgetName, config?] and bare output node ids.
+    // Widget ids are `graphUuid:nodeId:widgetName` (UUID has no colons).
+    const linearNodeId = (v) => {
+      const direct = num(v);
+      if (direct != null) return direct;
+      if (typeof v !== "string" || !v) return null;
+      const widgetId = /^(?:[^:]+):([^:]+):(?:[^:]+)$/.exec(v);
+      if (!widgetId) return null;
+      try {
+        return num(decodeURIComponent(widgetId[1]));
+      } catch {
+        return num(widgetId[1]);
+      }
+    };
     const inputs = (Array.isArray(rawInputs) ? rawInputs : [])
       .map((it) => {
+        if (Array.isArray(it) && it.length >= 2) {
+          const nodeId = linearNodeId(it[0]);
+          const widget = String(it[1] ?? "").trim();
+          if (nodeId == null || !widget) return null;
+          const cfg = it[2] && typeof it[2] === "object" && !Array.isArray(it[2]) ? it[2] : null;
+          return {
+            nodeId,
+            widget,
+            label: String(cfg?.description ?? widget),
+            kind: "text",
+          };
+        }
         if (!it || typeof it !== "object") return null;
         const nodeId = num(it.nodeId ?? it.node_id ?? it.id);
         const widget = String(it.widget ?? it.name ?? it.key ?? "").trim();
@@ -226,6 +263,11 @@ export class AppBuilder {
       .filter(Boolean);
     const outputs = (Array.isArray(rawOutputs) ? rawOutputs : [])
       .map((it) => {
+        if (typeof it === "number" || typeof it === "string") {
+          const nodeId = linearNodeId(it);
+          if (nodeId == null) return null;
+          return { nodeId, kind: "images" };
+        }
         if (!it || typeof it !== "object") return null;
         const nodeId = num(it.nodeId ?? it.node_id ?? it.id);
         if (nodeId == null) return null;
@@ -261,6 +303,7 @@ export class AppBuilder {
     "KSampler",
     "KSamplerAdvanced",
     "SamplerCustom",
+    "SamplerCustomAdvanced",
     "EmptyImage",
     "EmptyLatentImage",
     "EmptySD3LatentImage",
@@ -269,15 +312,40 @@ export class AppBuilder {
     "EmptyMochiLatentVideo",
   ]);
 
+  /** Hint-type OR a video-gen family parameter/loader (#428). */
+  static isInputHint(nodeType) {
+    const t = String(nodeType || "");
+    return AppBuilder.INPUT_HINT_TYPES.has(t) || isVideoGenInputHint(t);
+  }
+
+  /** "video" | "text" | "images" | null. Shared by heuristic + live convert. */
+  static outputKind(nodeType, outputNode = false) {
+    return appOutputKind(nodeType, outputNode);
+  }
+
+  static collectRunMedia(out) {
+    return collectAppRunMedia(out);
+  }
+
+  static isRunVideoRef(ref) {
+    return isAppRunVideoRef(ref);
+  }
+
+  static videoFamiliesOnGraph(nodes) {
+    return videoFamiliesOnGraph(nodes);
+  }
+
   /** Widget value → app input kind. `nodeType` refines (LoadImage → image
    *  upload; *Loader → model picker); `widgetType` is the live litegraph widget
    *  type when available (lets us spot a `color` widget, which is otherwise an
-   *  ordinary string). seed/noise_seed get the dedicated seed control. */
+   *  ordinary string). seed/noise_seed get the dedicated seed control. Video
+   *  file loaders win over the generic *Loader → model rule (#428). */
   static classifyWidget(nodeType, widgetName, value, widgetType) {
     const t = String(nodeType || "");
     const name = String(widgetName || "");
     const wt = String(widgetType || "").toLowerCase();
     if (/loadimage/i.test(t)) return "image";
+    if (isVideoLoaderType(t)) return "video";
     if (/loader/i.test(t) || /_name$/i.test(name)) return "model";
     if (wt === "color" || (/color/i.test(name) && typeof value === "string" && /^#?[0-9a-fA-F]{6}$/.test(value))) {
       return "color";
@@ -302,16 +370,12 @@ export class AppBuilder {
       const id = Number(node.id);
       if (!Number.isFinite(id)) continue;
       const type = String(node.type || "");
-      const isOutput =
-        node.constructor?.nodeData?.output_node === true ||
-        /^(SaveImage|PreviewImage|SaveVideo|SaveAudio|PreviewAudio|ShowText|PreviewAsText)/.test(
-          type,
-        );
-      if (isOutput) {
-        outputs.push({ nodeId: id, kind: /^Show|^PreviewAs/.test(type) ? "text" : "images" });
+      const kind = AppBuilder.outputKind(type, node.constructor?.nodeData?.output_node === true);
+      if (kind) {
+        outputs.push({ nodeId: id, kind });
         continue;
       }
-      if (!AppBuilder.INPUT_HINT_TYPES.has(type)) continue;
+      if (!AppBuilder.isInputHint(type)) continue;
       const values = Array.isArray(node.widgets_values) ? node.widgets_values : [];
       // widgets_values aligns positionally with the node's widget list; with
       // only serialized JSON we lack widget NAMES — the UI layer enriches from

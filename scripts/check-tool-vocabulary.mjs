@@ -213,6 +213,12 @@ const NOT_TOOL_NAMES = [
     context: "data?.panel_mcp",
     why: "backends-frame connection metadata property, not a tool reference",
   },
+  {
+    name: "panel_version",
+    file: "web/js/lib/duplicate-panel-guard.js",
+    context: "no `panel_version` before 0.11.83",
+    why: "the hello payload field, named in the #1269 doc comment — not a tool reference",
+  },
 ];
 
 /**

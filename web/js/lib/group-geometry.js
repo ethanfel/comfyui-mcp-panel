@@ -22,8 +22,12 @@ export function nodeFocusBounds(node) {
   if (br && br.length === 4 && (br[2] || br[3])) {
     return [br[0], br[1], br[2], br[3]];
   }
-  const w = node.size?.[0] ?? 200;
-  const h = node.size?.[1] ?? 100;
+  // Extents from the shared model, not a local `?? 200` / `?? 100`: this fallback
+  // is the footprint a node with NO cached rect is judged by, so if it disagrees
+  // with the box builder about a degenerate extent the same way boundsAroundNodes
+  // used to, an un-rendered node is excluded from the box drawn around it
+  // (mcp#1877). Matches wantedNodeArea(node, forceCollapsed) exactly.
+  const [w, h] = nodeExtents(node);
   return [node.pos[0], node.pos[1] - 30, w, h + 30]; // title bar renders above pos
 }
 
@@ -92,17 +96,36 @@ export function refreshNodeArea(node, prevPos) {
   }
 }
 
-/** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
+/** [x, y, w, h] that wraps the given nodes, padded for the group + node titles.
+ *
+ * Extents come from `nodeExtents`, the SAME model `wantedNodeArea` writes into a
+ * node's cached rect. They used to be read here as `n.size?.[1] ?? 100`, which is
+ * a different rule: `??` only substitutes for null/undefined, so a node reporting
+ * a zero (or negative, or non-finite) extent contributed it literally, while
+ * `wantedNodeArea` rejected it and substituted the default. Building the box from
+ * one model and testing membership against the other is how a group could wrap a
+ * node it then reported as missing — a collapsed node reported as `size` [w, 0]
+ * yielded a box 100px shorter than the rect the panel had just written for it, so
+ * the node's centre landed just below the bottom edge and create-by-node_ids
+ * returned an EMPTY group whose bounds visibly covered the requested node
+ * (mcp#1877, the collapsed half of #391/#416). One model, one answer.
+ */
 export function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
   for (const n of nodes) {
-    const x = n.pos?.[0] ?? 0;
-    const y = n.pos?.[1] ?? 0;
-    const w = n.size?.[0] ?? 200;
-    const h = n.size?.[1] ?? 100;
+    const x = Number(n?.pos?.[0]);
+    const y = Number(n?.pos?.[1]);
+    // A node whose position is not a finite point has no knowable footprint —
+    // the same verdict wantedNodeArea reaches, for the same reason. `?? 0` let a
+    // NaN coordinate through and poisoned the accumulators; only `minX` was
+    // checked afterwards, so a NaN *y* (or a NaN extent, which never touches
+    // minX at all) escaped as a NaN group box. A NaN box is the invisible-layout-
+    // corruption class graph_move_group already refuses outright.
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const [w, h] = nodeExtents(n);
     minX = Math.min(minX, x);
     minY = Math.min(minY, y);
     maxX = Math.max(maxX, x + w);
@@ -320,6 +343,19 @@ function finiteExtent(value, fallback) {
 }
 
 /**
+ * The [width, height] the panel treats an EXPANDED node as occupying.
+ *
+ * Exported so there is exactly ONE answer to that question: the box builder
+ * (`boundsAroundNodes`) and the cached-rect writer (`wantedNodeArea`) both read
+ * it. Two functions each with their own idea of what a missing/degenerate extent
+ * means is not a style problem — it silently decouples the box from the
+ * membership test that box will be judged by (mcp#1877).
+ */
+export function nodeExtents(node) {
+  return [finiteExtent(node?.size?.[0], 200), finiteExtent(node?.size?.[1], 100)];
+}
+
+/**
  * The rect a node's cached boundingRect SHOULD hold for its live pos/size, or
  * NULL when the node's position is not a finite point.
  *
@@ -333,10 +369,9 @@ function wantedNodeArea(node, forceCollapsed = false) {
   const y = Number(node?.pos?.[1]);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   const collapsed = !!node.flags?.collapsed && !forceCollapsed;
-  const w = collapsed
-    ? finiteExtent(node._collapsed_width, COLLAPSED_PILL_WIDTH)
-    : finiteExtent(node.size?.[0], 200);
-  const h = collapsed ? 0 : finiteExtent(node.size?.[1], 100);
+  const [fullW, fullH] = nodeExtents(node);
+  const w = collapsed ? finiteExtent(node._collapsed_width, COLLAPSED_PILL_WIDTH) : fullW;
+  const h = collapsed ? 0 : fullH;
   return [x, y - COLLAPSED_TITLE_HEIGHT, w, h + COLLAPSED_TITLE_HEIGHT]; // title above pos
 }
 
@@ -357,6 +392,50 @@ export function nodeAreaIsLive(node) {
     return want.every((v, i) => br[i] === v);
   } catch {
     return false; // an unreadable node cannot be shown to be live
+  }
+}
+
+/**
+ * Did this node's cached boundingRect ORIGIN shift by (dx, dy)?
+ *
+ * Distinct from `nodeAreaIsLive`, which asks whether the WHOLE rect matches the
+ * panel's generic `[x, y-30, w, h+30]` model. A custom node (Label (rgthree) and
+ * anything else whose `updateArea()` draws past `size`) has a live, engine-
+ * authoritative rect whose extents will NEVER match that model. Demanding the
+ * generic footprint made `panel_move_group` refuse a group of those nodes after
+ * their positions had already been written, while `panel_edit_node` — which never
+ * asks this question — moved the same nodes fine (#1300).
+ *
+ * Membership is still rect-first: if the origin did not track the move, the next
+ * geometric read would leave the node in the group it has actually left, so this
+ * returns false and the caller treats the node as stuck (#408). Re-reads
+ * `boundingRect` so a copying getter (writes to a throwaway) cannot fake a pass.
+ *
+ * `originBefore` is the `[x, y]` origin SNAPSHOTTED before the position write.
+ * Null/missing means there was no cached rect to compare: a missing rect means
+ * membership reads use live pos/size, and a rect that only appeared after the
+ * write is the engine's answer for the NEW position. Either way the origin cannot
+ * be stale from the old one, so a finite origin (or no rect at all) is enough.
+ */
+export function nodeAreaOriginTracks(node, originBefore, dx, dy) {
+  try {
+    const br = node?.boundingRect;
+    if (!br || br.length !== 4) return true; // nothing cached ⇒ reads use live pos
+    const f32 = isFloat32(br);
+    if (!originBefore || originBefore.length !== 2) {
+      const x = Number(br[0]);
+      const y = Number(br[1]);
+      return Number.isFinite(x) && Number.isFinite(y);
+    }
+    const ox = Number(originBefore[0]);
+    const oy = Number(originBefore[1]);
+    if (!Number.isFinite(ox) || !Number.isFinite(oy)) return false;
+    const wantDx = Number(dx);
+    const wantDy = Number(dy);
+    if (!Number.isFinite(wantDx) || !Number.isFinite(wantDy)) return false;
+    return samePoint(Number(br[0]), ox + wantDx, f32) && samePoint(Number(br[1]), oy + wantDy, f32);
+  } catch {
+    return false; // an unreadable rect cannot be shown to have tracked
   }
 }
 
@@ -511,6 +590,26 @@ export function moveGroupMembers(members, dx, dy) {
       continue;
     }
     attempted.push([n, px, py]);
+    // Snapshot the cached origin BEFORE the write so the #1300 origin-tracks
+    // check can delta-compare afterwards. A throwing accessor is "unreadable",
+    // not "no rect": we cannot prove the origin tracked a value we never captured.
+    let originBefore = null;
+    let originReadable = false;
+    try {
+      const br = n?.boundingRect;
+      if (br && br.length === 4) {
+        const ox = Number(br[0]);
+        const oy = Number(br[1]);
+        if (Number.isFinite(ox) && Number.isFinite(oy)) {
+          originBefore = [ox, oy];
+          originReadable = true;
+        }
+      } else {
+        originReadable = true; // no cached rect ⇒ membership reads use live pos
+      }
+    } catch {
+      originReadable = false;
+    }
     let landedExactly = false;
     try {
       landedExactly = writePoint(n, "pos", px + dx, py + dy);
@@ -553,17 +652,14 @@ export function moveGroupMembers(members, dx, dy) {
       // left. The question changes from "does the rect already agree" to "can the rect be
       // MADE to agree", which is the one the caller actually needs answered.
       //
-      // TWO THINGS THE CORRECTION IS DELIBERATELY NOT (both found in review):
+      // TWO THINGS THE COLLAPSED CORRECTION IS DELIBERATELY NOT (both found in review):
       //
-      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets it. An expanded node's
-      //    `updateArea()` may authoritatively compute extents that legitimately differ from
-      //    the generic `[x, y-30, size0, size1+30]` model — visible bounds that reach past
-      //    `size`, on a custom node that draws outside its box. Forcing the generic
-      //    footprint there would overwrite the engine's own answer and then report success,
-      //    and rect-first membership would be wrong afterwards. The reported defect is
-      //    specifically the collapsed-PILL disagreement, so that is all this repairs; an
-      //    expanded node with an uncorrectable rect is still stuck, exactly as before.
-      //    A `flags` accessor that THROWS reads as not-collapsed, so it fails closed.
+      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets the pill-force. An expanded
+      //    node's `updateArea()` may authoritatively compute extents that legitimately
+      //    differ from the generic `[x, y-30, size0, size1+30]` model — visible bounds
+      //    that reach past `size`, on a custom node that draws outside its box. Forcing
+      //    the generic footprint there would overwrite the engine's own answer and then
+      //    report success, and rect-first membership would be wrong afterwards.
       //
       // 2. IT DOES NOT TRUST `syncNodeArea`'s OWN VERDICT ALONE. `boundingRect` can be an
       //    accessor whose getter returns a FRESH array on every read — a shape this file
@@ -573,20 +669,42 @@ export function moveGroupMembers(members, dx, dy) {
       //    node's real rect never changed: the move would report the node moved while the
       //    next membership read still saw the old rect and dropped it from the group. So the
       //    verdict is re-read through `nodeAreaIsLive`, which fetches the property again.
+      //
+      // panel#1300 — AN EXPANDED MEMBER WITH CUSTOM EXTENTS IS NOT STUCK EITHER.
+      //
+      // The #813 review left expanded custom-extent nodes stuck rather than overwrite
+      // their engine rect. That is the #1300 false refusal: `Label (rgthree)` (and any
+      // decorative node that draws past `size`) lands the position write, `updateArea()`
+      // shifts the origin by the same delta, and `nodeAreaIsLive` still fails because
+      // width/height are not the generic model. `panel_edit_node` never asks that
+      // question, so the same node moves fine one-by-one. The remedy is not to force
+      // the generic footprint (that is the overwrite #813 correctly refused) — it is
+      // to accept a rect whose ORIGIN tracked the move, extents and all.
       let isCollapsed = false;
+      let flagsReadable = true;
       try {
         isCollapsed = !!n?.flags?.collapsed;
       } catch {
-        // Unreadable flags ⇒ not eligible for the collapsed repair. Mutation reports
-        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather than
-        // a gap: `syncNodeArea` reads the same `flags` accessor through `wantedNodeArea`,
-        // so it throws, is caught there, and returns false — the node is stuck either way.
-        // Stated here so the next run does not re-chase it; the BEHAVIOUR is pinned by
-        // "a node whose flags accessor THROWS is stuck, not repaired".
+        // Unreadable flags ⇒ not eligible for the collapsed repair AND not eligible
+        // for the #1300 origin-tracks path. We cannot tell a collapsed pill from a
+        // custom-extent Label, so we cannot choose a verdict. Mutation reports
+        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather
+        // than a gap: `syncNodeArea` reads the same `flags` accessor through
+        // `wantedNodeArea`, so it throws, is caught there, and returns false — the
+        // node is stuck either way. Stated here so the next run does not re-chase
+        // it; the BEHAVIOUR is pinned by "a node whose flags accessor THROWS is
+        // stuck, not repaired".
+        flagsReadable = false;
         isCollapsed = false;
       }
-      if (!nodeAreaIsLive(n) && !(isCollapsed && syncNodeArea(n) && nodeAreaIsLive(n))) {
-        landedExactly = false;
+      if (isCollapsed) {
+        if (!nodeAreaIsLive(n) && !(syncNodeArea(n) && nodeAreaIsLive(n))) {
+          landedExactly = false;
+        }
+      } else if (!nodeAreaIsLive(n)) {
+        if (!flagsReadable || !originReadable || !nodeAreaOriginTracks(n, originBefore, dx, dy)) {
+          landedExactly = false;
+        }
       }
     } catch {
       landedExactly = false;
@@ -1077,6 +1195,87 @@ export function placeReroute(r, x, y) {
 }
 
 /**
+ * Snapshot every node position, every other group box, and every reroute on
+ * the graph, then put them back. A box-only bounds write must not be a group
+ * drag (#1306): some frontends couple `pos` / `_bounding` writes to
+ * LGraphGroup.move(), which translates the cached `_children` set.
+ *
+ * The snapshot is the WHOLE graph, not just current geometric members. A stale
+ * `_children` cache can still include nodes that have left the box, and those
+ * would ride along if we only pinned the live members.
+ *
+ * NEVER THROWS. Restore is best-effort per item — one unrestorable node must
+ * not stop the rest, and must not replace the caller's stated outcome with a
+ * raw TypeError.
+ */
+export function holdGraphItemPositions(graph, exceptGroup) {
+  const nodeSnap = [];
+  try {
+    for (const n of graph?._nodes ?? []) {
+      try {
+        const x = Number(n?.pos?.[0]);
+        const y = Number(n?.pos?.[1]);
+        if (Number.isFinite(x) && Number.isFinite(y)) nodeSnap.push([n, x, y]);
+      } catch {
+        /* unreadable node — skip */
+      }
+    }
+  } catch {
+    /* walk failed — restore what we captured */
+  }
+
+  const groupSnap = [];
+  try {
+    for (const other of graph?._groups ?? []) {
+      if (!other || other === exceptGroup) continue;
+      try {
+        const b = groupBoundsOf(other);
+        if (b) groupSnap.push([other, b]);
+      } catch {
+        /* unreadable box — skip */
+      }
+    }
+  } catch {
+    /* walk failed */
+  }
+
+  const rerouteSnap = [];
+  try {
+    for (const r of allReroutes(graph)) {
+      try {
+        const x = Number(r?.pos?.[0]);
+        const y = Number(r?.pos?.[1]);
+        if (Number.isFinite(x) && Number.isFinite(y)) rerouteSnap.push([r, x, y]);
+      } catch {
+        /* unreadable reroute — skip */
+      }
+    }
+  } catch {
+    /* walk failed */
+  }
+
+  return {
+    restore() {
+      restoreNodePositions(nodeSnap);
+      for (const [g, quad] of groupSnap) {
+        try {
+          restoreGroupBox(g, quad);
+        } catch {
+          /* never raise from a restore */
+        }
+      }
+      for (const [r, x, y] of rerouteSnap) {
+        try {
+          placeReroute(r, x, y);
+        } catch {
+          /* never raise from a restore */
+        }
+      }
+    },
+  };
+}
+
+/**
  * Translate reroute points by (dx, dy), reporting which ones actually moved.
  * Without this a moved group leaves its wire elbows behind and the links visibly
  * snake back to where the group used to be.
@@ -1122,6 +1321,68 @@ export function moveReroutePoints(reroutes, dx, dy) {
  * Normalizing to a common key fixes that; the returned arrays keep each id's
  * ORIGINAL representation so callers see the ids in their native form.
  */
+/**
+ * Word a create-by-node_ids membership gap for the failure that ACTUALLY
+ * happened.
+ *
+ * The old message was a single sentence that always opened with "the box that
+ * wraps the requested nodes also captures N unrelated node(s)" and always ended
+ * by prescribing a more contiguous layout. When nothing extra was captured that
+ * read as "also captures 0 unrelated node(s)", and the prescription was a
+ * non-answer: the reporter of mcp#1877 asked for ONE node, got an empty group
+ * whose bounds visibly covered it, and was told to spread its neighbours out.
+ * A dense layout is one cause of a membership gap, not the explanation for every
+ * one of them.
+ *
+ * Each cause therefore gets its own sentence, and only when it applies:
+ *   - `extra`   — the geometric-capture problem #297 named (dense layouts).
+ *   - unknown   — a requested id that resolves to no node in this graph.
+ *   - unsynced  — a node whose cached rect REFUSED the resync, so the box was
+ *                 built around geometry the frontend does not report it at.
+ *   - remainder — resolved, live, and still outside: the centre rule (#497).
+ *
+ * `resolvedIds` and `unsyncedIds` are Sets of STRING ids (ids arrive as both
+ * numbers and strings across frontends, the same normalisation
+ * classifyRequestedMembership does). Dependency-free, so it is unit-testable.
+ */
+export function describeGroupMembershipGap(extra, missing, resolvedIds, unsyncedIds) {
+  const has = (set, id) => !!set && typeof set.has === "function" && set.has(String(id));
+  const parts = [];
+  if (extra.length) {
+    parts.push(
+      `the box that wraps the requested nodes also captures ${extra.length} unrelated node(s) ` +
+        "(their centre falls inside) and LiteGraph has no per-node ownership to exclude them — " +
+        "move the intended nodes into a contiguous region (panel_edit_node / panel_auto_layout) " +
+        "before grouping, or edit the group bounds, to get an exact set.",
+    );
+  }
+  const unknown = missing.filter((id) => !has(resolvedIds, id));
+  if (unknown.length) {
+    parts.push(
+      `${unknown.length} requested node id(s) (${unknown.join(", ")}) do not exist in this graph, ` +
+        "so nothing was grouped for them — re-read the ids with panel_query_graph.",
+    );
+  }
+  const stuck = missing.filter((id) => has(resolvedIds, id) && has(unsyncedIds, id));
+  if (stuck.length) {
+    parts.push(
+      `${stuck.length} requested node(s) (${stuck.join(", ")}) exist but their cached footprint ` +
+        "could not be reconciled with their live position on this frontend, so membership was " +
+        "judged against geometry the panel could not refresh — set the box explicitly with " +
+        "panel_edit_group({bounds}) after re-reading panel_query_graph.",
+    );
+  }
+  const outside = missing.filter((id) => has(resolvedIds, id) && !has(unsyncedIds, id));
+  if (outside.length) {
+    parts.push(
+      `${outside.length} requested node(s) (${outside.join(", ")}) exist and are live, but the ` +
+        "CENTRE of their footprint falls outside the box — a node the box merely overlaps is " +
+        "not a member. Widen the box with panel_edit_group({bounds}).",
+    );
+  }
+  return `group membership is geometric: ${parts.join(" ")}`;
+}
+
 export function classifyRequestedMembership(requestedIds, memberIds) {
   const key = (id) => String(id);
   const reqKeys = new Set(requestedIds.map(key));

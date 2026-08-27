@@ -384,10 +384,43 @@ test("wiring: the disclosure rides on the WIRE frame, not on the composer", () =
   );
   assert.match(
     body,
-    /CANVAS_TOOL_DISCLOSURE \+ text/,
-    "the disclosure must be PREPENDED — appended after the message it reads as commentary",
+    /CANVAS_TOOL_DISCLOSURE\.trimEnd\(\)/,
+    "the disclosure must still ride the frame — in context, not glued onto the user's text",
   );
-  assert.match(body, /text: outText/, "the frame must carry the disclosed text, not the original");
+  assert.match(
+    body,
+    /context: outContext/,
+    "#1310 — agent-directed prose goes in context so the orchestrator prepends it for the model",
+  );
+  assert.match(body, /^\s*text,$/m, "user_message.text stays the original — the visible transcript field");
+  assert.doesNotMatch(
+    body,
+    /CANVAS_TOOL_DISCLOSURE \+ text/,
+    "prepending the disclosure to text is how it rendered in the user's chat (#1310)",
+  );
+});
+
+test("wiring: the shipped chat painters strip agent-directed blocks (#1310)", () => {
+  // The leak is a RENDER one: history replay, an echo, a quoted say, and the
+  // activity-card default all paint whatever string they are handed. The
+  // stripper is the last line of defence — if a painter skips it, the block
+  // is back in the user's chat even when the wire field is clean.
+  const source = panelSource();
+  assert.match(
+    source,
+    /function renderUserText\(container, text, atts\) \{\s*const raw = stripAgentDirectedBlocks\(coerceMessageText\(text\)\);/,
+    "user bubbles must strip before they paint",
+  );
+  assert.match(
+    source,
+    /const safeText = stripAgentDirectedBlocks\(coerceMessageText\(text\)\);/,
+    "agent bubbles must strip before they paint",
+  );
+  assert.match(
+    source,
+    /text = stripAgentDirectedBlocks\(coerceMessageText\(text\)\);\s*detail = detail == null \? detail : stripAgentDirectedBlocks\(coerceMessageText\(detail\)\);/,
+    "activity cards must strip both slots — graph_query used to dump budget_overrun here",
+  );
 });
 
 test("wiring: the composer no longer assembles the disclosure itself", () => {
@@ -480,11 +513,16 @@ test("the README does not promise parity it cannot guarantee — anywhere in the
   assert.match(readme, /identical \*\*as served\*\*/);
 });
 
-/** The whole body of the bridge client's sendHello(). */
+/** The whole body of the bridge client's hello PAYLOAD builder.
+ *
+ *  #1095 — `advertiseHello`, not `sendHello`. `sendHello` is now the gated entry point in
+ *  front of it (a re-advertise waits for in-flight commands to reply), so slicing from
+ *  `sendHello` would return a five-line wrapper containing none of what this file asserts —
+ *  and `assert.equal(count, 1)` style checks would keep passing on an empty window. */
 function sendHelloBody(source) {
-  const start = source.indexOf("  function sendHello() {");
+  const start = source.indexOf("  function advertiseHello() {");
   const end = source.indexOf("  // When the workflow title changes", start);
-  assert.ok(start >= 0 && end > start, "could not locate sendHello");
+  assert.ok(start >= 0 && end > start, "could not locate advertiseHello");
   return source.slice(start, end);
 }
 

@@ -31,6 +31,9 @@ import {
   HISTORY_UNSEEDED,
   HISTORY_PENDING,
   backendHistoryVerdict,
+  isSubgraphUuidType,
+  subgraphTypeIsLoaded,
+  subgraphUuidAddRefusal,
 } from "../../web/js/lib/node-resolve.js";
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
@@ -39,7 +42,14 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 // The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
 // oracle that gates #507's last-resort acceptance.
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
-import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
+import {
+  serverDeclaresEmptyComboOptions,
+  serverDeclaresRemoteComboOptions,
+} from "../../web/js/lib/input-asset.js";
+// #1223 — the REAL snapshot, so the #1126 fallback is driven against the DETACHED name-only
+// map production actually hands back, never a hand-rolled full schema.
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -531,6 +541,28 @@ test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no m
   assert.equal(node.widgets[0].value, "");
 });
 
+test("#2107: the real runSetWidget refuses a replacement object before mutation", async () => {
+  const reg = loadedRegistry();
+  const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 0 }]);
+  const replacement = regNode("KSampler", [{ name: "steps", type: "INT", value: 99 }]);
+  let liveTarget = replacement;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 20, {
+        registry: reg,
+        getFreshObjectInfo: async () => FRESH_ALL,
+        resolveSource: () => null,
+        ...HOOKS,
+        assertTargetStillCurrent: () => {
+          if (liveTarget !== node) throw new Error("panel_set_widget target changed before dispatch");
+        },
+      }),
+    /target changed before dispatch/,
+  );
+  assert.equal(node.widgets[0].value, 0, "the captured stale object was not mutated");
+  liveTarget = node;
+});
+
 // ---- HANDLER ORDERING through the REAL runSetWidget (#458) -------------------
 // reconcileUnknownWidgetNames RENAMES widgets in place. The handler must preflight
 // (refuse a placeholder) BEFORE reconcile, and reconcile only a resolved direct
@@ -974,10 +1006,11 @@ test("#496 add_node: a genuinely INVALID target still fails closed (unknown type
   );
   // (d) an allowlisted name that is NOT registered in the live registry at all — the
   //     exemption requires registry membership (which is also what createNode needs).
+  //     Still refused; only the diagnosis changed (#1296 — see the dedicated block below).
   const reg4 = loadedRegistry();
   await assert.rejects(
     () => assertAddNodeResolvableRefreshing(() => reg4, "MarkdownNote", ADD_OPTS(fresh)),
-    /Unknown node type|does not provide/i,
+    /frontend-only node type|does not provide/i,
   );
 });
 
@@ -1002,18 +1035,450 @@ test("#496 add_node: the EVER-SEEN gate still wins — an allowlisted name whose
   );
 });
 
-test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a frontend-only type", async () => {
-  // The exemption is scoped to "object_info WAS fetched but lacks the type". An
-  // unverifiable backend must never authorize anything (#458).
+// ---- mcp#2000: object_info UNAVAILABLE no longer refuses a FRONTEND-ONLY type.
+//      Reported against a HEALTHY live canvas: panel_refresh_nodes timed out fetching
+//      /object_info, and the very next panel_add_node "MarkdownNote" was refused with
+//      "Reconnect ComfyUI and retry" — while ComfyUI was answering fine. The
+//      availability guard ran BEFORE the frontend-only exemption, so a fetch that did
+//      not answer vetoed a type the fetch could never have answered about: /object_info
+//      never lists Note/MarkdownNote/Reroute/PrimitiveNode BY DESIGN.
+//
+//      The exemption is applied on the SAME terms as the fetched-defs path, and neither
+//      of its clauses reads freshDefs — the ever-seen gate reads the session history
+//      oracle (which a timeout leaves intact), and isAuthorizedFrontendOnlyType reads
+//      the live registry. So this narrows nothing about #458: the block below pins every
+//      fail-closed direction, and each case is refused for a DIFFERENT clause. --------
+
+const ADD_OPTS_NO_OBJECT_INFO = (wasTypeEverDefined = () => false) => ({
+  getFreshObjectInfo: async () => null, // the bounded fetch timed out / rejected
+  refresh: async () => {},
+  wasTypeEverDefined,
+});
+
+test("mcp#2000 add_node: THE REPORTED CASE — a frontend-only native is ADDABLE when the /object_info fetch did not answer", async () => {
   const reg = registryWithNatives();
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS_NO_OBJECT_INFO()),
+      `mcp#2000: "${t}" is frontend-only — a fetch that did not answer withheld nothing about it`,
+    );
+  }
+  // The rgthree frontend control nodes ride the same shared allowlist.
+  const reg2 = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg2,
+      "Fast Groups Bypasser (rgthree)",
+      ADD_OPTS_NO_OBJECT_INFO(),
+    ),
+  );
+});
+
+test("mcp#2000 add_node: driven through the REAL history oracle after a timed-out refresh, not a stub", async () => {
+  // Production wiring: the baseline seeded at page load, then a refresh timed out.
+  // recordTypes(null) records nothing and a timeout must NEVER arm loseBaseline, so the
+  // baseline SURVIVES — which is exactly why the ever-seen gate is still trustworthy on
+  // this path. If that ever stops holding, this test is the one that catches it.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, VAEDecode: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+  assert.equal(history.seeded, true, "a timeout must not demote the baseline");
+  assert.equal(history.wasTypeEverDefined("MarkdownNote"), false, "verdict must be never-seen");
+
+  const reg = registryWithNatives();
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg,
+      "MarkdownNote",
+      ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+    ),
+  );
+  // …and a type the SAME surviving baseline DID report is still refused: the trust root
+  // is doing real work here, it is not merely present.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => loadedRegistry([], ["SaveImage"]),
+        "SaveImage",
+        ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everything that is not an authorized frontend-only type", async () => {
+  // Each case below trips a DIFFERENT clause, so a mutation that removes any one of
+  // them shows up here rather than hiding behind a sibling.
+  // (a) not on the allowlist — a genuinely unknown type.
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (b) a REAL backend type: /object_info IS load-bearing for it, so an unanswered
+  //     fetch must still veto — this is the #458 case the guard exists for.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "KSampler", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (c) an allowlisted NAME whose registered class carries backend provenance — a
+  //     removed pack's stale class squatting a reserved name.
+  const regHusk = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regHusk, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (d) an allowlisted name absent from the LIVE REGISTRY — registry membership is what
+  //     LG.createNode needs, so without it the add could only mint a placeholder.
+  const regBare = loadedRegistry();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regBare, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (e) THE EVER-SEEN GATE, on the unavailable path too: the backend reported this
+  //     reserved name earlier this session ⇒ its pack was removed ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "MarkdownNote",
+        ADD_OPTS_NO_OBJECT_INFO((t) => t === "MarkdownNote"),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (f) history PENDING (the baseline has not arrived) and (g) UNSEEDED (it never
+  //     will) are both TRUTHY sentinels ⇒ not "never-seen" ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_PENDING)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_UNSEEDED)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (h) NO history oracle wired at all: the exemption REQUIRES the non-forgeable trust
+  //     root, so a caller that omits it gets the strict pre-mcp#2000 behaviour.
   await assert.rejects(
     () =>
       assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
         getFreshObjectInfo: async () => null,
         refresh: async () => {},
-        wasTypeEverDefined: () => false,
       }),
     /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("mcp#2000 INVARIANT: relaxing the precondition does not change WHICH types are exempt", async () => {
+  // THE load-bearing invariant of the whole change, and the one a reviewer can check
+  // without re-deriving my reasoning: the exempt SET must be identical whether
+  // /object_info answered or not. The change moves a PRECONDITION, it does not widen the
+  // permission set. Exactly one verdict may differ between the two paths — a REAL backend
+  // type, for which the fetch genuinely is load-bearing.
+  //
+  // Iterating FRONTEND_ONLY_NODE_TYPES rather than a hand-written list is deliberate: a
+  // type added to the allowlist later is covered here automatically, on both paths.
+  const addVerdict = async (fresh, type, reg, ever) => {
+    try {
+      await assertAddNodeResolvableRefreshing(() => reg, type, {
+        getFreshObjectInfo: async () => fresh,
+        refresh: async () => {},
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const swVerdict = (fresh, type, reg, ever) => {
+    try {
+      assertTypeAgainstFreshBackend(fresh, type, 1, {
+        registry: reg,
+        node: { id: 1, type, constructor: reg[type] },
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const healthy = objectInfo(); // a live backend that never lists a frontend-only type
+  const never = () => false;
+
+  const cases = [];
+  for (const t of FRONTEND_ONLY_NODE_TYPES) {
+    cases.push([`${t} (clean, never-seen)`, t, loadedRegistry([], [t]), never, "ALLOW"]);
+  }
+  cases.push(["unknown type", "TotallyMadeUpNode", loadedRegistry(), never, "REFUSE"]);
+  cases.push(["ever-seen ⇒ removed", "MarkdownNote", registryWithNatives(), () => true, "REFUSE"]);
+  cases.push(["provenance husk", "MarkdownNote", loadedRegistry(["MarkdownNote"]), never, "REFUSE"]);
+  cases.push(["not in the live registry", "MarkdownNote", loadedRegistry(), never, "REFUSE"]);
+
+  for (const [label, type, reg, ever, expected] of cases) {
+    const withDefs = await addVerdict(healthy, type, reg, ever);
+    const without = await addVerdict(null, type, reg, ever);
+    assert.equal(withDefs, expected, `add/${label}: unexpected verdict WITH defs`);
+    assert.equal(without, withDefs, `add/${label}: the two paths disagree — the exempt set moved`);
+    const swWith = swVerdict(healthy, type, reg, ever);
+    const swWithout = swVerdict(null, type, reg, ever);
+    assert.equal(swWithout, swWith, `set_widget/${label}: the two paths disagree`);
+  }
+
+  // …and the ONE type whose verdict MUST differ: a real backend node genuinely needs the
+  // fetch, so an unanswered one still refuses. If this ever stops differing, the
+  // relaxation has leaked out of the frontend-only set and into live backend types.
+  const reg = loadedRegistry();
+  assert.equal(await addVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(await addVerdict(null, "KSampler", reg, never), "REFUSE");
+  assert.equal(swVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(swVerdict(null, "KSampler", reg, never), "REFUSE");
+});
+
+test("mcp#2000: an exemption that THROWS must not replace the refusal it was checking", async () => {
+  // Found by running the review taxonomy against my OWN diff (class 5: what does the
+  // change make WORSE?). Before mcp#2000 these guards threw their refusal WITHOUT
+  // consulting anything, so nothing on this path could raise. Consulting two predicates
+  // first meant a hostile registry or a raising oracle surfaced a RAW error instead of
+  // the worded refusal — measured leaking "registry exploded" / "history oracle exploded"
+  // from all three guards before the shared helper swallowed it. Any doubt REFUSES.
+  const ctor = function MarkdownNoteNative() {};
+  const reg = registryWithNatives();
+  const node = { id: 1, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  const BOOM = () => {
+    throw new Error("history oracle exploded");
+  };
+  // A registry whose membership probe throws — the realistic shape is a Proxy.
+  const hostileReg = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error("registry exploded");
+      },
+      has() {
+        throw new Error("registry exploded");
+      },
+      get() {
+        throw new Error("registry exploded");
+      },
+    },
+  );
+  const isWorded = (err) => {
+    assert.match(err.message, /cannot verify|object_info is unavailable|no usable/i);
+    assert.doesNotMatch(err.message, /exploded/, "the raw error must not reach the caller");
+    return true;
+  };
+
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: BOOM,
+      }),
+    isWorded,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => hostileReg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: () => false,
+      }),
+    isWorded,
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(null, "MarkdownNote", 1, { registry: reg, node, wasTypeEverDefined: BOOM }),
+    isWorded,
+  );
+  assert.throws(() => assertMutatedNodeAuthorized(null, reg, node, "target", BOOM), isWorded);
+
+  // CONTROL: swallowing must not have swallowed the exemption itself.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+  );
+  void ctor;
+});
+
+// ---- mcp#2000 PARITY: the SAME relaxation in the two set_widget guards. All three
+//      /object_info-oracle guards had the identical `!freshDefs` early throw, so fixing
+//      only add_node would have shipped HALF the documented annotation path — the note
+//      appears and its text can never be written. Measured on origin/main before
+//      extending the fix: with the fetch unavailable the write REFUSED, and the control
+//      (same state, fetch answering) WROTE, so the probe was proving the product and not
+//      itself. One copy relaxed alone is the #496 drift again, hence all three. --------
+
+test("mcp#2000 set_widget: assertTypeAgainstFreshBackend exempts an authorized frontend-only type when object_info is unavailable", () => {
+  const reg = registryWithNatives();
+  const node = { id: 7, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() =>
+    assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+      registry: reg,
+      node,
+      wasTypeEverDefined: () => false,
+    }),
+  );
+  // …and every other direction still fails closed on the SAME unavailable map.
+  for (const [why, type, opts] of [
+    ["a real backend type", "KSampler", { registry: reg, wasTypeEverDefined: () => false }],
+    ["a non-allowlisted type", "TotallyMadeUpNode", { registry: reg, wasTypeEverDefined: () => false }],
+    ["an ever-seen (removed) allowlisted name", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => true }],
+    ["a pending baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_PENDING }],
+    ["an unseeded baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_UNSEEDED }],
+    ["no registry wired at all", "MarkdownNote", { node, wasTypeEverDefined: () => false }],
+    ["a provenance-bearing husk", "MarkdownNote", { registry: loadedRegistry(["MarkdownNote"]), wasTypeEverDefined: () => false }],
+  ]) {
+    assert.throws(
+      () => assertTypeAgainstFreshBackend(null, type, 7, opts),
+      /cannot verify|object_info is unavailable|no usable/i,
+      `mcp#2000: ${why} must still fail closed`,
+    );
+  }
+  // A stale backend INSTANCE under a bare native class of the same name is refused by
+  // the instance-provenance clause, which only this guard family has.
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+        registry: reg,
+        node: { id: 7, type: "MarkdownNote", constructor: { comfyClass: "MarkdownNote" } },
+        wasTypeEverDefined: () => false,
+      }),
+    /cannot verify|no usable/i,
+  );
+});
+
+test("mcp#2000 set_widget: assertMutatedNodeAuthorized keeps the same terms on the unavailable path", () => {
+  const reg = registryWithNatives();
+  const node = { id: 9, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() => assertMutatedNodeAuthorized(null, reg, node, "target", () => false));
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, node, "target", () => true),
+    /cannot verify|object_info is unavailable/i,
+    "an ever-seen removal still wins",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, { id: 9, type: "KSampler" }, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "a real backend type still needs the fetch",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, undefined, node, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "no registry wired ⇒ no exemption",
+  );
+});
+
+test("mcp#2000 set_widget e2e: the documented annotation path COMPLETES through the production handler when object_info never answers", async () => {
+  // THE WHOLE POINT: add the note, then put the text in it. Driving runSetWidget — the
+  // body graph_set_widget delegates to — not a predicate in isolation.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+
+  const ctor = function MarkdownNoteNative() {};
+  const reg = loadedRegistry();
+  reg["MarkdownNote"] = ctor;
+  const node = { id: 42, type: "MarkdownNote", widgets: [{ name: "text", type: "text", value: "" }], constructor: ctor };
+  const { set } = await runSetWidget(node, "text", "hello", {
+    registry: reg,
+    getFreshObjectInfo: async () => null, // the fetch never answers
+    wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "hello");
+  assert.equal(node.widgets[0].value, "hello", "the note is fillable, not just addable");
+
+  // CONTROL: a REAL backend node in the identical state still refuses — the relaxation
+  // is scoped to frontend-only types, not to "object_info is down".
+  const ksNode = { id: 43, type: "KSampler", widgets: [{ name: "steps", type: "INT", value: 1 }], constructor: reg["KSampler"] };
+  await assert.rejects(
+    () =>
+      runSetWidget(ksNode, "steps", 20, {
+        registry: reg,
+        getFreshObjectInfo: async () => null,
+        wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+        ...HOOKS,
+      }),
+    /cannot verify|object_info is unavailable|no usable/i,
+  );
+  assert.equal(ksNode.widgets[0].value, 1, "the refused write left the node untouched");
+});
+
+// ---- #1296: an allowlisted FRONTEND-ONLY type that is NOT in the live registry is
+//      still refused (LiteGraph could only mint a placeholder — that part is
+//      correct), but the refusal must stop diagnosing it as "not installed / its
+//      pack failed to import" and pointing at create_workflow (action:"node_info").
+//      A frontend-only class never comes from /object_info, so no fetch can confirm
+//      it, and the reported rig (rgthree-comfy installed, ComfyUI restarted, tab
+//      never reloaded) is exactly "pack JS not loaded in this tab". The refusal now
+//      names that and prescribes the ONE action that changes it: reload the tab. ---
+
+test('#1296 add_node: "Fast Groups Bypasser (rgthree)" with rgthree installed but the tab never reloaded is refused with a RELOAD-THE-TAB diagnosis, not "not installed"', async () => {
+  const fresh = objectInfo(); // healthy backend — never lists a frontend-only type
+  const reg = loadedRegistry(); // this tab predates the rgthree install: not registered
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /frontend-only node type/);
+      assert.match(err.message, /RELOAD the ComfyUI tab/);
+      // The old diagnosis — install a pack they already have, then query the live
+      // /object_info for a type that is never in it — must be GONE.
+      assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+      assert.doesNotMatch(err.message, /failed to import/);
+      assert.doesNotMatch(err.message, /create_workflow \(action:"node_info"\)/);
+      return true;
+    },
+  );
+  // …and once the tab IS reloaded (the pack JS registers the class, defless), the
+  // same add succeeds — the refusal above was about this tab, not the type.
+  const regReloaded = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => regReloaded, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
+  );
+});
+
+test("#1296 add_node: the reload diagnosis is scoped — provenance-bearing husk, ever-seen removal, and non-allowlisted types keep their own refusals", async () => {
+  const fresh = objectInfo();
+  // (a) an allowlisted name whose REGISTERED class carries backend provenance (a
+  //     removed pack's stale class squatting a reserved name) is NOT told to reload —
+  //     it keeps the generic unknown-type refusal.
+  const regHusk = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regHusk, "MarkdownNote", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /Unknown node type "MarkdownNote"/);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
+  );
+  // (b) the EVER-SEEN gate still wins over the reload diagnosis: a type the backend
+  //     reported earlier this session and no longer does is a REMOVED pack.
+  const reg = loadedRegistry();
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "Fast Groups Bypasser (rgthree)",
+        ADD_OPTS(fresh, (t) => t === "Fast Groups Bypasser (rgthree)"),
+      ),
+    (err) => {
+      assert.match(err.message, /defined this node type earlier this session|removed/i);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
+  );
+  // (c) a genuinely unknown, non-allowlisted type keeps the generic refusal with the
+  //     node_info pointer — nothing about it suggests a not-yet-loaded pack.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /Unknown node type "TotallyMadeUpNode"/);
+      assert.match(err.message, /create_workflow \(action:"node_info"\)/);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
   );
 });
 
@@ -1116,10 +1581,11 @@ test("#496 recurrence: the SetNode/GetNode allowlist entries do NOT weaken the g
     /defined this node type earlier this session|removed/i,
   );
   // (c) An allowlisted name that is NOT registered in the live registry at all stays
-  //     refused (registry membership is also what createNode needs).
+  //     refused (registry membership is also what createNode needs). #1296 changed only
+  //     the DIAGNOSIS: it now names the unloaded pack JS and prescribes a tab reload.
   await assert.rejects(
     () => assertAddNodeResolvableRefreshing(() => loadedRegistry(), "SetNode", ADD_OPTS(fresh)),
-    /Unknown node type|does not provide/i,
+    /frontend-only node type|does not provide/i,
   );
 });
 
@@ -1263,6 +1729,23 @@ function starObjectInfo(serverOptions = []) {
   info["StarOllamaPromptHelper"] = { input: { required: { model: [serverOptions, {}] } } };
   return info;
 }
+function remoteComboFixture(liveOptions = []) {
+  const reg = loadedRegistry(["LTXVAudioVAELoader"]);
+  const widget = { name: "ckpt_name", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 1696, type: "LTXVAudioVAELoader", widgets: [widget], constructor: reg["LTXVAudioVAELoader"] };
+  return { reg, node, widget };
+}
+function remoteComboObjectInfo() {
+  const info = objectInfo();
+  info["LTXVAudioVAELoader"] = {
+    input: {
+      required: {
+        ckpt_name: ["COMBO", { remote: { route: "/internal/files/checkpoints" } }],
+      },
+    },
+  };
+  return info;
+}
 // The PRODUCTION combo refresh (the same function the panel injects as refreshCombos),
 // so these tests inherit its real semantics — notably that it deliberately NEVER clobbers
 // a dynamic (function) option source. A hand-rolled stand-in that overwrote functions
@@ -1387,6 +1870,43 @@ test("#507 SEVERE: a DYNAMIC (function) source returning [] while the SERVER pub
   ).then(() => {
     assert.equal(widget.value, "", "must not have mutated — the server list is real");
   });
+});
+
+test("#1696 e2e: a remote combo refusal names unavailable provenance, not an empty list", async () => {
+  const { reg, node, widget } = remoteComboFixture([]);
+  const remote = remoteComboObjectInfo();
+  assert.equal(
+    serverDeclaresRemoteComboOptions(remote, "LTXVAudioVAELoader", "ckpt_name"),
+    true,
+    "the fixture must identify the separate remote option source",
+  );
+  assert.equal(
+    serverDeclaresEmptyComboOptions(remote, "LTXVAudioVAELoader", "ckpt_name"),
+    false,
+    "a remote source is not a server-declared empty list",
+  );
+
+  await assert.rejects(
+    runSetWidget(node, "ckpt_name", "ltx-video.safetensors", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => remote,
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) => {
+      assert.match(err.message, /combo_source=remote/);
+      assert.match(err.message, /option_list=unavailable/);
+      assert.match(err.message, /verdict=unknown/);
+      assert.match(err.message, /requested value was not validated/);
+      assert.match(err.message, /NOTHING WAS WRITTEN/);
+      assert.doesNotMatch(err.message, /EMPTY option list/i);
+      assert.doesNotMatch(err.message, /may simply be stale|refreshing it before deciding/i);
+      return true;
+    },
+  );
+  assert.equal(widget.value, "", "the remote/unreadable path remains fail-closed");
 });
 
 test("#507: a dynamic source returning [] AND a server-declared empty list DOES write", () => {
@@ -1784,5 +2304,1032 @@ test("#512: the flag does not authorize a provenance-bearing NON-container leaf"
   assert.throws(
     () => assertMutatedNodeAuthorized(fresh, reg, leaf, "outer subgraph", () => false, RESOLVED),
     /not a verifiable frontend-only \/ virtual-subgraph node/i,
+  );
+});
+
+// ── #1126 e2e: a combo whose options CANNOT BE ENUMERATED, through the real ladder ──
+//
+// `options.values` is the node's own callback. When it throws, the panel has compared the
+// value to nothing — yet the ladder refused, and the refusal reached the user as a verdict
+// about their value. The decision below is made from the panel's OWN observation (the read
+// failed) confirmed against the server (it publishes no list for this input either), never
+// from an assertion the caller makes about the node.
+
+/** The reported shape: a dynamic file combo whose populate callback fails. */
+function unreadableComboFixture(values) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+const THROWS = () => {
+  throw new Error("the node's own populate() failed");
+};
+
+test("#1126 e2e: an UNREADABLE option list writes the path and discloses that nothing checked it", async () => {
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    registry: reg,
+    getRegistry: () => reg,
+    // The server publishes no list for this input either — so the valid set is not
+    // knowable from anywhere the panel can see.
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true, "the caller must be told nothing validated it");
+  assert.match(res.option_list_unreadable_note, /could NOT BE READ/);
+  assert.match(res.option_list_unreadable_note, /not because the value was checked and passed/);
+  // The note states the OBSERVED reason rather than a plausible default: there are three
+  // distinct ones and only the read that decided it knows which.
+  assert.match(res.option_list_unreadable_note, /options\.values callback threw/);
+  assert.match(res.option_list_unreadable_note, /the node's own populate\(\) failed/);
+  assert.match(res.set.option_list_unreadable_detail, /callback threw/);
+  // It must NOT claim the empty-list path: "the server declared zero options" is a
+  // different observation, and reporting one as the other misdescribes the write.
+  assert.equal(res.empty_option_list, undefined);
+});
+
+test("#1126 e2e: a failed live read is NOT licence to ignore a list the SERVER publishes", async () => {
+  // The second condition, and the one that keeps this from becoming "skip validation
+  // whenever the callback is flaky". /object_info publishes a real list for this input,
+  // so the valid set IS knowable from somewhere — and the panel does not get to write
+  // blindly just because the node's own callback failed.
+  //
+  // The refresh cannot repair this shape (refreshComboOptionsFromDefs deliberately never
+  // clobbers a FUNCTION option source — a dynamic list computes its own), so the write
+  // stays refused, exactly as it was before this change. That is the deliberate
+  // conservative edge: the panel refuses rather than validating against a server list the
+  // widget itself has not adopted. The refusal still says which observation it rests on.
+  for (const value of ["llama3.2:3b", "not-installed:70b"]) {
+    const { reg, node, widget } = unreadableComboFixture(THROWS);
+    await assert.rejects(
+      runSetWidget(node, "model", value, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+      (err) =>
+        /panel_set_widget refused "model" on node 9/.test(err.message) &&
+        /option list could not be READ/.test(err.message) &&
+        // Never a claim about the value: nothing was compared to anything.
+        !/is not a valid option/.test(err.message),
+      `a server-published list withholds the acceptance for ${value}`,
+    );
+    assert.equal(widget.value, "", "no mutation on the refusal");
+  }
+});
+
+test("#1126 e2e: a list that WAS read still refuses an off-list value, framed and self-describing", async () => {
+  // The other direction, end to end. Nothing about the escape reaches a combo the panel
+  // could enumerate: the value is simply not one of the choices.
+  const { reg, node, widget } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
+  await assert.rejects(
+    runSetWidget(node, "model", "not-installed:70b", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      // The frame survives — tool, widget, node — so the refusal is attributable.
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /is not a valid option/.test(err.message) &&
+      // …and it says WHICH of the two happened, so an agent does not read a rejected
+      // value as an unreadable list (or keep retrying a value that will never be valid).
+      /option list WAS read successfully/.test(err.message) &&
+      /rejected VALUE, not an unreadable list/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation on the refusal");
+});
+
+test("#1126 e2e: an unreadable list REFUSES a non-string, and the refusal keeps its frame", async () => {
+  // The last-resort attempt can itself refuse (#240 keeps a number out of a combo whose
+  // real list exists but cannot be read). That refusal is raised inside the final write,
+  // outside the ladder's try/catch — so without explicit framing it would surface as a
+  // bare `Combo widget "model": …` with no tool, node, or widget attached.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", 640, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /option list unreadable/.test(err.message) &&
+      /NON-EMPTY STRING/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation");
+});
+
+test("#1126 e2e: the unreadable acceptance is the LAST resort — a refreshable list is fixed first", async () => {
+  // Ordering matters: if the acceptance ran before the authoritative refresh it would
+  // quietly become "skip validation whenever the callback is flaky", and a transient
+  // failure would write an off-list value into a combo the server can enumerate perfectly
+  // well. Here the callback fails once and the refresh replaces it with the server's list.
+  let calls = 0;
+  const flaky = () => {
+    calls += 1;
+    if (calls === 1) throw new Error("transient");
+    return ["qwen3-vl:8b", "llama3.2:3b"];
+  };
+  const { reg, node, widget } = unreadableComboFixture(flaky);
+  const res = await runSetWidget(node, "model", "llama3.2:3b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(widget.value, "llama3.2:3b");
+  assert.equal(res.refreshed, true, "the authoritative retry is what accepted it");
+  assert.equal(res.option_list_unreadable, undefined, "nothing went unvalidated");
+});
+
+// ── #1223/#716 × #1126: the "server declares it empty" evidence must be LIVE ──────────
+//
+// A cross-feature hole, opened by changes that are each correct alone. #1223 (v0.14.39) lets
+// `getFreshObjectInfo` answer from the LAST-OBSERVED schema snapshot when both live probes go
+// silent; #716's burst cache lets it answer from a payload up to 1.5s old. This fallback's
+// second condition reads either answer as "the SERVER declares this input's option list
+// empty" — but both are what the server said BEFORE, retained across a window in which nobody
+// re-asked. Options change without a reconnect AND without a cache drop (a model downloaded
+// while this node's own callback keeps failing), so either stale `[]` would authorize an
+// unvalidated write. Same defect, two layers.
+
+const snapshotOpts = (reg, extra = {}) => ({
+  registry: reg,
+  getRegistry: () => reg,
+  // The (stale) schema publishes NO list for this input — the shape that would authorize.
+  getFreshObjectInfo: async () => starObjectInfo([]),
+  wasTypeEverDefined: () => true,
+  refreshCombos: refreshFromServer,
+  ...HOOKS,
+  ...extra,
+});
+
+/**
+ * The REAL map #1223's fallback hands back — built by driving `record` + `authorize`, never
+ * hand-rolled. This matters: the snapshot deliberately stores a DETACHED map of TYPE NAMES,
+ * every value the shared frozen EMPTY_DEF with no `input` at all (retaining the payload would
+ * let a beforeRegisterNodeDef hook launder frontend-mutated defs back as backend evidence).
+ * A test that supplies a full `starObjectInfo([])` here would be testing a shape production
+ * never produces — which is how the snapshot branch came to be dead code in the first place.
+ */
+function detachedSnapshotDefs(fullMap) {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(
+    snap.record(fullMap, {
+      observedAtEpoch: 7,
+      currentEpoch: 7,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+    "fixture precondition: the snapshot accepted the whole map",
+  );
+  const { defs } = snap.authorize({
+    epoch: 7,
+    socketDown: false,
+    // Both transports contacted and silent — the only state that licenses the fallback.
+    outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }, { kind: TRANSPORT_OUTCOME.NOTHING_RETURNED }],
+  });
+  assert.ok(defs, "fixture precondition: the snapshot authorized");
+  return defs;
+}
+
+test("#1223 fixture: the real snapshot map holds NAMES ONLY — it cannot answer an option-list question", () => {
+  // Pins the premise the refusal below rests on, so a future change that re-attached payloads
+  // to the snapshot fails HERE with a clear reason rather than silently reviving a branch that
+  // was reasoned about as unreachable.
+  const defs = detachedSnapshotDefs(starObjectInfo([]));
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(defs, "StarOllamaPromptHelper"),
+    "membership survives — that is what the snapshot is for",
+  );
+  assert.equal(defs["StarOllamaPromptHelper"].input, undefined, "…but the def carries no input");
+  assert.equal(
+    serverDeclaresEmptyComboOptions(defs, "StarOllamaPromptHelper", "model"),
+    false,
+    "so the shape test is ALWAYS false against a snapshot, for every input on every node",
+  );
+});
+
+test("#1223 × #1126: a SNAPSHOT can never authorize the blind write, and says why", async () => {
+  // Driven against the REAL detached map, not a hand-built full one. The shape test cannot
+  // pass here — a name-only map answers "no" for every input in existence — so the honest
+  // outcome is a refusal that names the silent backend rather than the generic end-of-ladder
+  // message, which would send the caller to look at their value instead.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      getFreshObjectInfo: async () => detachedSnapshotDefs(starObjectInfo([])),
+      schemaProvenance: () => "snapshot",
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
+      /LAST-OBSERVED one \(#1223\)/.test(err.message) &&
+      /detached map of TYPE NAMES ONLY/.test(err.message) &&
+      // It must name WHICH fact is missing. "Reconnect and retry" is only actionable if the
+      // caller knows it is the SCHEMA, not their value, that could not be established.
+      /holds no option lists at all/.test(err.message) &&
+      /Reconnect to ComfyUI/.test(err.message) &&
+      // And it must NOT be the cache/stale wording: a map that holds no lists is not a map
+      // holding a stale one, and telling the user to "retry in a moment" would be wrong.
+      !/burst cache/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — a name-only map establishes nothing");
+});
+
+test("#1126: a RECONNECT-SPANNING response is not live — the replaced process cannot authorize", async () => {
+  // object-info-cache deliberately still hands a retired response to its ORIGINAL waiter, and
+  // objectInfoSnapshot.record refuses to file it because observed !== current. The provenance
+  // must apply the same test: a schema describing the ComfyUI process that has been replaced
+  // must not authorize a blind write against the replacement's option lists — a restart is
+  // precisely the event that changes what the server publishes.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "reconnected",
+    }),
+    (err) =>
+      /backend RECONNECTED while that \/object_info request was in flight/.test(err.message) &&
+      /has since been replaced/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer describes a process that is gone");
+});
+
+test("#1126: a RETIRED response is not live — the panel's own refresh superseded it", async () => {
+  // The fourth way a response turned out not to be live, and the one a healthy backend hits
+  // most: registerComfyNodeDefs drops the burst cache on a refresh, a pack install, or a
+  // download completing. That bumps the cache GENERATION without moving the reconnect epoch,
+  // so an epoch test alone still calls it live — while the very refresh that retired it may
+  // be what filled this option list.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "retired",
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /may be what filled this list/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer was superseded before it arrived");
+});
+
+test("#1126: a NESTED promotion is refused BEFORE any re-fetch is paid for", async () => {
+  // The chain shape is already known and no schema can make this writable, so establishing
+  // evidence for it is pure cost — and on a non-live provenance that cost is a cache drop
+  // plus a multi-megabyte /object_info round trip, spent to answer a question whose answer
+  // cannot change the outcome.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const container = (uuid, id, w, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: w.name, _widget: w, widget: { name: w.name }, _subgraphSlot: { name: w.name } }],
+      widgets: [w],
+    };
+  };
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container("11111111-1111-4111-8111-111111111111", 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container("22222222-2222-4222-8222-222222222222", 320, outerWidget, mid, "301");
+  let refetched = 0;
+  let fetches = 0;
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => {
+        fetches += 1;
+        return starObjectInfo([]);
+      },
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource: (_n, si) => {
+        if (si?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+        if (si?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+        return null;
+      },
+      // A provenance that WOULD trigger the re-ask if the nested check did not come first.
+      schemaProvenance: () => "cache",
+      // Wired for real, so the assertion below measures something. Stubbing a capability the
+      // lib no longer reads would make "it was never called" true by construction.
+      refetchObjectInfoLive: async () => {
+        refetched += 1;
+        return starObjectInfo([]);
+      },
+      ...HOOKS,
+    }),
+    (err) => /NESTED promotion/.test(err.message),
+  );
+  assert.equal(refetched, 0, "no forced reread is paid for a write that cannot succeed");
+  assert.equal(fetches, 1, "only the ladder's own authorization fetch — no last-resort re-ask");
+});
+
+test("#716 × #1126: a CACHE-HIT empty list does NOT authorize a blind write either", async () => {
+  // The layer below the snapshot, and the one a healthy backend actually hits: #716's burst
+  // cache answers writes 2..N of a burst without asking the server at all. "Not from a
+  // snapshot" is NOT the same as "live". Here the re-ask is impossible (no invalidator
+  // wired), so the fallback must fail closed rather than trust a payload nobody refreshed.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "cache",
+    }),
+    (err) =>
+      /burst cache \(#716\)/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message) &&
+      // Never blamed on the snapshot: naming the wrong layer sends the user to reconnect
+      // when all they had to do was wait out a 1.5s TTL.
+      !/LAST-OBSERVED schema snapshot/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — a cached [] is not the server answering");
+});
+
+test("#716 × #1126: a cache hit is RE-ASKED, and a live empty answer authorizes the write", async () => {
+  // Failing closed on every cache hit would refuse writes 2..N of an ordinary burst — the
+  // exact multi-widget case this fix exists to serve. So the fallback drops the cache and
+  // re-asks ONCE. The re-ask is what must flip the provenance; the write follows from that.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let refetched = 0;
+  let provenance = "cache";
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => provenance,
+    // ONE capability naming the outcome the ladder needs, so the cache decides how to get a
+    // fresh answer without a global invalidation that would disturb concurrent writers.
+    refetchObjectInfoLive: async () => {
+      refetched += 1;
+      provenance = "live";
+      return starObjectInfo([]);
+    },
+  });
+  assert.equal(refetched, 1, "the forced reread happens exactly once");
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1126: a verdict that EXPIRES during the recovery awaits does not authorize the write", async () => {
+  // Round-5's defect, and a different species from rounds 1-4. Those asked "what KIND of
+  // response is this"; this asks "is that still TRUE". The initial /object_info read is
+  // genuinely live — and then definitions change while `refreshCombos` and the upload probe
+  // are AWAITED. A stored "live" string keeps insisting otherwise, so the blind write is
+  // authorized from a schema that has since been superseded, bypassing a list that may have
+  // become non-empty in exactly that window.
+  //
+  // The panel therefore threads `provenanceNow`, a QUESTION rather than an answer, and the
+  // lib asks it after those awaits. Modelled here by a provenance that is live at the first
+  // read and retired by the time the ladder decides.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let refreshed = false;
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      // The refresh is what supersedes the schema — exactly what registerComfyNodeDefs does
+      // on an install, a download completing, or an explicit refresh.
+      refreshCombos: async (...args) => {
+        const out = refreshFromServer(...args);
+        refreshed = true;
+        return out;
+      },
+      // LIVE at delivery; RETIRED once the refresh above has run. Re-asked, this tells the
+      // truth; remembered, it does not.
+      schemaProvenance: () => (refreshed ? "retired" : "live"),
+      // No re-ask capability wired, so the ladder must fail closed rather than paper over it.
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(refreshed, true, "the recovery await really did run before the decision");
+  assert.equal(widget.value, "", "fails closed — the verdict had expired by the time it was used");
+});
+
+test("#716 × #1126: a re-ask that finds a REAL list refuses instead of writing blind", async () => {
+  // The hole the re-ask exists to find: the cached `[]` was stale and the server does publish
+  // a list for this input. Good provenance must not become permission to write past the very
+  // answer that was just fetched to check it.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let provenance = "cache";
+  const res = runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => provenance,
+    refetchObjectInfoLive: async () => {
+      provenance = "live";
+      // The model finished downloading while the node's own callback kept failing.
+      return starObjectInfo(["qwen3-vl:8b"]);
+    },
+  });
+  await assert.rejects(
+    res,
+    (err) =>
+      /the live re-read NO LONGER declares it empty/.test(err.message) &&
+      // The refusal must state the OBSERVATION and name the possibilities, not pick one.
+      // `serverDeclaresEmptyComboOptions` returning false is equally true when the server
+      // publishes a real list and when it stops describing this input at all — asserting
+      // the first as fact is the same over-claim this PR exists to remove.
+      /either it now publishes a real option list for this input, or it no longer/.test(err.message) &&
+      !/produced one that DOES publish a list/.test(err.message) &&
+      /panel_set_widget refused "model"/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no blind write once the premise no longer holds");
+});
+
+test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", async () => {
+  // The other half: this must fail closed on stale evidence WITHOUT disabling the fallback
+  // for the live case it exists to serve. Only the provenance differs between the two tests.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => "live",
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is not a live one", async () => {
+  // A provenance probe that throws has established nothing, and "nothing established" must
+  // not read as "live". The default (no probe wired at all) is the pre-#716/#1223 world,
+  // where the oracle had neither a cache nor a snapshot branch to take and could only ever
+  // have fetched, so it stays permissive — that is the case every other test here exercises.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => {
+        throw new Error("provenance unknown");
+      },
+    }),
+    (err) => /provenance could not be established at all/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation when provenance could not be established");
+});
+
+test("#1126: a PARTIAL write is never reworded into a 'refused' frame", async () => {
+  // Every `panel_set_widget refused …` message asserts more than the text it wraps: that
+  // nothing was applied, so the caller may retry or give up freely. Exactly one
+  // WidgetWriteError breaks that — the one raised AFTER the graph was mutated and the
+  // rollback failed to restore it. Reporting THAT as a refusal tells the caller "nothing
+  // happened" about a graph now in a partial state, which is the class of false report this
+  // whole change exists to eliminate.
+  //
+  // Driven through the REAL ladder: the value is refused by the widget's own callback after
+  // the write lands, and the rollback is defeated by a value setter that refuses to restore.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: ["a.fbx"] }, value: "a.fbx" };
+  let landed = false;
+  Object.defineProperty(widget, "value", {
+    configurable: true,
+    get: () => (landed ? "STUCK" : "a.fbx"),
+    set: () => {
+      // Accepts nothing: the write cannot verify, and the rollback cannot restore either.
+      landed = true;
+    },
+  });
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [widget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  await assert.rejects(
+    runSetWidget(node, "model", "a.fbx", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["a.fbx"]),
+      wasTypeEverDefined: () => true,
+      ...HOOKS,
+    }),
+    (err) =>
+      // The write's own partial-state warning reaches the caller intact…
+      /partial state/.test(err.message) &&
+      // …and is NOT dressed up as a refusal, which would claim nothing was applied.
+      !/panel_set_widget refused/.test(err.message),
+  );
+});
+
+test("#1126: a stateful callback that finally answers [] takes #507's acceptance, not a refusal", async () => {
+  // `options.values` is a callback and can answer differently per call. If it throws on the
+  // initial read and on the refreshed read but returns [] on the FINAL one, only the
+  // unreadable acceptance was enabled — so coercion fell through to #507's empty-list branch,
+  // raised a RETRYABLE emptyOptions rejection, and refused with "the server's option list may
+  // simply be stale, refreshing it before deciding" at the end of a ladder that had already
+  // refreshed it. By that point the LIVE server schema has ALREADY confirmed the list empty,
+  // which is #507's own precondition, so this is a valid transition being rejected.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let reads = 0;
+  widget.options.values = () => {
+    reads += 1;
+    // Throws for every read the ladder makes before the final write attempt.
+    if (reads < 3) throw new Error("ollama not reachable");
+    return [];
+  };
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => "live",
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`, "the write lands");
+  // Pins the ladder shape this test depends on: the list is UNREADABLE for the initial read
+  // and for the post-refresh retry — so the #1126 branch is the one reached — and answers []
+  // only on the final write attempt. If the ladder ever reads a different number of times,
+  // this fails loudly instead of quietly covering the #507 branch instead.
+  assert.equal(reads, 3, "throws on the initial read and the post-refresh retry, [] on the final write");
+  // Reported as what ACTUALLY admitted it, decided at coercion time — an empty list really
+  // was read on the attempt that counted, so this is #507's outcome and says so.
+  assert.equal(res.empty_option_list, true, "#507's acceptance, named as #507's");
+  assert.equal(res.option_list_unreadable, undefined, "not claimed as an unreadable-list write");
+});
+
+test("#1126 e2e: the reply note does not claim 'nothing checked it' when the RAIL did", async () => {
+  // End-to-end through the real ladder: a SINGLE-HOP promotion (so the nested refusal below
+  // does not apply), inner list unreadable, parent rail's list readable and containing the
+  // value. The sibling cross-check compares against that rail and proceeds only on
+  // membership — so the reply must scope its "unvalidated" claim to the widget it is about.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const UUID = "33333333-3333-4333-8333-333333333333";
+  const innerWidget = { name: "model", type: "combo", options: { values: THROWS }, value: "" };
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [innerWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const rail = { name: "model_alias", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: UUID };
+  ctor.comfyClass = UUID;
+  reg[UUID] = ctor;
+  const outer = {
+    id: 320,
+    type: UUID,
+    constructor: ctor,
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [{ name: "model_alias", _widget: rail, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [rail],
+  };
+  const res = await runSetWidget(outer, "model_alias", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+    resolveSource: (_n, si) =>
+      si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null,
+    ...HOOKS,
+  });
+  assert.equal(rail.value, "qwen3-vl:8b");
+  assert.equal(innerWidget.value, "qwen3-vl:8b");
+  assert.equal(res.option_list_unreadable, true, "the inner widget's own list still went unread");
+  assert.equal(res.promoted_rail_validated, true, "…but the rail's list vouched for the value");
+  assert.match(res.option_list_unreadable_note, /NOT written entirely unchecked/);
+  assert.match(res.option_list_unreadable_note, /rail widget, whose option list WAS readable/);
+  assert.doesNotMatch(res.option_list_unreadable_note, /Nothing compared your value to anything/);
+});
+
+// ── #1126: a NESTED promotion is refused, not blind-written ──────────────────────────
+//
+// The rejection this fallback answers describes the IMMEDIATE promoted projection. On a
+// nested chain the value is driven on into a DEEPER concrete widget this path never read,
+// whose own client-populated list may be perfectly readable — so the premise "the valid set
+// is not knowable from here" is not established. Refusing is the deliberate choice over
+// validating the concrete widget: see the refusal's own comment for why.
+
+test("#1126: the unreadable fallback REFUSES a nested promotion rather than writing blind", async () => {
+  // outer SubgraphNode → intermediate SubgraphNode → concrete node. The widget the ladder
+  // reads is the intermediate's projection (unreadable); the concrete widget below it has a
+  // perfectly readable list that nothing on this path ever consulted.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  // Registered exactly as ComfyUI_frontend's registerSubgraphNodeDef builds them: the type
+  // is the subgraph's UUID (never in /object_info) and the class carries the synthesized
+  // nodeDef, so the #458/#512 authorization treats them as real containers rather than as
+  // an uninstalled pack.
+  const container = (uuid, id, widget, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: widget.name, _widget: widget, widget: { name: widget.name }, _subgraphSlot: { name: widget.name } }],
+      widgets: [widget],
+    };
+  };
+  const MID_UUID = "11111111-1111-4111-8111-111111111111";
+  const OUTER_UUID = "22222222-2222-4222-8222-222222222222";
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container(MID_UUID, 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container(OUTER_UUID, 320, outerWidget, mid, "301");
+  const resolveSource = (_node, subgraphInput) => {
+    if (subgraphInput?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+    if (subgraphInput?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+    return null;
+  };
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      // A virtual SubgraphNode's type is its subgraph UUID and is NEVER in /object_info by
+      // design, so it must not read as a since-REMOVED backend type (#458) — only the
+      // concrete node at the end of the chain was ever backend-defined.
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model_alias" on node 320/.test(err.message) &&
+      /NESTED promotion/.test(err.message) &&
+      /may be readable/.test(err.message) &&
+      /panel_enter_subgraph/.test(err.message),
+  );
+  assert.equal(concreteWidget.value, "", "the concrete widget is untouched");
+  assert.equal(midWidget.value, "", "the intermediate projection is untouched");
+  assert.equal(outerWidget.value, "", "the outer rail is untouched");
+});
+
+// ---- #1523: panel_add_node of a loaded subgraph UUID is not an unknown backend
+//      node, and must never name an unrelated failed pack. ----------------------
+
+const SAM3_UUID = "6e7ab3ea-96aa-470f-9b94-3d9d0e01f481";
+
+function uuidSubgraphCtor(uuid) {
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: uuid };
+  ctor.comfyClass = uuid;
+  return ctor;
+}
+
+function addOptsForSubgraph(reg, { rootGraph, readImportFailures } = {}) {
+  return {
+    getFreshObjectInfo: async () => objectInfo(),
+    refresh: async () => {},
+    wasTypeEverDefined: () => false,
+    getRootGraph: () => rootGraph,
+    readImportFailures:
+      readImportFailures ?? (async () => ["comfyui-reactor-node"]),
+  };
+}
+
+test("#1523 isSubgraphUuidType: RFC-4122 only", () => {
+  assert.equal(isSubgraphUuidType(SAM3_UUID), true);
+  assert.equal(isSubgraphUuidType("KSampler"), false);
+  assert.equal(isSubgraphUuidType("SubgraphBlueprint.Image Segmentation (SAM3)"), false);
+  assert.equal(isSubgraphUuidType(""), false);
+  assert.equal(isSubgraphUuidType(null), false);
+});
+
+test("#1523 subgraphTypeIsLoaded: registry Map, nested instance, fail-closed", () => {
+  const sub = { id: SAM3_UUID, _nodes: [] };
+  const root = { subgraphs: new Map([[SAM3_UUID, sub]]), _nodes: [] };
+  assert.equal(subgraphTypeIsLoaded(root, SAM3_UUID), true);
+
+  const nested = {
+    _nodes: [{ type: SAM3_UUID, subgraph: { id: SAM3_UUID, _nodes: [] } }],
+  };
+  assert.equal(subgraphTypeIsLoaded(nested, SAM3_UUID), true);
+
+  assert.equal(subgraphTypeIsLoaded({ _nodes: [] }, SAM3_UUID), false);
+  assert.equal(subgraphTypeIsLoaded(null, SAM3_UUID), false);
+  assert.equal(subgraphTypeIsLoaded(root, "KSampler"), false);
+});
+
+test("#1523 add_node: loaded + registered SAM3 UUID is ADDABLE on a healthy backend that never lists it", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [{ id: 1, type: SAM3_UUID }],
+  };
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, addOptsForSubgraph(reg, { rootGraph })),
+  );
+});
+
+test("#1523 add_node: the same UUID without a live definition is refused as a subgraph, not a missing pack", async () => {
+  const reg = loadedRegistry();
+  const err = await assertAddNodeResolvableRefreshing(
+    () => reg,
+    SAM3_UUID,
+    addOptsForSubgraph(reg, { rootGraph: { _nodes: [] } }),
+  ).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an unloaded subgraph UUID must still be refused");
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: false, registered: false }),
+  );
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+  assert.doesNotMatch(err.message, /Unknown node type/);
+  assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+});
+
+test("#1523 add_node: loaded but UNREGISTERED UUID is refused with copy-instance advice, never a pack note", async () => {
+  const reg = loadedRegistry(); // SAM3 class not registered — createNode would mint a placeholder
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [{ id: 1, type: SAM3_UUID }],
+  };
+  const err = await assertAddNodeResolvableRefreshing(
+    () => reg,
+    SAM3_UUID,
+    addOptsForSubgraph(reg, { rootGraph }),
+  ).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an unregistered class must still be refused");
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: true, registered: false }),
+  );
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+});
+
+test("#1523 add_node: the exemption requires the ever-seen oracle, like the frontend-only one", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [],
+  };
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+        getFreshObjectInfo: async () => objectInfo(),
+        getRootGraph: () => rootGraph,
+        // wasTypeEverDefined deliberately omitted
+      }),
+    (err) => {
+      assert.equal(
+        err.message,
+        subgraphUuidAddRefusal(SAM3_UUID, { loaded: true, registered: true }),
+      );
+      return true;
+    },
+  );
+});
+
+test("#1523 add_node: an EVER-SEEN (removed) UUID still fails closed — the trust root is not bypassed", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [],
+  };
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+        getFreshObjectInfo: async () => objectInfo(),
+        wasTypeEverDefined: (t) => t === SAM3_UUID,
+        getRootGraph: () => rootGraph,
+      }),
+    /defined this node type earlier this session|removed/i,
+  );
+});
+
+test("#1523 add_node: isLoadedSubgraphType override is the positive proof, even without a graph", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+      getFreshObjectInfo: async () => objectInfo(),
+      wasTypeEverDefined: () => false,
+      isLoadedSubgraphType: (t) => t === SAM3_UUID,
+      readImportFailures: async () => ["comfyui-reactor-node"],
+    }),
+  );
+});
+
+test("#1523 add_node: a throwing isLoadedSubgraphType fails closed rather than authorizing", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const err = await assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+    getFreshObjectInfo: async () => objectInfo(),
+    wasTypeEverDefined: () => false,
+    isLoadedSubgraphType: () => {
+      throw new Error("graph unreadable");
+    },
+    readImportFailures: async () => ["comfyui-reactor-node"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: false, registered: true }),
+  );
+  assert.doesNotMatch(err.message, /graph unreadable/);
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+});
+
+// ── mcp#1940 ─────────────────────────────────────────────────────────────────
+// The V2 combo spec. Everything above declares combos in the V1 shape
+// `[[opt, ...], config]`, where the option array IS `spec[0]`. A live ComfyUI 0.33
+// /object_info publishes 676 inputs in the V2 shape instead —
+// `["COMBO", { options: [...] }]` — with the literal type string "COMBO" at
+// `spec[0]` and the list under the config object. `serverDeclaresEmptyComboOptions`
+// tested `Array.isArray(spec[0])`, so every V2 combo was filed as "not a combo" and
+// the #507 accept could never be reached: measured 0 of 11 server-declared-empty V2
+// inputs recognised, against 30 of 30 V1.
+//
+// The reported node is verbatim from that rig:
+//     "choice": ["COMBO", { "multiselect": false, "options": [] }]
+// which made `CustomCombo.choice` permanently unwritable, blamed on a STALE list that
+// no refresh could ever change.
+function customComboFixture(liveOptions = []) {
+  const reg = loadedRegistry(["CustomCombo"]);
+  const widget = { name: "choice", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 816, type: "CustomCombo", widgets: [widget], constructor: reg["CustomCombo"] };
+  return { reg, node, widget };
+}
+// /object_info in which CustomCombo's `choice` is declared in the V2 shape.
+function customComboObjectInfo(config) {
+  const info = objectInfo(["CustomCombo"]);
+  info["CustomCombo"] = { input: { required: { choice: ["COMBO", config] } } };
+  return info;
+}
+
+test("mcp#1940 e2e: a V2 combo whose SERVER option list is empty becomes writable", async () => {
+  const { reg, node, widget } = customComboFixture([]);
+  const res = await runSetWidget(node, "choice", "Default", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => customComboObjectInfo({ multiselect: false, options: [] }),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "Default");
+  assert.equal(widget.value, "Default", "the write reached the live widget");
+  assert.equal(res.empty_option_list, true, "reported honestly as an unvalidatable empty list");
+});
+
+test("mcp#1940 e2e: a V2 combo with a REAL server list is still validated STRICTLY", async () => {
+  // The fix must not turn "V2" into a blanket accept. A V2 spec that publishes a real
+  // list is refreshed and enforced exactly like V1: a member lands, a non-member is
+  // refused and nothing is written.
+  const config = { multiselect: false, options: ["Quality", "Default", "Turbo"] };
+  const ok = customComboFixture([]);
+  const res = await runSetWidget(ok.node, "choice", "Turbo", {
+    registry: ok.reg,
+    getRegistry: () => ok.reg,
+    getFreshObjectInfo: async () => customComboObjectInfo(config),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(ok.widget.value, "Turbo");
+  assert.notEqual(res.empty_option_list, true, "a real list is not the empty-list path");
+
+  const bad = customComboFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(bad.node, "choice", "Nonexistent", {
+        registry: bad.reg,
+        getRegistry: () => bad.reg,
+        getFreshObjectInfo: async () => customComboObjectInfo(config),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option|refused/i,
+  );
+  assert.equal(bad.widget.value, "", "an off-list value is still refused (#240 intact)");
+});
+
+test("mcp#1940: serverDeclaresEmptyComboOptions reads the V2 shape, and still refuses to guess", () => {
+  const defs = {
+    T: {
+      input: {
+        required: {
+          v2empty: ["COMBO", { multiselect: false, options: [] }],
+          v2full: ["COMBO", { options: ["a", "b"] }],
+          // The list is a SEPARATE fetch that has not landed. Unread is not empty.
+          v2remote: ["COMBO", { remote: { route: "/internal/files/output" } }],
+          // The keys select SUB-INPUTS to materialize; they are not an option list.
+          v3dynamic: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png" }] }],
+          v1empty: [[], {}],
+          v1full: [["a"], {}],
+          notacombo: ["STRING", {}],
+        },
+        optional: { v2optEmpty: ["COMBO", { options: [] }] },
+      },
+    },
+  };
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2optEmpty"), true, "optional inputs count too");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2full"), false);
+  // Both of these are "could not read the list", which must fail CLOSED — never be
+  // mistaken for the server declaring the list empty.
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2remote"), false, "an unlanded remote list is not an empty one");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v3dynamic"), false, "dynamic V3 keys are not an option list");
+  // V1 and non-combo behaviour is unchanged.
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v1empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v1full"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "notacombo"), false);
+});
+
+// The REPORTED shape end-to-end: a subgraph instance promoting a V2 empty COMBO.
+// mcp#1940 was filed as a promoted-widget bug — "cannot set ANY promoted COMBO on a
+// subgraph node" — so a fix for the combo SHAPE has to be shown to clear the actual
+// reported scenario, not just a bare node. The promotion resolves to the concrete
+// inner CustomCombo (`followPromotionToConcrete`), which is the type whose def the
+// empty-list gate reads; before the fix that read said "not a combo" and the write
+// was refused with a stale-list message no refresh could clear.
+function promotedCustomComboFixture() {
+  const inner = {
+    id: 795,
+    type: "CustomCombo",
+    // Empty live list — nothing for the parent rail to project either.
+    widgets: [{ name: "choice", type: "combo", options: { values: [] }, value: "" }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "795" ? inner : null) };
+  const railWidget = { name: "mode", type: "combo", options: { values: [] }, value: "" };
+  const parent = {
+    id: 816,
+    // The synthetic subgraph UUID from the report — never in /object_info, and never
+    // looked up: the promotion is traversed to the inner type instead.
+    type: "6c697765-ebd7-4e1e-8af0-d84d620be471",
+    subgraph,
+    inputs: [{ name: "mode", _widget: railWidget, _subgraphSlot: { name: "mode" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "mode" ? { sourceNodeId: "795", sourceWidgetName: "choice" } : null;
+  return { parent, inner, resolveSource };
+}
+
+test("mcp#1940 e2e: a PROMOTED V2 empty combo on a subgraph instance is settable from the parent", async () => {
+  const reg = loadedRegistry(["CustomCombo"]);
+  reg["6c697765-ebd7-4e1e-8af0-d84d620be471"] = reg["SubgraphNode"] ?? function SubgraphNode() {};
+  const { parent, inner, resolveSource } = promotedCustomComboFixture();
+  const fresh = objectInfo(["CustomCombo"]);
+  fresh["CustomCombo"] = { input: { required: { choice: ["COMBO", { multiselect: false, options: [] }] } } };
+  const res = await runSetWidget(parent, "mode", "Default", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => fresh,
+    // The UUID was NEVER a backend type — it is a subgraph. Answering `true` here
+    // would claim its absence from /object_info means an uninstalled pack (#458).
+    wasTypeEverDefined: (t) => t === "CustomCombo",
+    refreshCombos: refreshFromServer,
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "Default");
+  assert.equal(res.set.promoted_from.inner_node_id, 795, "resolved through the promotion, not the UUID");
+  assert.equal(
+    inner.widgets.find((w) => w.name === "choice").value,
+    "Default",
+    "the value reached the inner widget the rail projects",
   );
 });

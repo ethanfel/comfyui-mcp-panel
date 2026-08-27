@@ -29,6 +29,235 @@ export function shouldResumeAfterComfyReconnect({
   return Boolean(rebootPending || autoConnect || hasResumableSession);
 }
 
+// #654 — may this ComfyUI `reconnected` re-advertise the tab's bridge route?
+//
+// The gate above is the RESUME decision and its `if (bridgeConnected) return false`
+// is #278's: a benign ComfyUI WS blip must never bounce or respawn a live agent
+// session. That guard is not relaxed here — this is a SECOND, cheaper action on
+// the branch the resume declines, and the two are mutually exclusive by
+// construction (resume needs the bridge DOWN, this needs it UP).
+//
+// Why that branch needed one at all. The pack is pure-frontend and can no longer
+// spawn the orchestrator (`externalOrchestratorMode()` is hardcoded true), so the
+// orchestrator ALWAYS survives a ComfyUI restart now and the bridge socket never
+// closes. The panel re-registers its bridge route only by sending a `hello`, and
+// on this path nothing sends one: `connectAgent()` cannot, because `connect()`
+// early-returns on an already-OPEN socket, and no socket `open` handler fires.
+// The tab therefore sits on a live socket it never re-announced — the
+// orchestrator's post-restart watch waits for a strictly NEWER hello generation
+// that will never arrive, so the restart reply's tab-reconnected and
+// graph-tools-ready flags both stay false after every successful restart, with a
+// manual browser refresh as the only recovery.
+//
+// This is the same non-destructive repair `shouldRehelloAfterCommand` already
+// ships for `free_vram` (#310) — re-advertise the route — but triggered by the
+// `reconnected` event rather than a command reply, because at `comfy_reboot`
+// reply time ComfyUI is on its way DOWN and a hello then is useless.
+//
+// A landed hello is NOT a cheap frame, which is what every input below is for.
+// It bumps the agent-session epoch (discarding #291's canvas-tool proof), draws
+// a fresh `ready` ack (which drives #585's post-restart resume), and runs the
+// orchestrator's panel sync. After a real restart all three are exactly what is
+// wanted — they are what the socket-drop path does — but firing them on every
+// benign blip is the #1138 false-nudge harm. So:
+//
+//   - `bridgeConnected` false → the socket dropped, and its own `open` handler
+//     already sends a hello. A second one here is two greetings and two ready
+//     acks for one outage.
+//   - `helloLandedSinceOutage` → a hello reached the wire since this outage
+//     began (a bridge drop that reconnected FIRST), so the tab is already
+//     re-registered. Measured from hellos that provably landed, never from ones
+//     the panel meant to send.
+//   - `alreadyReadvertised` → one-shot per outage; `reconnected` can repeat.
+//   - `outageMs` → the elapsed interval is the ONLY thing separating a real
+//     restart from a WS blip (asset view, image check, tab refocus). Same
+//     reasoning and same default threshold as `shouldNudgeAfterMidTaskReconnect`
+//     below; deliberately one number, not a second one to keep in sync. A
+//     persisted `comfy_reboot` marker is delivery state, not proof for this
+//     outage, so it cannot bypass this gate unless a current outage-correlated
+//     proof is added here.
+//
+// A duration, not a timestamp to subtract from `now`, for #1145's reason: the
+// caller measures the interval once and a duration cannot be silently reread as
+// "time since the last drop, whenever that was". Absent, zero, negative or
+// unreadable all mean no outage was measured, and no measured outage means no
+// re-advertise — the safe direction, since a missed re-advertise leaves the tab
+// exactly as wedged as it is today while an invented one re-greets a live agent.
+export function shouldReadvertiseAfterComfyRestart({
+  bridgeConnected = false,
+  outageMs = 0,
+  helloLandedSinceOutage = false,
+  alreadyReadvertised = false,
+  minOutageMs = 6000,
+} = {}) {
+  if (!bridgeConnected) return false;
+  if (helloLandedSinceOutage) return false;
+  if (alreadyReadvertised) return false;
+  if (typeof outageMs !== "number" || !Number.isFinite(outageMs)) return false;
+  if (outageMs <= 0) return false;
+  if (typeof minOutageMs !== "number" || !Number.isFinite(minOutageMs)) return false;
+  return outageMs >= minOutageMs;
+}
+
+/**
+ * #1790 — account for a restart re-advertisement only after its hello landed.
+ *
+ * `sendHello()` is asynchronous: it may wait for the tab-identity lease, be
+ * deferred behind in-flight bridge commands, or be superseded by a socket
+ * change. A caller that marks the outage handled before that promise resolves
+ * can permanently suppress the only hello that would restore graph-tool
+ * routing. Keep the in-flight claim separate from the landed watermark, and
+ * let the completion callback prove that it still belongs to the reconnect
+ * epoch that requested it.
+ *
+ * This helper deliberately does not retry a failed hello itself. The bridge
+ * client owns the socket/route retry paths; this state machine only prevents a
+ * failed attempt from becoming false proof, and coalesces duplicate events
+ * while one attempt is still resolving.
+ */
+export function createRestartReadvertiseController() {
+  let landedOutageSeq = 0;
+  let inFlight = null;
+
+  const validSeq = (value) => Number.isSafeInteger(value) && value > 0;
+
+  return {
+    /** True only for a hello that landed, or one already resolving for this outage. */
+    isReadvertised(outageSeq) {
+      return landedOutageSeq === outageSeq || inFlight?.outageSeq === outageSeq;
+    },
+
+    /**
+     * Start or join the one hello for an outage. The returned promise always
+     * resolves to a boolean and never lets a send failure escape the reconnect
+     * lifecycle.
+     */
+    attempt({ outageSeq, reconnectEpoch, isCurrent, send } = {}) {
+      if (!validSeq(outageSeq) || !Number.isSafeInteger(reconnectEpoch) || reconnectEpoch < 0) {
+        return Promise.resolve(false);
+      }
+      if (landedOutageSeq === outageSeq) return Promise.resolve(true);
+      if (inFlight?.outageSeq === outageSeq) return inFlight.promise;
+
+      let result;
+      try {
+        result = typeof send === "function" ? send() : false;
+      } catch {
+        result = false;
+      }
+      const promise = Promise.resolve(result).then(
+        (sent) => sent === true,
+        () => false,
+      );
+      const record = { outageSeq, reconnectEpoch, promise };
+      inFlight = record;
+      void promise.then((sent) => {
+        if (inFlight === record) inFlight = null;
+        let current = true;
+        try {
+          current = typeof isCurrent !== "function" || isCurrent() === true;
+        } catch {
+          current = false;
+        }
+        // A late result from an older reconnect must not mint proof for the
+        // current outage. A failed result never advances the watermark.
+        if (sent && current) landedOutageSeq = outageSeq;
+      });
+      return promise;
+    },
+  };
+}
+
+// #654 — the accounting that produces the `outageMs` above, for ComfyUI's OWN
+// backend socket (the bridge has its own tracker, `createBridgeOutageTracker`
+// below; the two measure different connections and must not be conflated).
+//
+// It lives here, as a tracker over injected time, for the same reason that one
+// does: the defect it guards against is a SEQUENCE, and only a sequence can
+// demonstrate it. ComfyUI announces a drop as `reconnecting` AND as a null
+// `status` payload, and a frontend can emit several before it comes back — so
+// the FIRST one opens the outage and every one after it belongs to the same
+// outage. A tracker that re-stamped on each would measure the gap between the
+// last two signals instead of the restart, which is #1145 exactly: a 26-second
+// restart read as a three-second blip and the recovery withheld.
+//
+// It also carries the two facts the caller needs to make the decision ONCE per
+// outage rather than once per event:
+//
+//   seq()          — identity of the current outage, advanced when one OPENS, so
+//                    it is stamped strictly before any `reconnected` reader can
+//                    run whatever order the listeners were registered in. 0 means
+//                    no outage has ever opened, which lets a caller's "already
+//                    handled" watermark start at 0 with no second sentinel.
+//   helloBaseline()— the landed-hello count at the moment the outage opened, so
+//                    a bridge that dropped and re-helloed DURING the outage is
+//                    distinguishable from one that stayed up throughout.
+export function createComfyBackendOutageTracker({ now = () => Date.now() } = {}) {
+  // NULL while the backend socket is up, never 0: the panel measures on
+  // `monotonicNow()` (performance.now), whose origin is page load, so an early
+  // enough drop genuinely stamps a near-zero value. A falsy-0 sentinel would read
+  // that as "no outage open" and every later signal would re-stamp it — #1138's
+  // mistake, a sentinel sharing a value with real data.
+  let startedAt = null;
+  let lastOutageMs = 0;
+  let outageSeq = 0;
+  let baseline = 0;
+  const readClock = () => {
+    const t = now();
+    return typeof t === "number" && Number.isFinite(t) ? t : null;
+  };
+  return {
+    /** A backend down signal. `landedHellos` is the caller's count of hellos that
+     *  provably reached the wire, captured as this outage's baseline. */
+    noteDown(landedHellos = 0) {
+      if (startedAt !== null) return; // inside an outage already — not a new one
+      const t = readClock();
+      // An unreadable clock cannot open an outage. Nothing is stamped, so the
+      // reconnect measures no outage and withholds the re-advertise — the safe
+      // direction: a missed one leaves the tab exactly as it is today, an
+      // invented one re-greets a live agent.
+      if (t === null) return;
+      startedAt = t;
+      outageSeq += 1;
+      baseline =
+        typeof landedHellos === "number" && Number.isFinite(landedHellos) ? landedHellos : 0;
+    },
+    /** The backend socket is back. Closes the outage and records its duration. */
+    noteUp() {
+      if (startedAt === null) {
+        // Ended no outage — records nothing rather than inheriting the previous
+        // one as if it were this reconnect's.
+        lastOutageMs = 0;
+        return;
+      }
+      const t = readClock();
+      // An outage whose end could not be timed measured nothing; closing it with
+      // a stale duration would credit this reconnect with the last one's.
+      lastOutageMs = t === null ? 0 : Math.max(0, t - startedAt);
+      startedAt = null;
+    },
+    /** The outage this reconnect ended, in ms (0 = none).
+     *
+     *  Reads LIVE while the outage is still open, so the answer does not depend
+     *  on whether the listener that closes it happened to run first. Two
+     *  listeners on one event, registered at different times: an ordering
+     *  assumption there is what #1327 recurred on. Both orders agree here. */
+    outageMs() {
+      if (startedAt !== null) {
+        const t = readClock();
+        return t === null ? 0 : Math.max(0, t - startedAt);
+      }
+      return lastOutageMs;
+    },
+    seq() {
+      return outageSeq;
+    },
+    helloBaseline() {
+      return baseline;
+    },
+  };
+}
+
 // #310 — free_vram can bounce the ComfyUI connection (models unloaded, the WS
 // blips), which drops the orchestrator's tab mapping the way a restart does.
 // Re-advertise (rehello) this tab after a successful free_vram so the very next
@@ -83,6 +312,15 @@ export function shouldRehelloAfterCommand(cmd, reply) {
 // `outageMs` is therefore required to be a positive, finite number of milliseconds:
 // absent, zero, negative or unreadable all mean no outage was measured, and no outage
 // means no nudge.
+//
+// #1168 deliberately did NOT add a second input here. The wedge it fixes is an outage
+// this predicate never got to see, not a case the threshold judges wrongly, so it is
+// fixed by opening that outage (see `noteAgentGone` on the tracker below) rather than by
+// letting a caller's conclusion outrank the clock. A first draft did the latter and was
+// rejected in review: the panel cannot tell "the orchestrator died" from "my own socket
+// went stale while it kept working" — both are an open socket that answers nothing — and
+// a bypass would have nudged a live agent mid-turn on the second. The elapsed interval
+// is what separates them, so it stays the sole gate.
 export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6000 } = {}) {
   if (typeof outageMs !== "number" || !Number.isFinite(outageMs)) return false;
   // Not `> 0` by accident: a measured outage is a real elapsed duration, so a
@@ -113,6 +351,9 @@ export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6
 //     outage ENDS and its duration is finally known. A handshake with no outage open is
 //     a re-advertise on a live socket (#310 does one after every free_vram) and records
 //     nothing rather than inheriting the previous outage as if it were its own.
+//   noteAgentGone()     — the panel CONCLUDED the agent behind the bridge socket is gone.
+//     Opens an outage exactly as a close does, and is a separate event only because the
+//     DECISION differs: a close is observed, this is concluded. See its body.
 //   noteTurnStarted()   — a new agent turn began, so outages that ended before it are no
 //     longer evidence about the turn now running. This is what stops a real but settled
 //     drop from being re-read later as this turn's — the #1138 defect with a stale
@@ -141,6 +382,40 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // An unreadable clock cannot start an outage. Leaving startedAt null means the
       // handshake records no duration, so the nudge is withheld — the safe direction:
       // a missed nudge leaves an idle agent, an invented one derails a working agent.
+      if (t !== null) startedAt = t;
+    },
+    // #1168 — the panel CONCLUDED the agent behind the bridge socket is gone, so the
+    // outage starts HERE.
+    //
+    // A wedged orchestrator holds its connection OPEN and answers nothing, so the close
+    // listener never runs. The outage it caused is therefore not merely mismeasured, it
+    // is never opened at all — and when the wedged process finally dies the clock starts
+    // from that moment, so a user who restarts it promptly measures the RESTART. Minutes
+    // with no agent behind the socket are weighed as a three-second blip and the turn the
+    // wedge killed is never resumed.
+    //
+    // Same body as noteBridgeClosed above, and a separate method for the DECISION, not
+    // the effect. That name means "a socket closed" — an observation. This one is a
+    // conclusion the panel reaches after a bounded ladder of cold-start windows and
+    // redials, and it is a conclusion only its caller can be trusted to have earned.
+    // Keeping it separate is what stopped the two rejected attempts from being spelled
+    // as this one: they stamped an outage in the shared teardown helper (~17 call sites,
+    // most of them a LIVE orchestrator being re-pointed) and in the handshake REDIAL,
+    // whose own doc calls it the agent-not-ready-YET case.
+    //
+    // What it deliberately does NOT do is exempt the death from the threshold. The panel
+    // cannot distinguish "the orchestrator died" from "my own socket went stale while it
+    // kept working" — a half-open TCP after a sleep, a NAT idle-kill or a VPN flap looks
+    // identical from here — so a conclusion is evidence that an outage BEGAN, never that
+    // it was long enough to have killed the turn. The elapsed interval is what separates
+    // the two, and it stays the sole gate: a live orchestrator that answers again
+    // moments later measures short and is left alone, while a wedge the user has to
+    // notice and restart by hand cannot be.
+    noteAgentGone() {
+      if (startedAt !== null) return; // already inside an outage — not a new one
+      const t = readClock();
+      // An unreadable clock cannot start an outage; see noteBridgeClosed for why that is
+      // the safe direction.
       if (t !== null) startedAt = t;
     },
     noteHandshake() {
@@ -207,7 +482,8 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // reports no outage rather than a negative one.
       return t === null ? outageMs : Math.max(0, t - startedAt);
     },
-    /** True while the bridge is down — the outage has begun but not yet ended.
+    /** True while the bridge is down — the outage has begun but not yet ended, whether
+     *  a close observed that or #1168's noteAgentGone concluded it.
      *  Read by the tests that pin the open/closed transitions; the panel decides on
      *  outageMs() alone, so this stays a state ACCESSOR and never a second predicate. */
     isDown: () => startedAt !== null,
@@ -518,6 +794,25 @@ export function buildHelloPayload({
     // newer orchestrator fail closed for an older bundle that only fences at
     // initial dispatch.
     enforces_workflow_stamp_at_write: true,
+    // #2107: graph_set_widget honors optional expected_node_type at the
+    // synchronous write boundary, so the orchestrator can fence a node
+    // replacement between its final identity probe and mutation.
+    enforces_expected_node_type_at_write: true,
+    // #2314: graph_set_widget validates an optional promoted subgraph owner and
+    // workflow witness against the LIVE canvas at the same synchronous boundary.
+    enforces_expected_scope_at_write: true,
+    // #2314 P1: the promoted-scope fence also validates the object-keyed live
+    // graph identity, not only graph-local owner/workflow fields.
+    enforces_expected_scope_graph_identity_at_write: true,
+    // #2314 P1: graph_get_subgraph publishes the complete alias -> immediate
+    // -> terminal promotion witness consumed by the orchestrator. This is a
+    // separate capability from the write-boundary fence so an older bundle is
+    // never mistaken for one that can classify renamed promotion aliases.
+    publishes_promoted_terminal_witnesses: true,
+    // #2314 final-rail race: graph_set_widget re-resolves the promoted alias
+    // through the live owner/input relationship immediately before mutation,
+    // so an external/relinked host input cannot permit an inner/shared write.
+    enforces_promoted_parent_rail_at_write: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

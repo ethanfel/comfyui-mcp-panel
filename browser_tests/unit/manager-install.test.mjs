@@ -16,6 +16,7 @@ const {
   buildInstallRequest,
   parseInstalled,
   nodeInstalledMatches,
+  resolveInstalledUpdateId,
   queueDrained,
   isReadableInstalledList,
   queueFailureSignal,
@@ -30,6 +31,7 @@ const {
   searchNodesVia,
   parseObjectInfoSearch,
   objectInfoSearchFallback,
+  SEARCH_LIMIT_CAP,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol, plus author/repo shorthand (#301)", () => {
@@ -214,6 +216,37 @@ test("nodeInstalledMatches accepts a full git URL directly and matches by repo n
   );
   assert.equal(nodeInstalledMatches(undefined, installed), false);
   assert.equal(nodeInstalledMatches("rgthree-comfy", {}), false);
+});
+
+test("#1600 resolves an installed directory to Manager's active_nodes identity", () => {
+  const installed = {
+    "comfyui-minimax-h3-prompt-enhancer-T8": {
+      ver: "nightly",
+      cnr_id: "comfyui-minimax-h3-prompt-enhancer",
+      aux_id: "example/comfyui-minimax-h3-prompt-enhancer",
+      enabled: true,
+    },
+  };
+  assert.equal(
+    resolveInstalledUpdateId("comfyui-minimax-h3-prompt-enhancer-T8", installed),
+    "comfyui-minimax-h3-prompt-enhancer",
+  );
+  assert.equal(
+    resolveInstalledUpdateId("comfyui-minimax-h3-prompt-enhancer", installed),
+    "comfyui-minimax-h3-prompt-enhancer",
+  );
+  assert.equal(resolveInstalledUpdateId("not-installed", installed), null);
+});
+
+test("#1600 uses the aux repository basename for an installed unknown git pack", () => {
+  const installed = {
+    "local-renamed-folder": {
+      ver: "unknown",
+      aux_id: "owner/original-repo",
+      enabled: true,
+    },
+  };
+  assert.equal(resolveInstalledUpdateId("local-renamed-folder", installed), "original-repo");
 });
 
 // --- queueDrained: POSITIVE evidence only (codex round 2 #1) ----------------
@@ -681,7 +714,13 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 // injected budget keeps the test fast WITHOUT touching the timing assertions:
 // verifyInstalled closes over INSTALL_VERIFY_BUDGET_MS, so the factory passes a
 // small stand-in — the drain-loop arithmetic under test is the panel's own.
-function loadVerifyInstalled({ budgetMs, get }) {
+//
+// `fakeTime` ({ now, boundedDelay, abortSignal }) swaps the clock the composed
+// sources read for an injected one (#1246): Date, AbortSignal and boundedDelay
+// arrive as factory parameters, so a test can advance time instead of enduring
+// it and assert on the deadline arithmetic rather than on the wall clock.
+// Without it the real globals are bound and nothing changes.
+function loadVerifyInstalled({ budgetMs, get, fakeTime }) {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
@@ -692,6 +731,7 @@ function loadVerifyInstalled({ budgetMs, get }) {
   assert.ok(delayMatch && waitMatch && verifyMatch,
     "could not locate boundedDelay / waitForQueueDrain / verifyInstalled in panel source");
   const managerGet = async () => { throw new Error("managerGet must not be called (get is always passed)"); };
+  const realBoundedDelay = new Function(`${delayMatch[0]}\nreturn boundedDelay;`)();
   const factory = new Function(
     "queueDrained",
     "classifyInstallOutcome",
@@ -701,7 +741,9 @@ function loadVerifyInstalled({ budgetMs, get }) {
     "MANAGER_FETCH_TIMEOUT_MS",
     "INSTALL_VERIFY_BUDGET_MS",
     "AbortSignal",
-    `${delayMatch[0]}\n${waitMatch[0]}\n${verifyMatch[0]}\nreturn verifyInstalled;`,
+    "Date",
+    "boundedDelay",
+    `${waitMatch[0]}\n${verifyMatch[0]}\nreturn verifyInstalled;`,
   );
   return factory(
     queueDrained,
@@ -711,7 +753,9 @@ function loadVerifyInstalled({ budgetMs, get }) {
     async () => { throw new Error("managerCall must not be called on the v2 dialect"); },
     15000,
     budgetMs,
-    AbortSignal,
+    fakeTime?.abortSignal ?? AbortSignal,
+    fakeTime ? { now: fakeTime.now } : Date,
+    fakeTime?.boundedDelay ?? realBoundedDelay,
   );
 }
 
@@ -720,8 +764,10 @@ test("#671 verifyInstalled (real panel source) answers 'unverified' inside the r
   // scenario: the canvas is responsive, the install is genuinely still running.
   // The installed-list read HANGS (signal-aware): the ONE shared deadline must
   // cap it at whatever budget the drain wait left, not at a fresh 15s.
+  let statusPolls = 0;
   const get = (route, opts) => {
     if (route === "manager/queue/status") {
+      statusPolls += 1;
       return Promise.resolve({ is_processing: true, done_count: 0, total_count: 1 });
     }
     if (route === "customnode/installed") {
@@ -729,17 +775,74 @@ test("#671 verifyInstalled (real panel source) answers 'unverified' inside the r
     }
     return Promise.reject(new Error(`unexpected route ${route}`));
   };
-  const verifyInstalled = loadVerifyInstalled({ budgetMs: 2500, get });
-  const started = Date.now();
-  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", { budgetMs: 2500 });
-  const elapsed = Date.now() - started;
 
-  // The reply must leave the tab WELL inside the orchestrator's 30s window.
-  // Expected ~budget + the ≤1s capped list read. A missing drain budget waits
-  // 120s; a list read on its own fresh 15s timeout (no shared deadline) waits
-  // ~17.5s — both mutants blow this bound. (10s, not tighter: loaded machines
-  // overrun timers — the suite has seen a 5s budget take 10.4s.)
-  assert.ok(elapsed < 10000, `verification outlived its budget (${elapsed} ms)`);
+  // #1246 — this test used to bound the run on the WALL clock (elapsed < 10s
+  // around a 2.5s injected budget). That measured the machine, not the code:
+  // alone it passed in ~3.5s, but inside the loaded full suite the same run
+  // took 18-40s and failed — on branches whose entire diff was markdown. It
+  // now runs on an injected clock, in the style of the drain-wait test above:
+  // boundedDelay's OWN arithmetic advances the fake clock instead of sleeping,
+  // and the fake AbortSignal aborts on the microtask queue — what
+  // classifyInstallOutcome reads is the abort VERDICT, not how long the hang
+  // was endured. What is asserted is the deadline the code computed: the polls
+  // that fit the budget, the delays it was paced with, and the signal cap the
+  // hanging read was handed — the properties the wall-clock bound was a lossy
+  // (and under load, false) proxy for.
+  let now = 0;
+  const delays = [];
+  const timeouts = [];
+  const fakeTime = {
+    now: () => now,
+    // The real boundedDelay's own budget arithmetic (the request capped by
+    // what the deadline leaves), applied to the fake clock rather than slept.
+    boundedDelay: (ms, deadline) => {
+      const wait = Math.max(0, Math.min(ms, deadline - now));
+      delays.push({ ms, wait, remaining: deadline - now });
+      now += wait;
+      return Promise.resolve();
+    },
+    // An abort that fires as soon as it is observed: the hang rejects, the
+    // read classifies as listError — the same verdict the real 1s-capped abort
+    // produces, without the wait. The requested ms is recorded so the shared
+    // deadline's cap on the read is asserted directly.
+    abortSignal: {
+      timeout: (ms) => {
+        timeouts.push(ms);
+        return {
+          addEventListener: (type, cb) => {
+            if (type === "abort") queueMicrotask(cb);
+          },
+        };
+      },
+    },
+  };
+  const verifyInstalled = loadVerifyInstalled({ budgetMs: 2500, get, fakeTime });
+  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", { budgetMs: 2500 });
+
+  // The deadline arithmetic under test: a 2500ms budget is a 1000ms warm-up,
+  // one poll, one 1500ms interval — the loop stops AT the deadline, never past
+  // it. A missing drain budget (the #671 mutant) falls back to the 120s
+  // default: the poll count and the consumed budget both blow up, and this
+  // fails in milliseconds instead of after a 120s stall.
+  assert.equal(statusPolls, 1, "exactly one poll fits a 2500ms budget after the warm-up");
+  assert.deepEqual(
+    delays.map((d) => [d.ms, d.wait]),
+    [[1000, 1000], [1500, 1500]],
+    "one warm-up before the first poll, then the default interval between polls",
+  );
+  assert.ok(
+    delays.every((d) => d.wait <= d.remaining),
+    "every delay is capped by the budget that remains, so it cannot overrun the deadline",
+  );
+  assert.equal(now, 2500, "the drain wait consumed exactly the injected budget and stopped at the deadline");
+  // The hanging list read inherited what the drain wait LEFT of the shared
+  // deadline — nothing — so its signal was the 1000ms floor, not a fresh 15s
+  // (the second #671 mutant: a list read on its own MANAGER_FETCH_TIMEOUT_MS).
+  assert.deepEqual(
+    timeouts,
+    [1500, 1000],
+    "the poll was capped by the remaining budget, the list read by the floor past the shared deadline",
+  );
   // Assert the REASON, not just the state: not-drained is an honest
   // "still in progress", never a fabricated success or failure.
   assert.equal(outcome.state, "unverified");
@@ -860,6 +963,10 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
     "MANAGER_FETCH_TIMEOUT_MS",
     "NODES_INSTALL_COMMAND_BUDGET_MS",
     "AbortSignal",
+    // comfyui-mcp#1606 — the handler correlates its ui_id with the pack, so the
+    // Manager's completion broadcast can name what failed. A real log, not a
+    // stub: an injected no-op would let the correlation regress unnoticed here.
+    "managerTaskResults",
     `${stallMatch[0]}\nconst handler = { ${body} };\nreturn handler.nodes_install;`,
   );
   return factory(
@@ -878,6 +985,7 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
     15000,
     budgetMs,
     AbortSignal,
+    ManagerInstall.createManagerTaskResultLog(),
   );
 }
 
@@ -1030,6 +1138,68 @@ test("#671 nodes_install (real panel source) happy path still verifies inside th
   assert.ok(elapsed < 2500, `the happy path must not wait out the budget (${elapsed} ms)`);
   assert.deepEqual(calls, ["manager/queue/task"], "exactly one submit, on the v2 task route");
 });
+
+test("#1539 v4 refuses a Git-routed target before any Manager mutation", async () => {
+  const calls = [];
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    detect: async () => "v2",
+    managerV2: async (...args) => { calls.push(["v2", ...args]); },
+    managerCall: async (...args) => { calls.push(["legacy", ...args]); },
+    managerQueueControl: async (...args) => { calls.push(["start", ...args]); },
+    verifyInstalled: async (...args) => { calls.push(["verify", ...args]); },
+  });
+  const err = await nodes_install({
+    repository: "https://github.com/example/arbitrary-node.git",
+  }).then(() => null, (e) => e);
+
+  assert.ok(err, "an arbitrary Git URL must be refused on real v4");
+  assert.match(err.message, /Manager v4 does not clone the supplied arbitrary URL/);
+  assert.match(err.message, /no install was queued/i);
+  assert.match(err.message, /Manager registry id/);
+  assert.match(err.message, /ComfyUI host/);
+  assert.match(err.message, /local verified path/);
+  assert.deepEqual(calls, [], "v4 Git rejection must send no submit, start, or verification mutation");
+});
+
+for (const dialect of ["v2-batch", "legacy"]) {
+  test(`#1539 ${dialect} keeps the direct-URL files path`, async () => {
+    const url = "https://github.com/example/arbitrary-node.git";
+    const calls = [];
+    const managerV2 = async (route, opts) => {
+      calls.push(["v2", route, opts]);
+      return { failed: [] };
+    };
+    const managerCall = async (route, opts) => {
+      calls.push(["legacy", route, opts]);
+      return null;
+    };
+    const nodes_install = loadNodesInstall({
+      budgetMs: 2500,
+      detect: async () => dialect,
+      managerV2,
+      managerCall,
+      managerQueueControl: async (_call, route) => {
+        calls.push(["start", route]);
+      },
+      verifyInstalled: async (target, actualDialect) => {
+        assert.equal(actualDialect, dialect);
+        return { state: "installed" };
+      },
+    });
+    const result = await nodes_install({ repository: url });
+
+    assert.equal(result.installed, true);
+    const submit = calls.find(([kind, route]) =>
+      kind === (dialect === "v2-batch" ? "v2" : "legacy") &&
+      route === (dialect === "v2-batch" ? "manager/queue/batch" : "manager/queue/install"),
+    );
+    assert.ok(submit, `${dialect} must still submit the install`);
+    const body = dialect === "v2-batch" ? submit[2].body.install[0] : submit[2].body;
+    assert.deepEqual(body.files, [url], `${dialect} must preserve files:[url] direct-URL routing`);
+    assert.ok(calls.some(([kind, route]) => kind === "start" && route === "manager/queue/start"));
+  });
+}
 
 test("#671 nodes_install a stalled dialect detection reports NOTHING queued (a retry is safe)", async () => {
   // Detection hangs (signal-aware); NO mutation may run. The budget error must
@@ -1433,6 +1603,180 @@ test("#251/#255 a non-unreachable error from the absolute fallback also propagat
   );
 });
 
+// ---------------------------------------------------------------------------
+// #1908 — nodes_search is a canvas-independent read, but its reply still has
+// to travel through the panel tab that received the command. The production
+// handler therefore gives the complete Manager probe/fallback ladder one
+// budget below the bridge's 20s read deadline and passes its AbortSignal down
+// to every request. A stalled Manager must become a structured answer, not a
+// misleading "bound canvas tab did not reply" timeout.
+// ---------------------------------------------------------------------------
+
+function loadNodesSearchHandler({ budgetMs, managerGet, managerCall, fetchObjectInfo }) {
+  const panelPath = fileURLToPath(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  );
+  const src = readFileSync(panelPath, "utf8");
+  const fnMatch = src.match(/async nodes_search\(\{ query, limit \}\) \{[\s\S]*?\n  \},/);
+  assert.ok(fnMatch, "could not locate the production nodes_search handler");
+  const body = fnMatch[0].replace(/,\s*$/, "");
+  const factory = new Function(
+    "searchNodesVia",
+    "managerGet",
+    "managerCall",
+    "fetchObjectInfo",
+    "AbortSignal",
+    "NODES_SEARCH_COMMAND_BUDGET_MS",
+    `const handler = { ${body} }; return handler.nodes_search;`,
+  );
+  return factory(
+    searchNodesVia,
+    managerGet,
+    managerCall,
+    fetchObjectInfo,
+    AbortSignal,
+    budgetMs,
+  );
+}
+
+test("#1908 the production nodes_search handler answers a stalled Manager inside the bridge window", async () => {
+  let managerCallUsed = false;
+  const abortError = () => Object.assign(new Error("Manager request aborted"), { name: "AbortError" });
+  const managerGet = async (_route, { signal } = {}) =>
+    new Promise((_, reject) => {
+      // AbortSignal.timeout() uses an unref'd timer in Node. Keep this mock's
+      // worker alive with a short ref'd fallback, but clear it as soon as the
+      // production budget signal aborts so the test does not leave a timer
+      // behind. If the production budget is not wired, fail with a DISTINCT
+      // non-abort error; otherwise a generic AbortError-to-timeout conversion
+      // could make this test pass without the internal budget firing.
+      let fallbackTimer;
+      const abort = () => {
+        clearTimeout(fallbackTimer);
+        reject(abortError());
+      };
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      fallbackTimer = setTimeout(
+        () => reject(new Error("test fallback fired before the internal budget")),
+        250,
+      );
+    });
+  const managerCall = async () => {
+    managerCallUsed = true;
+    throw new Error("legacy fallback must not run after the search budget aborts");
+  };
+  const nodesSearch = loadNodesSearchHandler({
+    budgetMs: 25,
+    managerGet,
+    managerCall,
+    fetchObjectInfo: async () => {
+      throw new Error("object_info fallback must not run after the search budget aborts");
+    },
+  });
+
+  const started = Date.now();
+  const result = await nodesSearch({ query: "MiniMaxH3UnifiedToVideo" });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 1000, `stalled search must settle promptly, took ${elapsed} ms`);
+  assert.equal(managerCallUsed, false, "an exhausted search budget must not start another route");
+  assert.equal(result.supported, false);
+  assert.equal(result.managerReachable, false);
+  assert.equal(result.query, "MiniMaxH3UnifiedToVideo");
+  assert.match(result.reason, /timed out/i);
+  assert.match(result.message, /No canvas workflow was changed/i);
+  assert.match(result.message, /Retry/i);
+});
+
+test("#1908 searchNodesVia forwards one caller signal through the legacy fallback", async () => {
+  const controller = new AbortController();
+  let receivedSignal;
+  const managerGet = async () => {
+    throw UNREACHABLE;
+  };
+  const managerCall = async (_route, { signal } = {}) => {
+    receivedSignal = signal;
+    return GETMAPPINGS_MAP;
+  };
+  const result = await searchNodesVia(managerGet, managerCall, {
+    query: "BiRefNet",
+    signal: controller.signal,
+    timeoutMs: 15000,
+  });
+
+  assert.equal(receivedSignal, controller.signal);
+  assert.equal(result.count, 1);
+  assert.equal(result.results[0].title, "ComfyUI-RMBG");
+});
+
+test("#1908 caller cancellation rejects instead of becoming the internal timeout result", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the node search"), { name: "AbortError" });
+  const managerGet = async (_route, { signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  const managerCall = async () => {
+    throw new Error("legacy fallback must not run after caller cancellation");
+  };
+
+  const pending = searchNodesVia(managerGet, managerCall, {
+    query: "caller-cancelled",
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /caller stopped/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection",
+  );
+});
+
+test("#1908 caller cancellation through /object_info fallback rejects instead of timing out", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the installed-node fallback"), { name: "AbortError" });
+  const unreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const objectInfoGet = async ({ signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+
+  const pending = searchNodesVia(unreachable, unreachable, {
+    query: "caller-cancelled-installed-fallback",
+    objectInfoGet,
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /installed-node fallback/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection through object_info",
+  );
+});
+
 test("parseNodeMappings handles array + map shapes and caps the limit", () => {
   const arr = [
     { id: "a/one", title: "One", description: "first" },
@@ -1446,6 +1790,62 @@ test("parseNodeMappings handles array + map shapes and caps the limit", () => {
   const many = Array.from({ length: 60 }, (_, i) => ({ id: `p/${i}`, title: `t${i}` }));
   assert.equal(parseNodeMappings(many, "", 999).results.length, 40);
   assert.equal(parseNodeMappings(many, "").results.length, 15);
+});
+
+test("#1287 a limit above the cap is DISCLOSED as limit_cap, not silently honored", () => {
+  // The tool's published description documented no maximum while the schema rejected
+  // limit>40 (MCP -32602) and the panel silently returned fewer rows than asked. The
+  // cap stays — but whenever it bites, the result must NAME it, so a truncated list
+  // can no longer read as the whole answer.
+  const many = Array.from({ length: 60 }, (_, i) => ({ id: `p/${i}`, title: `t${i}` }));
+
+  const clamped = parseNodeMappings(many, "", SEARCH_LIMIT_CAP + 10);
+  assert.equal(clamped.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(clamped.limit_cap, SEARCH_LIMIT_CAP, "a clamped request must say what bound was applied");
+
+  // At or under the cap — and the default path — there is nothing to disclose, and
+  // the payload must not grow a field that claims a clamp that never happened.
+  for (const lim of [SEARCH_LIMIT_CAP, 5, undefined]) {
+    const r = parseNodeMappings(many, "", lim);
+    assert.equal("limit_cap" in r, false, `limit ${String(lim)} was not clamped and must not say it was`);
+  }
+
+  // The /object_info fallback search enforces the same bound and discloses it the
+  // same way.
+  const bigInfo = Object.fromEntries(
+    Array.from({ length: 60 }, (_, i) => [`Node${i}`, { display_name: `Node ${i}` }]),
+  );
+  const infoClamped = parseObjectInfoSearch(bigInfo, "", SEARCH_LIMIT_CAP + 10);
+  assert.equal(infoClamped.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(infoClamped.limit_cap, SEARCH_LIMIT_CAP);
+  assert.equal("limit_cap" in parseObjectInfoSearch(bigInfo, "", SEARCH_LIMIT_CAP), false);
+});
+
+test("#1287 the object_info FALLBACK wrapper keeps the limit_cap disclosure", async () => {
+  // objectInfoSearchFallback re-wraps the parsed result; the disclosure must survive
+  // the re-wrap or the unreachable-Manager path silently loses it.
+  const UNREACHABLE_ERR = new Error("Manager customnode/getmappings: not reachable");
+  const bigInfo = Object.fromEntries(
+    Array.from({ length: 60 }, (_, i) => [`Node${i}`, { display_name: `Node ${i}` }]),
+  );
+  const res = await objectInfoSearchFallback(async () => bigInfo, "", SEARCH_LIMIT_CAP + 10, UNREACHABLE_ERR);
+  assert.equal(res.supported, true);
+  assert.equal(res.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(res.limit_cap, SEARCH_LIMIT_CAP, "the fallback path must disclose the same clamp");
+});
+
+test("#1287 the README documents the same bound the search enforces", () => {
+  // The README tool table is the published description this repo owns — it carried no
+  // maximum while the search enforced one, the disagreement the issue reports. Pin
+  // the row to the enforced cap so the two cannot drift apart again.
+  const readme = readFileSync(fileURLToPath(new URL("../../README.md", import.meta.url)), "utf8");
+  const row = readme.split("\n").find((l) => l.includes("`panel_search_nodes`"));
+  assert.ok(row, "the tool table must list panel_search_nodes");
+  assert.match(
+    row,
+    new RegExp(`max ${SEARCH_LIMIT_CAP}\\b`),
+    "the documented limit bound must match the enforced SEARCH_LIMIT_CAP",
+  );
 });
 
 test("#394 parseNodeMappings MAP-shape id is INSTALLABLE (repo URL), never the display title", () => {

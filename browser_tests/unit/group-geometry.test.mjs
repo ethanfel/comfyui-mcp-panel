@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 import {
   nodeFocusBounds,
   boundsAroundNodes,
+  nodeExtents,
+  describeGroupMembershipGap,
   groupBoundsOf,
   groupMemberNodes,
   classifyRequestedMembership,
@@ -22,7 +24,9 @@ import {
   syncNodeArea,
   syncGraphNodeAreas,
   moveGroupMembers,
+  holdGraphItemPositions,
   nodeAreaIsLive,
+  nodeAreaOriginTracks,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -822,11 +826,15 @@ test("#813 a rect exposed by a COPYING getter is not reported moved (review P2)"
   assert.deepEqual(real, [100, 70, 80, 30], "and the underlying rect really was never updated");
 });
 
-test("#813 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
+test("#813/#1300 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
   // A custom node whose updateArea() computes visible bounds reaching past `size` — a
   // legitimate engine answer that differs from the panel's generic footprint model. The
   // collapsed repair must not fire here: overwriting the engine's rect and reporting
   // success would make later rect-first membership wrong.
+  //
+  // #813 left this node STUCK rather than overwrite. That is the #1300 false
+  // refusal: the position DID land, the origin DID track, only the extent model
+  // disagreed. The node must MOVE, and the engine's extents must survive.
   const n = {
     id: 31,
     pos: [100, 100],
@@ -840,12 +848,91 @@ test("#813 an EXPANDED node's authoritative extents are not overwritten (review 
 
   const r = moveGroupMembers([n], 10, 10);
 
-  assert.deepEqual(r.stuck, [n], "an expanded node with a non-generic rect is still stuck");
+  assert.deepEqual(r.stuck, [], "an expanded node whose origin tracked is not stuck");
+  assert.deepEqual(r.moved, [n], "…it moved");
+  assert.deepEqual(n.pos, [110, 110]);
   assert.deepEqual(
     [...n.boundingRect],
     [110, 80, 400, 300],
     "and its authoritative extents survive — never replaced by the 200x130 generic model",
   );
+});
+
+test("#1300 a Label (rgthree)-shaped member moves even though its rect is not the generic footprint", () => {
+  // The reporter's nodes 579/594/606: frontend-only Label (rgthree). Their
+  // updateArea() writes font-scaled visual bounds that are much larger than
+  // size, so nodeAreaIsLive is false by construction. pinned is not the
+  // discriminator — 579 was unpinned, 594 and 606 were pinned, all three
+  // refused. panel_edit_node moved each of them.
+  const label = (id, pinned) => ({
+    id,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    flags: { pinned },
+    boundingRect: [100, 70, 420, 180],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, 420, 180];
+    },
+  });
+  const unpinned = label(579, false);
+  const pinned = label(594, true);
+
+  const r = moveGroupMembers([unpinned, pinned], 50, 25);
+
+  assert.deepEqual(r.stuck, [], "neither pinned nor unpinned Label is stuck");
+  assert.deepEqual(r.moved, [unpinned, pinned]);
+  assert.deepEqual(unpinned.pos, [150, 125]);
+  assert.deepEqual(pinned.pos, [150, 125]);
+  assert.deepEqual([...unpinned.boundingRect], [150, 95, 420, 180], "engine extents survive");
+  assert.deepEqual([...pinned.boundingRect], [150, 95, 420, 180]);
+});
+
+test("#1300 an expanded copying-getter rect is still stuck (#408 preserved)", () => {
+  // Same copying-getter shape as the #813 collapsed test, but expanded: the
+  // origin-tracks check must re-read, not trust a throwaway write, or a Label
+  // whose boundingRect getter returns a copy would report moved and then vanish
+  // from the group on the next rect-first membership read.
+  const real = [100, 70, 420, 180];
+  const n = {
+    id: 606,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    get boundingRect() {
+      return [...real];
+    },
+    updateArea() { /* writes to a copy, dropped */ },
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "a rect whose writes cannot be observed is not 'moved'");
+  assert.deepEqual(r.stuck, [n]);
+  assert.deepEqual(real, [100, 70, 420, 180], "and the underlying rect really was never updated");
+});
+
+test("#1300 an expanded frozen rect is still stuck (#408 preserved)", () => {
+  const n = {
+    id: 607,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    boundingRect: Object.freeze([100, 70, 420, 180]),
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "an uncorrectable rect still refuses");
+  assert.deepEqual(r.stuck, [n]);
+});
+
+test("#1300 nodeAreaOriginTracks: origin shifted by the delta, extents ignored", () => {
+  const n = { boundingRect: [110, 80, 420, 180] };
+  assert.equal(nodeAreaOriginTracks(n, [100, 70], 10, 10), true);
+  assert.equal(nodeAreaOriginTracks(n, [100, 70], 0, 0), false, "wrong delta");
+  assert.equal(nodeAreaOriginTracks({ boundingRect: null }, [100, 70], 10, 10), true, "no cached rect");
+  assert.equal(nodeAreaOriginTracks({ get boundingRect() { throw new TypeError("gone"); } }, [100, 70], 10, 10), false);
 });
 
 test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {
@@ -869,4 +956,137 @@ test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {
   }, "a hostile accessor must never escape the mover");
   assert.deepEqual(r.moved, [], "an unreadable node is not reported moved");
   assert.deepEqual(r.stuck, [n]);
+});
+
+// ---- holdGraphItemPositions: pin the graph while a box-only write runs (#1306) ----
+
+test("#1306 holdGraphItemPositions puts nodes, nested boxes and reroutes back", () => {
+  const a = node(1, 100, 100);
+  const inner = groupBox([50, 50, 80, 80]);
+  const outer = groupBox([0, 0, 400, 400]);
+  const elbow = { id: 11, pos: [120, 120] };
+  const graph = {
+    _nodes: [a],
+    _groups: [outer, inner],
+    reroutes: [elbow],
+  };
+  const hold = holdGraphItemPositions(graph, outer);
+  a.pos = [999, 999];
+  inner._bounding = [1, 2, 3, 4];
+  elbow.pos = [0, 0];
+  outer._bounding = [200, 200, 500, 500];
+  hold.restore();
+  assert.deepEqual(a.pos, [100, 100], "the node is back");
+  assert.deepEqual(inner._bounding, [50, 50, 80, 80], "the nested box is back");
+  assert.deepEqual(elbow.pos, [120, 120], "the reroute is back");
+  assert.deepEqual(outer._bounding, [200, 200, 500, 500], "the excepted group is left at its new box");
+});
+
+test("#1306 holdGraphItemPositions never throws on a hostile walk", () => {
+  const graph = {
+    get _nodes() { throw new TypeError("revoked"); },
+    get _groups() { throw new TypeError("revoked"); },
+    get reroutes() { throw new TypeError("revoked"); },
+  };
+  let hold;
+  assert.doesNotThrow(() => {
+    hold = holdGraphItemPositions(graph, null);
+  });
+  assert.doesNotThrow(() => hold.restore());
+});
+
+// ---------------------------------------------------------------------------
+// mcp#1877 — panel_create_group excluded a requested COLLAPSED node from a box
+// whose bounds visibly covered it.
+// ---------------------------------------------------------------------------
+
+test("mcp#1877 a requested node reporting a ZERO extent is a member of its own box", () => {
+  // Numbers straight from the report: collapsed VAEDecode 81 at [9750, 5410],
+  // which the frontend presents with a collapsed pill width and a ZERO body
+  // height. graph_create_group syncs the requested node's cached rect (forced to
+  // the FULL footprint) and then builds the box with boundsAroundNodes.
+  //
+  // FAIL-BEFORE: the two disagreed about a zero extent. boundsAroundNodes read
+  // `size[1] ?? 100` — `??` passes 0 through — so the box was [9720, 5340, 285,
+  // 100]; wantedNodeArea rejected the 0 and wrote a rect 130 tall. The rect's
+  // centre landed at y 5445, five pixels below the box's bottom edge at 5440, and
+  // the tool reported node_count 0 / missing_node_ids [81].
+  const n = {
+    id: 81,
+    type: "VAEDecode",
+    flags: { collapsed: true },
+    pos: [9750, 5410],
+    size: [225, 0],
+    boundingRect: [0, 0, 0, 0], // stale, as after a graph load
+  };
+  syncNodeArea(n, /* forceCollapsed */ true);
+  const bbox = boundsAroundNodes([n]);
+  assert.deepEqual(
+    groupMemberNodes(graphOf(n), groupBox(bbox)).map((x) => x.id),
+    [81],
+    "the node the box was built around must be one of its members",
+  );
+});
+
+test("mcp#1877 boundsAroundNodes and wantedNodeArea share ONE extent model", () => {
+  // The invariant behind the fix, stated directly on the degenerate extents that
+  // broke it: whatever width/height the box builder uses for a node, the cached
+  // rect writer must use the same. Testing membership (above) alone would not
+  // catch the two drifting apart again in a way that happens to stay inside the
+  // padding.
+  for (const size of [[225, 0], [0, 120], [0, 0], [225, -40], [225, NaN], [Infinity, 120]]) {
+    const n = { id: 1, pos: [100, 100], size };
+    syncNodeArea(n, true); // no cached rect ⇒ read the model through nodeFocusBounds
+    const [, , focusW, focusH] = nodeFocusBounds(n);
+    assert.deepEqual(
+      nodeExtents(n),
+      [focusW, focusH - 30],
+      `size ${JSON.stringify(size)}: box extents must match the rect extents`,
+    );
+  }
+});
+
+test("mcp#1877 a non-finite position never yields a NaN group box", () => {
+  // A NaN extent or a NaN *y* never touched minX, and minX was the only
+  // accumulator checked — so the box escaped as [x, NaN, w, NaN] and
+  // setGroupBounds wrote it to the user's graph.
+  const good = node(1, 100, 100);
+  const badY = { id: 2, pos: [100, Number.NaN], size: [300, 120] };
+  const badSize = { id: 3, pos: [400, 100], size: [300, Number.NaN] };
+  for (const bbox of [
+    boundsAroundNodes([good, badY]),
+    boundsAroundNodes([good, badSize]),
+    boundsAroundNodes([badY]),
+  ]) {
+    assert.ok(
+      bbox.every((v) => Number.isFinite(v)),
+      `every component of ${JSON.stringify(bbox)} must be finite`,
+    );
+  }
+});
+
+test("mcp#1877 a MISSING requested node is not reported as a dense-layout capture", () => {
+  // The old warning was one sentence that always began "also captures N unrelated
+  // node(s)" — with N printed as 0 — and always prescribed spreading the nodes
+  // out. For a single requested node that is exactly backwards.
+  const resolved = new Set(["81"]);
+  const w = describeGroupMembershipGap([], [81], resolved, new Set());
+  assert.ok(!/captures 0 unrelated/.test(w), `must not claim a 0-node capture: ${w}`);
+  assert.ok(!/contiguous region/.test(w), `must not prescribe a layout change: ${w}`);
+  assert.match(w, /81/, "names the node that is missing");
+  assert.match(w, /CENTRE/, "names the rule that actually excluded it");
+
+  // A rect that refused the resync is named as such, not blamed on the layout.
+  const stuck = describeGroupMembershipGap([], [81], resolved, new Set(["81"]));
+  assert.match(stuck, /could not be reconciled/, `names the stuck rect: ${stuck}`);
+  assert.ok(!/CENTRE of their footprint falls outside/.test(stuck), "one cause, not both");
+
+  // An id that resolves to nothing is its own cause (#297's nonexistent-id case).
+  const unknown = describeGroupMembershipGap([], [99], new Set(), new Set());
+  assert.match(unknown, /do not exist in this graph/, `names the unknown id: ${unknown}`);
+
+  // The dense-layout sentence still fires when something extra WAS captured.
+  const dense = describeGroupMembershipGap([7, 8], [], resolved, new Set());
+  assert.match(dense, /also captures 2 unrelated node\(s\)/);
+  assert.match(dense, /contiguous region/);
 });

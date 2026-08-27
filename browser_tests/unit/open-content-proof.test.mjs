@@ -96,6 +96,18 @@ test("#1001 a byte-identical repaint is still reported as exact", () => {
     proven: true,
     exact: true,
     fields: [],
+    // #1623 — a graph that matched has no difference to classify, so the weaker
+    // "nothing authored was lost" ground is not what carried it.
+    presentationOnly: false,
+    // panel#1283 family — nor the THIRD ground. A byte-identical repaint needs no
+    // observation about whether the restore completed, and claiming one it did not
+    // consult would misattribute the proof.
+    normalizedOnly: false,
+    normalizedFields: [],
+    // panel#1283 (the 2026-08-21 recurrence) — nor the DEFINITIONS arm of that ground.
+    // Same rule: an account the proof never consulted must not be reported as one it
+    // used, or the reply discloses a subgraph difference that did not decide anything.
+    definitionsNormalized: false,
   });
 });
 
@@ -227,6 +239,16 @@ test("#1001 an unreadable root proves nothing — absence of comparison is not e
       proven: false,
       exact: false,
       fields: [],
+      // #1623 — and it must not answer the WEAKER question either. A root nobody
+      // could read supports "nothing authored was lost" exactly as little as it
+      // supports "the content was reproduced".
+      presentationOnly: false,
+      // panel#1283 family — and not the third one. `loadRanToCompletion` was not even
+      // passed here, so the only honest answer is false; a ground that could pass on an
+      // unreadable root would prove an open off a comparison that never happened.
+      normalizedOnly: false,
+      normalizedFields: [],
+      definitionsNormalized: false,
     });
   }
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(state), state: null }).proven, false);
@@ -235,7 +257,10 @@ test("#1001 an unreadable root proves nothing — absence of comparison is not e
 
 test("#1001 source guard: the open publishes the fence and DISCLOSES rewritten geometry", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /const contentProof = graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
+  // The call site now spans several lines (it passes `loadRanToCompletion` too), so the
+  // pin is on the CALL and its two payload arguments rather than on one formatted line —
+  // still a call-site assertion, and still fails if the open stops asking for the proof.
+  assert.match(src, /const contentProof = graphRootReproducesStateContent\(\{[\s\S]{0,600}?state: repaintState,/);
   assert.match(src, /openGeometryRewritten = contentProof\.fields/, "a non-exact proof is recorded");
   assert.match(src, /geometry_rewritten: openGeometryRewritten/, "and reaches the reply");
   assert.match(src, /geometry_rewritten_note:/, "with prose, since a bare field list is not a disclosure");

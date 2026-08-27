@@ -19,7 +19,9 @@ import {
   createRunCompletionTracker,
   NO_PROMPT_KEY,
 } from "../../web/js/lib/run-completion.js";
+import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { runCompletionKeyMatchesContext } from "../../web/js/lib/run-completion-persistence.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
 function makeHarness({ debounceMs = 1500, maxRearms = 40 } = {}) {
@@ -312,7 +314,15 @@ function makeFrameDeps(overrides = {}) {
     fetchImageBytes: async () => 2048,
     fetchImageDimensions: async () => ({ w: 512, h: 512 }),
     humanizeBytes: (n) => (n == null ? null : `${n} B`),
-    buildVideoStoryboard: async () => ({ fake: "blob" }),
+    // #1485 — this double used to be `{ fake: "blob" }`, and that is the exact
+    // shape the composer must REFUSE: `storyboardFailure({reason})` is a truthy
+    // plain object too, so a double that is truthy-but-not-a-Blob made the old
+    // `if (!blob)` test look correct while production was uploading an
+    // explanation to ComfyUI as `storyboard_<name>.png`. A sheet is the thing
+    // with a numeric `size` (the test every consumer now applies), and
+    // `paintedFrames` is what #648 requires a caller to describe it by — so the
+    // double carries both, and the assertions below are unchanged.
+    buildVideoStoryboard: async () => ({ size: 4096, paintedFrames: 20 }),
     uploadBlobToInput: async (_blob, name, opts) => {
       uploadCalls.push({ name, opts });
       return { filename: name, type: opts?.type || "input" };
@@ -325,6 +335,145 @@ function makeFrameDeps(overrides = {}) {
   };
   return { deps, frames, painted, uploadCalls };
 }
+
+test("#1837 a repeat registration REUSES the run's identity — one finished run, one agent turn", () => {
+  const h = makeHarness();
+  const P = "repeat-registration";
+
+  // Neither call supplies a completion key, so the tracker mints one. #1833 dropped
+  // the `existingKey ||` term, and because createRunCompletionKey salts with
+  // Date.now()+Math.random() the second call invented a SECOND identity for the same
+  // prompt — an identity no orchestrator ticket ever opened. flushWithCompletionRecords
+  // emits one frame per record, so a single finished run became two agent turns: the
+  // exact symptom #1830 was filed about.
+  const first = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  const second = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  assert.equal(second, first, "a repeat registration reports the identity the run already carries");
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [first],
+    "minting must not add a second row the orchestrator never asked for",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("repeat-registration.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [first],
+    "ONE completion frame for one completed prompt",
+  );
+
+  // The single retained row still retires normally against its own receipt.
+  assert.equal(h.tracker.acknowledgeDelivery(P, first), true);
+  assert.equal(h.tracker.completionMetadata().length, 0);
+  assert.equal(h.tracker.hasPending(), false);
+});
+
+test("#1837 a reused identity re-registered on another route/session does not duplicate", () => {
+  const h = makeHarness();
+  const P = "ctx-switch-prompt";
+
+  // The identity tuple is [route, session, prompt, key], so reusing one key under a
+  // second route/session would land as a DISTINCT record and flush a byte-identical
+  // duplicate frame — strictly worse than the #1837 regression, since both copies
+  // carry the same completion key and the agent cannot tell them apart.
+  const first = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  h.tracker.onQueued(P, { routeId: "route-b", sessionId: "session-b" });
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [first],
+    "one key is one receipt, whichever context re-registers it",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("ctx-switch.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [first],
+    "no byte-identical duplicate frame",
+  );
+});
+
+test("#1830 keeps two same-prompt nonce rows and retires them by exact key", () => {
+  const h = makeHarness();
+  const P = "same-prompt";
+  const keyA = JSON.stringify(["route-a", "session-a", P, "nonce-a"]);
+  const keyB = JSON.stringify(["route-a", "session-a", P, "nonce-b"]);
+
+  h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey: keyA });
+  h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey: keyB });
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [keyA, keyB],
+    "restoring/queueing the same prompt id does not overwrite the other nonce",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("same-prompt.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [keyA, keyB],
+    "the lifecycle sends one exact completion identity for each retained row",
+  );
+
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyA), true);
+  assert.deepEqual(h.tracker.completionMetadata().map((row) => row.completionKey), [keyB]);
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyA), false, "a stale duplicate receipt is harmless");
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyB), true);
+  assert.equal(h.tracker.completionMetadata().length, 0);
+  assert.equal(h.tracker.hasPending(), false);
+});
+
+test("#1830 lifecycle send fence rejects a session switch on the same route and retries exact identity", async () => {
+  const { deps } = makeFrameDeps();
+  const P = "session-switch-prompt";
+  const completionKey = JSON.stringify(["route-a", "session-a", P, "nonce-a"]);
+  let activeSession = "session-a";
+  const rejected = [];
+  const accepted = [];
+  let tracker;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...deps,
+    sendFrame: (frame) => {
+      if (!runCompletionKeyMatchesContext(frame.completion_key, "route-a", activeSession)) {
+        rejected.push(frame);
+        return false;
+      }
+      accepted.push(frame);
+      return true;
+    },
+    markDelivered: (promptId, key) => tracker.markDelivered(promptId, key),
+    markUndelivered: (promptId, key) => tracker.markUndelivered(promptId, key),
+    pruneRebootMarker: () => {},
+    isAgentMuted: () => false,
+  });
+  tracker = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey });
+  tracker.onExecutionStart(P);
+  tracker.onExecuted(P, imgs([img("session-switch.png", "temp")]));
+  tracker.onExecutionSuccess(P);
+  activeSession = "session-b";
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(rejected.length, 1, "a same-route session switch rejects the in-flight completion");
+  assert.equal(rejected[0].completion_key, completionKey);
+  assert.equal(tracker.hasPending(), true, "the rejected completion remains recoverable");
+
+  activeSession = "session-a";
+  await tracker.reconcile();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(accepted.length, 1, "the exact completion is retried once its original session returns");
+  assert.equal(accepted[0].completion_key, completionKey);
+  assert.equal(tracker.acknowledgeDelivery(P, completionKey), true);
+  assert.equal(tracker.hasPending(), false);
+});
 
 test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE agent_event with all outputs", async () => {
   const { deps, frames } = makeFrameDeps();
@@ -349,15 +498,247 @@ test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE 
   assert.equal(frames[0].prompt_id, P, "attributed to the finishing prompt");
   // All outputs ride in the single frame: the still + both storyboard refs.
   const names = frames[0].images.map((m) => m.filename);
-  assert.deepEqual(
-    names,
-    ["final.png", "storyboard_v1.png", "storyboard_v2.png"],
-    "one still + BOTH video storyboards consolidated into the single images array",
-  );
+  assert.equal(names[0], "final.png");
+  assert.match(names[1], /^storyboard_v1_.+\.png$/);
+  assert.match(names[2], /^storyboard_v2_.+\.png$/);
+  assert.equal(names.length, 3, "one still + BOTH video storyboards consolidated into the single images array");
   // The note mentions the still result and both videos in one turn.
   assert.match(frames[0].note, /final\.png/, "note names the still output");
   assert.match(frames[0].note, /v1\.mp4/, "note names the first video");
   assert.match(frames[0].note, /v2\.mp4/, "note names the second video");
+});
+
+test("#1805: cache-assisted and real completion spans are labelled as workflow time", async () => {
+  const formatDuration = (ms) => `${(ms / 1000).toFixed(1)}s`;
+
+  // A cache-assisted prompt still has a real lifecycle span, but the panel does
+  // not observe ComfyUI's execution_cached events and must not call that span a
+  // render benchmark.
+  const cached = makeHarness();
+  cached.tracker.onExecutionStart("cached-prompt");
+  cached.advance(5800);
+  cached.tracker.onExecuted("cached-prompt", {
+    videos: [{ m: { filename: "cached.mp4", type: "output" }, nodeId: "save" }],
+  });
+  cached.tracker.onExecutionSuccess("cached-prompt");
+  assert.equal(cached.flushes[0].durationMs, 5800, "keep the measured workflow span");
+  const cachedDeps = makeFrameDeps({ formatDuration });
+  const cachedFrame = await composeRunCompletionFrame(cached.flushes[0], cachedDeps.deps);
+  assert.match(cachedFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(cachedFrame.note, /rendered in/);
+
+  // The same wording applies when still metadata is unavailable and the
+  // completion falls back to the batch-level duration line.
+  const fallbackDeps = makeFrameDeps({
+    formatDuration,
+    fetchImageBytes: () => new Promise(() => {}),
+    fetchImageDimensions: () => new Promise(() => {}),
+    stillsMetadataTimeoutMs: 1,
+  });
+  const fallbackFrame = await composeRunCompletionFrame(
+    { promptId: "cached-stills", images: [{ filename: "cached.png", type: "output" }], durationMs: 5800 },
+    fallbackDeps.deps,
+  );
+  assert.match(fallbackFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(fallbackFrame.note, /rendered in/);
+
+  // A genuine long render keeps its full measured duration; only the misleading
+  // render-time label changes.
+  const rendered = makeHarness();
+  rendered.tracker.onExecutionStart("rendered-prompt");
+  rendered.advance(940000);
+  rendered.tracker.onExecuted("rendered-prompt", {
+    images: [{ filename: "rendered.png", type: "output" }],
+  });
+  rendered.tracker.onExecutionSuccess("rendered-prompt");
+  assert.equal(rendered.flushes[0].durationMs, 940000, "preserve true render duration data");
+  const renderedDeps = makeFrameDeps({ formatDuration });
+  const renderedFrame = await composeRunCompletionFrame(rendered.flushes[0], renderedDeps.deps);
+  assert.match(renderedFrame.note, /workflow completed in 940\.0s/);
+  assert.doesNotMatch(renderedFrame.note, /rendered in/);
+  assert.equal(renderedFrame.metadata[0].durationMs, 940000);
+});
+
+test("#1805 production event wiring: a cached completion reaches the agent frame as workflow time", async () => {
+  const panelSrc = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const onExecutedStart = panelSrc.indexOf("  function onExecuted(ev) {");
+  const onExecutedEnd = panelSrc.indexOf("\n  function onExecError(ev)", onExecutedStart);
+  const onExecutionSuccessStart = panelSrc.indexOf(
+    "  function onExecutionSuccess(ev) {",
+  );
+  const onExecutionSuccessEnd = panelSrc.indexOf(
+    "\n  // Primary render-duration start signal",
+    onExecutionSuccessStart,
+  );
+  const onExecutionStart = panelSrc.indexOf(
+    "  function onExecutionStart(ev) {",
+  );
+  const onExecutionStartEnd = panelSrc.indexOf(
+    "\n  // Legacy/secondary run-end",
+    onExecutionStart,
+  );
+  assert.ok(onExecutedStart >= 0 && onExecutedEnd > onExecutedStart);
+  assert.ok(
+    onExecutionSuccessStart >= 0 &&
+      onExecutionSuccessEnd > onExecutionSuccessStart,
+  );
+  assert.ok(onExecutionStart >= 0 && onExecutionStartEnd > onExecutionStart);
+
+  const createProductionHandlers = new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    "appendImageCacheBust",
+    "NO_PROMPT_KEY",
+    `return (runCompletion) => [
+      (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
+      (${panelSrc.slice(
+        onExecutionSuccessStart,
+        onExecutionSuccessEnd,
+      ).trim()}),
+      (${panelSrc.slice(onExecutionStart, onExecutionStartEnd).trim()}),
+    ];`,
+  )(
+    (media) => `view://${media.filename}`,
+    () => false,
+    () => false,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    { graph: {}, nodeOutputs: {}, nodePreviewImages: {} },
+    () => "storyboard",
+    (url) => url,
+    // This harness asserts run bookkeeping, not URLs — the real helper is pinned
+    // by inline-image-cache-bust.test.mjs. Kept identity-ish so the image refs
+    // buffered below stay comparable.
+    (url) => url,
+  NO_PROMPT_KEY,
+  );
+
+  const registrationStart = panelSrc.indexOf(
+    '    api.addEventListener("executed", onExecuted);',
+  );
+  const registrationEnd = panelSrc.indexOf("\n  } catch {", registrationStart);
+  assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
+  const listenerLines = panelSrc
+    .slice(registrationStart, registrationEnd)
+    .match(/    api\.addEventListener\("[^"]+", \w+\);/g);
+  assert.ok(listenerLines);
+  assert.ok(
+    listenerLines.includes('    api.addEventListener("executed", onExecuted);'),
+  );
+  assert.ok(
+    listenerLines.includes(
+      '    api.addEventListener("execution_success", onExecutionSuccess);',
+    ),
+  );
+  assert.ok(
+    listenerLines.includes(
+      '    api.addEventListener("execution_start", onExecutionStart);',
+    ),
+  );
+
+  let now = 0;
+  const frameDeps = makeFrameDeps({
+    formatDuration: (durationMs) => `${(durationMs / 1000).toFixed(1)}s`,
+  });
+  let resolveFrame;
+  const frameReady = new Promise((resolve) => {
+    resolveFrame = resolve;
+  });
+  let runCompletion;
+  let sentFrame = null;
+  let pruneCount = 0;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...frameDeps.deps,
+    sendFrame: (frame) => {
+      const ok = frameDeps.deps.sendFrame(frame);
+      if (ok) sentFrame = frame;
+      return ok;
+    },
+    markDelivered: (promptId) => runCompletion.markDelivered(promptId),
+    markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
+    pruneRebootMarker: () => {
+      pruneCount += 1;
+      if (sentFrame) resolveFrame(sentFrame);
+    },
+    isAgentMuted: () => false,
+    now: () => Date.now(),
+  });
+  runCompletion = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    now: () => now,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  const [onExecuted, onExecutionSuccess, onStart] =
+    createProductionHandlers(runCompletion);
+
+  const api = new EventTarget();
+  let cachedSignalSeen = false;
+  api.addEventListener("execution_cached", () => {
+    cachedSignalSeen = true;
+  });
+  new Function(
+    "api",
+    "onExecuted",
+    "onExecutionSuccess",
+    "onExecutionStart",
+    "onExecuting",
+    "onExecError",
+    "onComfyReconnecting",
+    "onComfyReconnected",
+    listenerLines.join("\n"),
+  )(
+    api,
+    onExecuted,
+    onExecutionSuccess,
+    onStart,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+  );
+
+  const dispatch = (type, detail) => {
+    const event = new Event(type);
+    Object.defineProperty(event, "detail", { value: detail });
+    api.dispatchEvent(event);
+  };
+  const promptId = "cached-production-path";
+  dispatch("execution_start", { prompt_id: promptId });
+  // The shipped wiring does not consume this provenance-only signal; it is
+  // still delivered on the same API target before the normal completion events.
+  dispatch("execution_cached", { prompt_id: promptId, nodes: ["sampler"] });
+  now = 5800;
+  dispatch("executed", {
+    prompt_id: promptId,
+    node: "save",
+    output: { images: [{ filename: "cached.png", type: "output" }] },
+  });
+  dispatch("execution_success", { prompt_id: promptId });
+
+  const frame = await frameReady;
+  assert.equal(cachedSignalSeen, true);
+  assert.equal(frameDeps.frames.length, 1);
+  assert.equal(frame.type, "agent_event");
+  assert.equal(frame.kind, "executed");
+  assert.match(frame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(frame.note, /rendered in/);
+  assert.equal(pruneCount, 1);
+  assert.equal(runCompletion.isSettled(promptId), true);
+  assert.equal(runCompletion._delivered.has(promptId), true);
 });
 
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
@@ -396,11 +777,10 @@ test("presentation: a video-only run (2 videos) is still ONE frame", async () =>
     deps,
   );
   assert.equal(frames.length, 1, "two videos, one completion frame");
-  assert.deepEqual(
-    frames[0].images.map((m) => m.filename),
-    ["storyboard_x.png", "storyboard_y.png"],
-    "both storyboards in the single frame",
-  );
+  const names = frames[0].images.map((m) => m.filename);
+  assert.equal(names.length, 2, "both storyboards in the single frame");
+  assert.match(names[0], /^storyboard_x_.+\.png$/);
+  assert.match(names[1], /^storyboard_y_.+\.png$/);
 });
 
 // #209 — the storyboard contact sheet is a panel-generated PREVIEW, never a
@@ -421,14 +801,14 @@ test("#209 storyboard upload requests ComfyUI's temp namespace, never input/", a
     deps,
   );
   assert.equal(uploadCalls.length, 1, "one storyboard upload for the one video");
-  assert.equal(uploadCalls[0].name, "storyboard_clip.png");
+  assert.match(uploadCalls[0].name, /^storyboard_clip_.+\.png$/);
   assert.equal(uploadCalls[0].opts?.type, "temp", "must request the temp namespace, not input/");
 
   // The resulting ImageRef must carry type:"temp" all the way into the sent
   // frame, so the chat preview resolves via /view?...&type=temp — never silently
   // falls back to type:"input" (which would defeat the fix even if the upload
   // call itself requested temp).
-  const storyboardImg = frames[0].images.find((m) => m.filename === "storyboard_clip.png");
+  const storyboardImg = frames[0].images.find((m) => /^storyboard_clip_.+\.png$/.test(m.filename));
   assert.ok(storyboardImg, "storyboard ref must be present in the sent frame");
   assert.equal(storyboardImg.type, "temp");
 });
@@ -507,7 +887,7 @@ test("#609: blind mode (images withheld) — no review request, an explicit proh
   // The storyboard is still produced for the USER (blind blinds the agent, not
   // the panel) — the ref rides the frame; the sendFrame gate strips it.
   assert.ok(
-    frame.images.some((m) => m.filename === "storyboard_clip.png"),
+    frame.images.some((m) => /^storyboard_clip_.+\.png$/.test(m.filename)),
     "the storyboard is still built for the user; only the agent-facing pixels are gated",
   );
 });
@@ -574,7 +954,8 @@ test("#609: ONE decision per frame — parallel segments can never disagree with
     // fast.mp4's storyboard resolves immediately; slow.mp4's takes a real 20ms.
     buildVideoStoryboard: async (url) => {
       if (/slow/.test(url)) await new Promise((r) => setTimeout(r, 20));
-      return { fake: "blob" };
+      return { size: 4096, paintedFrames: 20 }; // #1485 — a Blob-shaped sheet, see makeFrameDeps
+
     },
     // Blind flips ON during slow.mp4's upload — AFTER fast.mp4's whole segment
     // (including its note) was already built.
@@ -613,19 +994,19 @@ test("#609: ONE decision per frame — parallel segments can never disagree with
 });
 
 // #609 wiring: the behavioral tests above inject `agentReceivesImages` by hand,
-// so they cannot catch the panel's REAL call site dropping the dep (the composer
-// then defaults to always-sighted while the sendFrame gate still strips the
-// pixels — the exact #609 hole). Pin the wiring by source inspection, the
+// so they cannot catch the panel's REAL delivery seam dropping the dep (the
+// composer then defaults to always-sighted while the sendFrame gate still strips
+// the pixels — the exact #609 hole). Pin the wiring by source inspection, the
 // panel's established pattern for the giant module (cf. bridge-disconnect).
-test("#609 wiring: the panel call site feeds the composer the gate's own blind predicate", () => {
+test("#609 wiring: the panel delivery seam feeds the gate's own blind predicate", () => {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   ).replace(/\r\n/g, "\n");
-  const start = src.indexOf("composeRunCompletionFrame(");
-  assert.notEqual(start, -1, "could not locate the composeRunCompletionFrame call site");
-  const end = src.indexOf(".then((frame)", start);
-  assert.notEqual(end, -1, "could not locate the end of the call site");
+  const start = src.indexOf("createRunCompletionFlushHandler({");
+  assert.notEqual(start, -1, "could not locate the run-completion delivery seam");
+  const end = src.indexOf("\n    }),\n    // #370: deliver a reconcile-discovered terminal ERROR", start);
+  assert.notEqual(end, -1, "could not locate the end of the delivery seam");
   const callSite = src.slice(start, end);
   assert.match(
     callSite,
@@ -741,4 +1122,78 @@ test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start t
   h.tracker.onExecutionSuccess("second"); // finishes within the cache-hit threshold
   assert.equal(h.flushes.length, 2, "a real render is delivered even when its duration looks tiny");
   assert.equal(h.flushes[1].looksCached, false, "an INVENTED duration is never called a cache hit");
+});
+
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1739 — a successful panel run whose completion frame FAILED to
+// send (bridge/socket churn around a workflow-tab switch re-hello) is re-pended
+// by markUndelivered. But flush() retires runs OPTIMISTICALLY, so a safety-sweep
+// tick in the async compose+send window sees an empty ledger and self-disarms —
+// leaving the re-pended run in a ledger NOTHING sweeps until a real reconnect
+// edge or the next queue (possibly never). The tracker now notifies the wiring
+// (onRepend) on every re-pend so it can re-arm the sweep.
+// ---------------------------------------------------------------------------
+
+test("#1739: markUndelivered re-pend fires onRepend so recovery can be re-armed", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markUndelivered("prompt-x");
+  assert.deepEqual(repends, ["prompt-x"], "the re-pend is announced with the run's id");
+  assert.ok(tracker.hasPending(), "the run is genuinely back in the pending ledger");
+});
+
+test("#1739: a null id re-pends nothing and must NOT fire onRepend", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markUndelivered(null);
+  assert.equal(repends.length, 0);
+  assert.equal(tracker.hasPending(), false);
+});
+
+test("#1739: markDelivered is a confirmation, not a re-pend — it never fires onRepend", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markDelivered("prompt-x");
+  assert.equal(repends.length, 0);
+});
+
+test("#1739 wiring: the panel re-arms the run-reconcile sweep on every re-pend", () => {
+  // Behavioral tests above inject onRepend by hand; this pins the REAL call
+  // site's wiring by source inspection — the established pattern for the giant
+  // module (cf. the #609 wiring test above).
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const start = src.indexOf("createRunCompletionTracker({");
+  assert.notEqual(start, -1, "could not locate the createRunCompletionTracker call site");
+  const end = src.indexOf("onFlush:", start);
+  assert.notEqual(end, -1, "could not locate the onFlush option after the call site");
+  const head = src.slice(start, end);
+  assert.match(
+    head,
+    /onRepend:\s*\(\)\s*=>\s*\{[\s\S]*armRunReconcileSweepRef\?\.\(\)/,
+    "a re-pended run must re-arm the safety sweep, or its completion can be lost forever",
+  );
 });

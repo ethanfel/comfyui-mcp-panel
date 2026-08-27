@@ -16,11 +16,16 @@
 // `unrunnableNodeIds(undefined)` answers `[]` — no offenders — because a result that does not
 // exist has no unrunnable entries in it. Absence of evidence, read as evidence of absence.
 import test from "node:test";
+// #1565 — the pre-flight serialization is bounded by graph_run's command budget now;
+// the harness below drives the SHIPPED block, so it needs the same two collaborators.
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import assert from "node:assert/strict";
 
 import {
   unrunnableNodeIds,
   graphToPromptUnusable,
+  graphToPromptFailureRefusal,
   unserializableGraphRefusal,
   unresolvedNodeTypes,
 } from "../../web/js/lib/missing-node-preflight.js";
@@ -47,6 +52,30 @@ test("#1582 a USABLE result is not flagged", () => {
   ]) {
     assert.equal(graphToPromptUnusable(ok), false, JSON.stringify(ok));
   }
+});
+
+test("#1654 a frontend serializer throw is preserved as a fail-closed refusal", () => {
+  const msg = graphToPromptFailureRefusal(new Error("Dynamic widget doesn't exist on node"));
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /graphToPrompt threw/);
+  assert.match(msg, /Dynamic widget doesn't exist on node/);
+  assert.match(msg, /Nothing was queued/);
+  assert.match(msg, /frontend or an extension's serializer/);
+});
+
+test("#1654 serializer refusal rendering is total and bounded for hostile throws", () => {
+  const hostile = new Proxy({}, {
+    get() {
+      throw new Error("hostile getter");
+    },
+  });
+  const msg = graphToPromptFailureRefusal(hostile);
+  assert.match(msg, /^NOT queued:/);
+  assert.ok(msg.length < 1400);
+
+  const long = graphToPromptFailureRefusal("x".repeat(1000));
+  assert.ok(long.length < 1400);
+  assert.match(long, /…/);
 });
 
 test("#1582 the refusal says WHAT failed and that nothing was queued", () => {
@@ -90,11 +119,31 @@ test("#1582 a long type list is bounded", () => {
 //    a few lines inside a 30k-line file that a refactor could drop with every unit test
 //    still green.
 
+test("#1565: a SYNCHRONOUS graphToPrompt still reaches the pre-flight — the bound must not remove a guard", async () => {
+  // An extension may replace graphToPrompt with a plain function returning the prompt
+  // object. `await` accepted that; a bare `.then` on a non-thenable throws, and the
+  // pre-flight's own catch would swallow it and skip a guard that used to run.
+  const msg = await runPreflight({
+    graphToPrompt: () => ({ output: { 1: { class_type: undefined, inputs: {} } }, workflow: {} }),
+    nodes: [{ id: 1, type: "LCKreaSampler", constructor: {} }],
+  });
+  assert.notEqual(msg, "__NO_REFUSAL__", "the pre-flight must still refuse an unrunnable node");
+  assert.match(msg, /^NOT queued:/);
+});
+
 test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
-  const at = src.indexOf("const built = await app.graphToPrompt();");
+  // #1565 — the call is bounded by the command budget now, so the recognisable line is the
+  // bounded step rather than a bare await. Same block, same assertions below it, plus a
+  // check that it is still graphToPrompt being bounded.
+  const at = src.indexOf("const preflightBuild = await withTimeout(");
   assert.ok(at > 0, "the pre-flight's graphToPrompt call must still be recognisable");
+  assert.match(
+    src.slice(at, src.indexOf("const built = preflightBuild.value;", at)),
+    /app\.graphToPrompt\(\)/,
+    "and it must still be the pre-flight that serializes the prompt",
+  );
   // Bounded by the pre-flight's OWN catch, not a byte count. A fixed 1800 truncated
   // `unrunnableNodeIds(built)` the moment the guard's comment grew — which is the third
   // time today a fixed window in this repo reported missing wiring that was present
@@ -103,13 +152,26 @@ test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async (
   assert.ok(endOfTry > at, "the pre-flight try block must still be recognisable");
   const block = src.slice(at, endOfTry);
   const guard = block.indexOf("graphToPromptUnusable(built)");
-  const offenders = block.indexOf("unrunnableNodeIds(built)");
+  const offenders = block.indexOf("unrunnableNodeIdsInScope(built, partialTargets)");
   assert.ok(guard > -1, "the unusable-result guard must exist");
   assert.ok(offenders > -1, "the offender check must still exist");
   // ORDER is the fix. Asking for offenders first answers `[]` for an absent result and
   // lets it through to queuePrompt, which is the reported TypeError.
   assert.ok(guard < offenders, "the guard must run BEFORE the offender check");
   assert.match(block, /unserializableGraphRefusal\(/);
+});
+
+test("#1654 the real graph_run preflight surfaces a serializer throw and refuses queueing", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => {
+      throw new Error("Dynamic widget doesn't exist on node");
+    },
+    nodes: [{ id: 136, type: "MiniMaxH3ReferenceToVideo" }],
+    registry: { MiniMaxH3ReferenceToVideo: {} },
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /Dynamic widget doesn't exist on node/);
+  assert.match(msg, /Nothing was queued/);
 });
 
 test("#1582 the refusal keeps the prefix its own catch requires", async () => {
@@ -127,7 +189,7 @@ test("#1582 the refusal keeps the prefix its own catch requires", async () => {
 //    the same real-source extraction pattern manager-dialect.test.mjs uses.
 
 /** Pull the pre-flight try/catch out of the monolith and run it with injected deps. */
-async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry = {} }) {
+async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry = {}, partialTargets }) {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
   const marker = src.indexOf("      // Inspect the SERIALIZED prompt");
@@ -141,10 +203,16 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     "app",
     "graph",
     "LG",
-    "unrunnableNodeIds",
+    "unrunnableNodeIdsInScope",
+    // comfyui-mcp#1871 - the block now reads the resolved run-to-node scope. It is a
+    // `let` in graph_run, so leaving it out of the factory would make the extracted body
+    // throw a ReferenceError that the pre-flight catch swallows - and the test would then
+    // see "no refusal" from a pre-flight that never ran at all.
+    "partialTargets",
     "describeUnrunnable",
     "missingNodeRunRefusal",
     "graphToPromptUnusable",
+    "graphToPromptFailureRefusal",
     "unserializableGraphRefusal",
     // #1582 review: the block became ROOT-scoped, so the harness has to supply the root
     // graph and the walker. Not injecting them made the extracted body throw a
@@ -157,6 +225,14 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     // without this the extracted body throws a ReferenceError that the pre-flight catch
     // swallows, and the test sees no refusal at all.
     "window",
+    // #1565 — the serialization is BOUNDED by graph_run's command budget now. All three
+    // names are consts in graph_run, so leaving any of them out makes the extracted body
+    // throw a ReferenceError the pre-flight catch swallows — the test would then read "no
+    // refusal" from a pre-flight that never ran, which is the silent failure this file
+    // exists to stop, one layer down.
+    "withTimeout",
+    "budget",
+    "RUN_SERIALIZE_TIMEOUT_MS",
     `return async function preflight() {\n${body}\n};`,
   );
   // The VIEWED graph is deliberately a DIFFERENT object from the root when the caller
@@ -167,14 +243,21 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     { graphToPrompt },
     { _nodes: viewedNodes ?? nodes },
     { registered_node_types: registry },
-    mod.unrunnableNodeIds,
+    mod.unrunnableNodeIdsInScope,
+    partialTargets,
     mod.describeUnrunnable,
     mod.missingNodeRunRefusal,
     mod.graphToPromptUnusable,
+    mod.graphToPromptFailureRefusal,
     mod.unserializableGraphRefusal,
     { _nodes: nodes },
     mod.unresolvedNodeTypes,
     { LiteGraph: { registered_node_types: registry } },
+    withTimeout,
+    // A REAL budget with room to spare: this file is about what the pre-flight REFUSES,
+    // and an already-spent budget would answer every case with a skipped pre-flight.
+    makeCommandBudget(30000),
+    8000,
   );
 }
 
@@ -233,6 +316,83 @@ test("#1582 BEHAVIOUR: the #1460 unrunnable-node refusal still fires", async () 
   assert.match(msg, /^NOT queued:/);
   assert.match(msg, /cannot be executed by the server/);
   assert.match(msg, /GoneNode/);
+});
+
+// ── comfyui-mcp#1871. #1511 took ComfyUI's veto of an excluded branch away: when the
+//    SERVER refuses over a node outside the requested closure, the run is re-posted
+//    without that branch. But the server only gets to refuse if we post, and this
+//    pre-flight refuses first. For the case where a pack is missing ENTIRELY there is no
+//    frontend registration, so no class_type, so this check fires and ComfyUI is never
+//    asked — the retry cannot save a run that never left the browser.
+//
+//    Driven through the SAME extracted pre-flight source: this is a claim about what
+//    production refuses, not about what a helper returns.
+
+// Two independent output branches, the reporter's shape: 43 is the branch asked for,
+// 56/57 are the branch whose pack is not installed at all (hence no class_type).
+const twoBranchPrompt = () => ({
+  output: {
+    "43": { class_type: "PreviewImage", inputs: { images: ["44", 0] } },
+    "44": { class_type: "EmptyImage", inputs: { width: 64, height: 64 } },
+    "56": { inputs: { image: ["57", 0] } },
+    "57": { inputs: {} },
+  },
+  workflow: {},
+});
+const twoBranchNodes = [
+  { id: 43, type: "PreviewImage" },
+  { id: 56, type: "TopazVideoAI" },
+];
+
+test("#1871 BEHAVIOUR: a scoped run is NOT refused for an unrunnable node outside its branch", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["43"],
+  });
+  assert.equal(msg, "__NO_REFUSAL__", "node 56 is not upstream of 43; the run reaches ComfyUI");
+});
+
+test("#1871 BEHAVIOUR: a scoped run IS still refused for an unrunnable node INSIDE its branch", async () => {
+  // The narrowing must not become a blanket exemption for scoped runs: node 56 is now a
+  // dependency of the requested target, so the run genuinely cannot succeed and #1511's
+  // retry could not rescue it either (it declines when the named node is in the closure).
+  const prompt = twoBranchPrompt();
+  prompt.output["43"].inputs.images = ["56", 0];
+  const msg = await runPreflight({
+    graphToPrompt: async () => prompt,
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["43"],
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
+});
+
+test("#1871 BEHAVIOUR: a FULL run over the same graph still refuses — the narrowing is scoped-only", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: undefined, // no to_node_id ⇒ every node is submitted
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
+});
+
+test("#1871 BEHAVIOUR: an unresolvable scope refuses exactly as an unscoped run does", async () => {
+  // A target that is not a key of this prompt means the closure is a guess. Guessing
+  // toward "let it through" would ship a run that cannot succeed; the safe direction is
+  // the behaviour that already exists.
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["not-a-node-in-this-prompt"],
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
 });
 
 // ── ROOT SCOPE (review, P1). graphToPrompt serializes the WHOLE workflow, so naming

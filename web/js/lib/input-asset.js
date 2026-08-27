@@ -19,8 +19,25 @@
 
 // Upload-input config flags ComfyUI attaches to an input SPEC's config object. Any
 // truthy one marks the input as one the user uploads a file into (image / video /
-// audio / 3d), whose valid values live on DISK, not only in the combo snapshot.
-const UPLOAD_CONFIG_FLAGS = ["image_upload", "video_upload", "audio_upload", "model_upload"];
+// audio / 3d model), whose valid values live on DISK, not only in the combo snapshot.
+//
+// #1569 — the 3D kind serializes as `file_upload`, NOT `model_upload`. ComfyUI's own
+// `UploadType` enum (comfy_api/latest/_io.py) is image="image_upload",
+// audio="audio_upload", video="video_upload", model="file_upload", and the V1 spelling
+// that predates it was already `{"file_upload": True}` (ComfyUI bdf39379, Dec 2024, the
+// commit that added Load3D). MEASURED on a live 0.33.2 /object_info (853 types): four
+// `image_upload`, one `audio_upload`, one `video_upload`, TWO `file_upload`
+// (Load3D.model_file, Load3DAdvanced.model_file) — and ZERO `model_upload`.
+//
+// `model_upload` is kept anyway, and that is a decision rather than an oversight. It has
+// never been a ComfyUI flag in any release — `git log -S model_upload -- '*.py'` over the
+// whole ComfyUI history returns no commit that introduces it as an input config key — so
+// it cannot be legacy for an older supported server. It is kept because a third-party pack
+// is free to invent it for a checkpoint-upload widget, dropping it could only ever REFUSE
+// a write that is accepted today, and recognising it costs nothing: `uploadInputAccepts`
+// admits a value only when the config carries the flag AND the extension matches THAT
+// flag's own kind, so an unused flag can never widen anything.
+const UPLOAD_CONFIG_FLAGS = ["image_upload", "video_upload", "audio_upload", "model_upload", "file_upload"];
 
 // Extension allowlist PER upload kind. A successful `/view?type=input` probe proves a
 // file EXISTS, not that it is a LOADABLE asset of the RIGHT kind — `/view` serves any
@@ -44,7 +61,108 @@ const UPLOAD_KIND_EXTENSIONS = {
   model_upload: new Set([
     "safetensors", "ckpt", "pt", "pth", "bin", "gguf", "sft", "onnx",
   ]),
+  // #1569 — the 3D-asset kind (`file_upload`), and it is NOT the weight-file kind above.
+  // These are exactly the suffixes `Load3D.define_schema` itself enumerates when it builds
+  // the combo (comfy_extras/nodes_load_3d.py: `file_path.suffix.lower() in {...}`), so a
+  // value the panel admits here is one ComfyUI's own listing would have offered had the
+  // file been under `input/3d/`. Deliberately NOT widened to `.usdz` — Preview3D declares a
+  // USDZ socket type, but Load3D's listing does not include it, and #240 says refuse where
+  // the server's own enumeration would not offer.
+  //
+  // Sharing the weight-file set would have been the wrong reuse: ComfyUI runs NO extension
+  // check of its own on this input (`Load3D.validate_inputs` only asks
+  // `exists_annotated_filepath`), so this list is the ONLY thing standing between a
+  // server-confirmed `3d/notes.txt` and a Load3D combo — measured: `/view` serves that file
+  // 206 and ComfyUI's own /prompt validation ACCEPTS it.
+  file_upload: new Set([
+    "gltf", "glb", "obj", "fbx", "stl", "spz", "splat", "ply", "ksplat",
+  ]),
 };
+
+/**
+ * The TRI-STATE verdict a ComfyUI `/view` existence probe supports (#1357).
+ *
+ *   true  — the server served the file: it is there.
+ *   false — the server ANSWERED and said it is not there (404).
+ *   null  — the question was NOT answered: no response, a traversal refusal (400),
+ *           an auth/proxy status, a 5xx, a timeout.
+ *
+ * The third state is load-bearing. A caller that only ever over-reports (the
+ * missing-media filter, which already has a STORE asserting the miss) may collapse
+ * `false` and `null` into "keep reporting". The live combo scan may NOT: its only
+ * other evidence is an option list that structurally cannot contain the value, so
+ * a flaky fetch read as a confirmed miss manufactures the exact false positive
+ * #1357 reported. `null` on every uncertainty, always.
+ */
+export function inputAssetProbeVerdict(res) {
+  try {
+    if (!res) return null;
+    if (res.ok === true || res.status === 206) return true;
+    return res.status === 404 ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Query string for a ComfyUI `/view` existence probe.
+ *
+ * Do not build this with `URLSearchParams`. That encodes a space as `+`
+ * (application/x-www-form-urlencoded), and aiohttp/yarl on some ComfyUI
+ * versions treat `+` as a literal plus, so `image (992).png` is asked as
+ * `image+(992).png` and 404s. That is the #1357 regression after #1368 —
+ * the original test value had no spaces, so the probe looked fine. Percent-
+ * encoding matches ComfyUI's own `getResourceURL` (`filename=` +
+ * encodeURIComponent): decodeURIComponent of the filename param is the file
+ * on disk.
+ */
+export function inputAssetViewQuery({ filename, subfolder = "", type = "input" } = {}) {
+  if (!filename || !type) return "";
+  return (
+    `filename=${encodeURIComponent(String(filename))}` +
+    `&subfolder=${encodeURIComponent(String(subfolder ?? ""))}` +
+    `&type=${encodeURIComponent(String(type))}`
+  );
+}
+
+/**
+ * TRI-STATE `/view` existence probe. `fetchApi` is injected so this module
+ * stays free of the ComfyUI API client. See `inputAssetProbeVerdict`.
+ */
+export async function probeInputAssetPresence(ref, timeoutMs, fetchApi) {
+  try {
+    if (typeof fetchApi !== "function") return null;
+    const { filename, type } = ref ?? {};
+    if (!filename || !type) return null;
+    if (!(timeoutMs > 0)) return null;
+    const qs = inputAssetViewQuery(ref);
+    const res = await fetchApi(`/view?${qs}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return inputAssetProbeVerdict(res);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `config` back, when it is an input spec's config object carrying at least one
+ * UPLOAD flag; otherwise null. Callers that already hold the per-input config
+ * (the live combo scan reads it straight out of `/object_info/<class>`) use this
+ * instead of re-walking a whole defs map, so both paths decide "is this an upload
+ * input" from the ONE flag list above.
+ */
+export function uploadConfigOf(config) {
+  try {
+    if (!config || typeof config !== "object") return null;
+    return UPLOAD_CONFIG_FLAGS.some((f) => config[f]) ? config : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The config object for `widgetName` on the fresh /object_info def for `type`, when
@@ -63,12 +181,50 @@ export function uploadInputConfig(defsByType, type, widgetName) {
       (input.required && input.required[widgetName]) ??
       (input.optional && input.optional[widgetName]);
     if (!Array.isArray(spec)) return null;
-    const config = spec[1];
-    if (!config || typeof config !== "object") return null;
-    return UPLOAD_CONFIG_FLAGS.some((f) => config[f]) ? config : null;
+    return uploadConfigOf(spec[1]);
   } catch {
     return null;
   }
+}
+
+/**
+ * The authoritative option list a def spec publishes, or NULL when this spec does not
+ * carry one. Never guesses: a caller that gets null has learned that it cannot read
+ * this list, which is a different thing from an input that is not a combo.
+ *
+ * MEASURED against a live ComfyUI 0.33 /object_info, because the V1 shape was the only
+ * one originally handled and it is now the MINORITY:
+ *
+ *     [[opt, ...], config?]                    V1 — the historical shape
+ *     ["COMBO", { options: [opt, ...] }]       V2 — the common shape today
+ *     ["COMBO", { remote: { route } }]         V2 remote — the list is a separate fetch;
+ *                                              nothing to read until it lands
+ *     ["COMFY_DYNAMICCOMBO_V3", { options: [{ key, inputs }] }]
+ *                                              the keys select SUB-INPUTS to materialize;
+ *                                              they are not an option list
+ *
+ * The last two return null on purpose — "I could not read it", never "it is empty".
+ * That distinction is load-bearing for `serverDeclaresEmptyComboOptions` below.
+ *
+ * Lives in this LEAF module (no imports) so both consumers can share one reader:
+ * asset-staleness.js re-exports it, and `serverDeclaresEmptyComboOptions` uses it
+ * directly. It previously lived in asset-staleness.js, which this file must not
+ * import from — that is how the two drifted apart (mcp#1940).
+ */
+export function authoritativeComboValues(spec) {
+  if (!Array.isArray(spec)) return null;
+  // V1 — the first element IS the option array.
+  if (Array.isArray(spec[0])) return spec[0];
+  // V2 — a "COMBO" type string, options under the config object.
+  //
+  // A REMOTE list is unread by definition: it arrives from a separate fetch and the
+  // frontend shows "Loading…" until it lands. Measured remote V2 specs carry no `options`
+  // array at all, so this is defense in depth rather than a live shape — but the whole
+  // safety argument for reading V2 is that UNREAD never becomes EMPTY, and a spec carrying
+  // `remote` alongside an empty `options` would be exactly the case that breaks it.
+  if (spec[0] === "COMBO" && spec[1]?.remote) return null;
+  if (spec[0] === "COMBO" && Array.isArray(spec[1]?.options)) return spec[1].options;
+  return null;
 }
 
 /**
@@ -85,8 +241,22 @@ export function uploadInputConfig(defsByType, type, widgetName) {
  * violating #240. Requiring the SERVER to declare the list empty makes that impossible.
  *
  * Fails CLOSED on every uncertainty: no defs, no def for the type, no such input, a
- * non-combo spec (a type string like "INT"/"STRING"), or a NON-EMPTY declared list all
- * return false, so the value simply stays rejected exactly as before.
+ * spec that publishes no readable option list, or a NON-EMPTY declared list all return
+ * false, so the value simply stays rejected exactly as before.
+ *
+ * mcp#1940 — the emptiness test reads the list through `authoritativeComboValues`, NOT
+ * off `spec[0]`. `spec[0]` is the option array only in the V1 shape; the now-common V2
+ * `["COMBO", { options: [] }]` puts it under the config object and leaves the literal
+ * type string "COMBO" at `spec[0]`. Testing `Array.isArray(spec[0])` therefore filed
+ * every V2 combo under "not a combo" and returned false — measured on a live 0.33
+ * /object_info as 0 of 11 server-declared-empty V2 inputs recognised, against 30 of 30
+ * V1. That made #507's last-resort accept UNREACHABLE for them, so `CustomCombo.choice`
+ * (declared `["COMBO", { multiselect: false, options: [] }]`) was permanently unwritable
+ * and the refusal blamed a STALE list that no refresh could ever change.
+ *
+ * The read stays authoritative in the direction that matters. A remote V2 and a dynamic
+ * V3 both yield null, not [], so neither is mistaken for "the server says empty" — an
+ * unread list must keep failing closed, exactly as a NON-EMPTY one does.
  */
 export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
   try {
@@ -96,9 +266,27 @@ export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
     const spec =
       (input.required && input.required[widgetName]) ??
       (input.optional && input.optional[widgetName]);
-    if (!Array.isArray(spec)) return false;
-    const options = spec[0];
+    const options = authoritativeComboValues(spec);
     return Array.isArray(options) && options.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * TRUE when /object_info identifies a V2 COMBO whose options arrive from a separate remote
+ * source. That source is not an empty option list: the panel cannot know its valid values until
+ * the remote fetch lands, so this must never authorize #507's blind write.
+ */
+export function serverDeclaresRemoteComboOptions(defsByType, type, widgetName) {
+  try {
+    if (!defsByType || !type || !widgetName) return false;
+    const input = defsByType[type]?.input;
+    if (!input) return false;
+    const spec =
+      (input.required && input.required[widgetName]) ??
+      (input.optional && input.optional[widgetName]);
+    return Array.isArray(spec) && spec[0] === "COMBO" && !!spec[1]?.remote;
   } catch {
     return false;
   }

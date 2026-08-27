@@ -29,6 +29,8 @@ export const CHAT_HISTORY_LEGACY_STORE = "legacy";
 export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
 export const CHAT_HISTORY_MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 export const CHAT_HISTORY_EXPORT_FORMAT = "comfyui-agent-panel-chat-history";
+/** ComfyUI's own draft-index key on the shared origin (#1305). */
+export const COMFY_DRAFT_INDEX_KEY = "Comfy.Workflow.DraftIndex.v2";
 
 const DEFAULT_THREADS_KEY = "comfyui-mcp.panel.threads";
 const DEFAULT_META_KEY = "comfyui-mcp.panel.historyMeta";
@@ -85,6 +87,89 @@ const MAX_TODO_TEXT = 2000;
 
 function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value)).byteLength;
+}
+
+export function isQuotaExceededError(error) {
+  if (!error) return false;
+  return error.name === "QuotaExceededError"
+    || error.name === "NS_ERROR_DOM_QUOTA_REACHED"
+    || error.code === 22
+    || error.code === 1014;
+}
+
+/**
+ * Write one localStorage key, and if the origin is already full, drop THIS key
+ * first so a shrink can land (#1305).
+ *
+ * Browsers measure remaining quota BEFORE freeing the value being replaced.
+ * That is why #861's bounded `setItem` still threw on an already-over-budget
+ * origin: the new payload was smaller, but not smaller than the leftover
+ * headroom, so the huge pre-0.11.57 shadow never moved. Removing the key
+ * first is the only way a guest can give the host its bytes back.
+ *
+ * On a failed retry the previous value is restored when we still have it —
+ * this must not become a delete of someone else's key (the draft-index probe
+ * uses the same helper).
+ */
+export function writeLocalStorageItem(storage, key, value) {
+  writeLocalStorageItem.lastError = null;
+  if (!storage) return false;
+  try {
+    storage.setItem(key, value);
+    return true;
+  } catch (error) {
+    writeLocalStorageItem.lastError = error;
+    if (!isQuotaExceededError(error)) return false;
+    let previous = null;
+    try { previous = storage.getItem(key); } catch { /* ignore */ }
+    try { storage.removeItem(key); } catch { /* ignore */ }
+    try {
+      storage.setItem(key, value);
+      writeLocalStorageItem.lastError = null;
+      return true;
+    } catch (retry) {
+      writeLocalStorageItem.lastError = retry;
+      if (previous != null) {
+        try { storage.setItem(key, previous); } catch { /* best-effort restore */ }
+      }
+      return false;
+    }
+  }
+}
+
+export function measurePanelShadowBytes(storage, keys) {
+  if (!storage) return 0;
+  let total = 0;
+  for (const key of keys) {
+    try {
+      const raw = storage.getItem(key);
+      if (typeof raw === "string") total += raw.length;
+    } catch { /* ignore */ }
+  }
+  return total;
+}
+
+/**
+ * Can ComfyUI still persist `Comfy.Workflow.DraftIndex.v2`? (#1305)
+ *
+ * Writes the EXISTING value back when one is present, so this is not a
+ * rewrite of the user's drafts. A missing key gets a tiny probe that is
+ * removed again. Never clears any other origin key.
+ */
+export function probeDraftIndexWrite(storage) {
+  if (!storage) return false;
+  let previous;
+  try {
+    previous = storage.getItem(COMFY_DRAFT_INDEX_KEY);
+  } catch {
+    return false;
+  }
+  const payload = previous == null ? "{\"v\":2}" : previous;
+  const wrote = writeLocalStorageItem(storage, COMFY_DRAFT_INDEX_KEY, payload);
+  if (previous == null && wrote) {
+    try { storage.removeItem(COMFY_DRAFT_INDEX_KEY); } catch { /* probe only */ }
+  }
+  return wrote;
 }
 
 function finiteTs(value) {
@@ -167,7 +252,16 @@ function mergeWorkflowVersions(...maps) {
   for (const map of maps) {
     for (const [hash, version] of Object.entries(normalizeWorkflowVersions(map))) {
       const previous = combined[hash];
-      if (!previous || version.capturedAt >= previous.capturedAt) combined[hash] = version;
+      // A version carrying its restorable graph outranks bare metadata for the same
+      // capture (#861). The local shadow strips payloads from what canonical already
+      // holds, and the shadow merges AFTER canonical — without this guard the
+      // stripped copy would launder the durable payload away on the next load. The
+      // hash is content-addressed, so same hash is the same graph: keeping the
+      // payload-carrier loses nothing.
+      const dropsPayload = previous?.snapshot !== undefined && version.snapshot === undefined;
+      if (!previous || (version.capturedAt >= previous.capturedAt && !dropsPayload)) {
+        combined[hash] = version;
+      }
     }
   }
   return normalizeWorkflowVersions(combined);
@@ -843,6 +937,123 @@ export function retainBoundedThreads(threads, limit, protectedThreadIds = []) {
   return ordered.filter((candidate) => keptIds.has(candidate.id));
 }
 
+/**
+ * First-seen id order of one source list. Used as input to the two-sequence
+ * merge below; a single-list caller (importPayload) is an identity.
+ */
+function messageIdsInOrder(list) {
+  const ids = [];
+  const seen = new Set();
+  for (const message of Array.isArray(list) ? list : []) {
+    if (!message || seen.has(message.id)) continue;
+    seen.add(message.id);
+    ids.push(message.id);
+  }
+  return ids;
+}
+
+/**
+ * Order-preserving merge of two id sequences.
+ *
+ * Shared ids are alignment points. An id unique to one sequence splices in
+ * after its nearest common predecessor rather than after every id from the
+ * other list. When the sequences disagree on the order of a shared pair, the
+ * second sequence wins — at the mergeThreadMessages call that is `newer`.
+ *
+ * Concatenating the lists and ranking first-seen (#1530) only preserves order
+ * when the first list is a prefix of the second. Production is often the other
+ * way around: `_writeLocalSnapshot` stores `thread.msgs.slice(-LOCAL_SHADOW_MESSAGES)`,
+ * so the local shadow is a TAIL, and the panel restore then merges that tail
+ * with the IndexedDB copy. `older`/`newer` is chosen by `updatedAt`, not by
+ * argument position, so swapping the concatenation is the exact mirror failure.
+ * Walk both instead (#1536).
+ */
+function mergeSequenceIds(left, right) {
+  if (!left.length) return right.slice();
+  if (!right.length) return left.slice();
+  const inLeft = new Set(left);
+  const inRight = new Set(right);
+  const emitted = new Set();
+  const merged = [];
+  const emit = (id) => {
+    if (emitted.has(id)) return;
+    emitted.add(id);
+    merged.push(id);
+  };
+  let i = 0;
+  let j = 0;
+  while (i < left.length || j < right.length) {
+    while (i < left.length && (emitted.has(left[i]) || !inRight.has(left[i]))) {
+      emit(left[i++]);
+    }
+    while (j < right.length && (emitted.has(right[j]) || !inLeft.has(right[j]))) {
+      emit(right[j++]);
+    }
+    if (i < left.length && j < right.length) {
+      if (left[i] === right[j]) {
+        emit(left[i]);
+        i += 1;
+        j += 1;
+      } else {
+        emit(right[j++]);
+      }
+      continue;
+    }
+    while (i < left.length) emit(left[i++]);
+    while (j < right.length) emit(right[j++]);
+  }
+  return merged;
+}
+
+/**
+ * Where each message sits after an order-preserving merge of the source lists.
+ * Folded left-to-right so a single list (the import path) keeps its own order.
+ */
+function messagePositions(...lists) {
+  let merged = [];
+  for (const list of lists) merged = mergeSequenceIds(merged, messageIdsInOrder(list));
+  const rank = new Map();
+  for (const id of merged) rank.set(id, rank.size);
+  return rank;
+}
+
+/**
+ * Order messages: by time, and — this is the whole of #1516 — by the position
+ * they already held rather than by their id when the time ties.
+ *
+ * A pre-v3 transcript carries no per-message timestamp, so normalizeMessage
+ * floors every one of its messages at createdAt:1 and the time comparison is a
+ * dead heat for the ENTIRE thread. The old tiebreak was the message id, and a
+ * pre-v3 message's id is `legacy-<hash of its own content>`: sorting on it dealt
+ * the user's conversation back in content-hash order. Measured on a six-message
+ * legacy thread crossing the 0.7.x -> 0.15.x boundary the reporter hit:
+ *
+ *     stored   u1, a1, u2, a2, u3, a3
+ *     painted  a3, u1, u2, a1, a2, u3
+ *
+ * Their first two prompts land after the agent's LAST reply, which is what
+ * "refreshing the page repeated my initial messages" looks like from the chat
+ * pane. Timestamped messages are untouched: their comparison resolves before the
+ * rank is ever consulted, so cross-tab causal interleaving keeps deciding by
+ * time. The id stays as the last resort, so the order is still total.
+ *
+ * ONE comparator for BOTH callers on purpose. The reload merge and the archive
+ * import each carried their own copy of the same two-term rule, so fixing only
+ * the one this issue arrived through would have left an import able to write the
+ * scrambled order straight back into a thread the merge had just repaired.
+ *
+ * The rank itself is an order-preserving two-sequence merge (#1536), not a
+ * first-seen walk of `[...oldMessages, ...newMessages]`. That concatenation
+ * only preserves order when `older` is a prefix of `newer`; the local shadow
+ * is a tail.
+ */
+function compareMessageOrder(rank) {
+  return (left, right) =>
+    finiteTs(left.createdAt || left.ts) - finiteTs(right.createdAt || right.ts) ||
+    (rank.get(left.id) ?? 0) - (rank.get(right.id) ?? 0) ||
+    String(left.id).localeCompare(String(right.id));
+}
+
 function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
@@ -853,11 +1064,7 @@ function mergeThreadMessages(older, newer) {
       byId.set(message.id, message);
     }
   }
-  return [...byId.values()].sort(
-    (a, b) =>
-      finiteTs(a.createdAt || a.ts) - finiteTs(b.createdAt || b.ts) ||
-      String(a.id).localeCompare(String(b.id)),
-  );
+  return [...byId.values()].sort(compareMessageOrder(messagePositions(oldMessages, newMessages)));
 }
 
 /** Merge snapshots by thread id; the newest record wins without dropping fields
@@ -1434,6 +1641,63 @@ export function boundShadowBytes(localSnapshot, { maxBytes, evictableIds, protec
 }
 
 /**
+ * Hashes of the workflow versions whose restorable graph payload a snapshot is PROVEN
+ * to hold, per thread id (#861 recurrence).
+ *
+ * A thread carries up to 20 versions x 300KB of serialized graph INSIDE its own
+ * record, and the live thread is protected from eviction — so while those payloads
+ * sit in the localStorage shadow, the byte bound above cannot hold. That is exactly
+ * the reported case: a long chat on a frequently edited graph re-wedged the shared
+ * origin quota even with the cap in place, and ComfyUI's saveDraft() failed again.
+ *
+ * The hash is content-addressed, so a hash present in the canonical record — WITH
+ * its snapshot — is the whole proof that the shadow's copy of that payload is a
+ * cache. This is the receipt that licenses stripping it there.
+ */
+function versionPayloadReceipts(snapshot) {
+  const receipts = new Map();
+  for (const thread of Array.isArray(snapshot?.threads) ? snapshot.threads : []) {
+    if (typeof thread?.id !== "string" || !thread.id) continue;
+    for (const [hash, version] of Object.entries(thread.workflowVersions || {})) {
+      if (version && typeof version === "object" && version.snapshot !== undefined) {
+        let held = receipts.get(thread.id);
+        if (!held) receipts.set(thread.id, (held = new Set()));
+        held.add(hash);
+      }
+    }
+  }
+  return receipts;
+}
+
+/**
+ * The shadow copy of a thread with its canonical-durable version payloads reduced to
+ * metadata (#861 recurrence). The version LIST survives — hash, capturedAt, node
+ * count, title — so startup paint and the history UI are unchanged; only the
+ * restorable graph leaves, and only for versions the receipt proves canonical holds.
+ * The in-memory thread is never touched: any later canonical write re-supplies every
+ * payload from it, so a stripped shadow cannot become the only copy. Versions with
+ * no receipt keep their payload — fail closed, exactly like an un-receipted legacy
+ * thread keeping its place in the shadow.
+ */
+function stripDurableVersionPayloads(thread, receipts) {
+  const held = receipts.get(thread?.id);
+  const versions = thread?.workflowVersions;
+  if (!held || !versions || typeof versions !== "object") return thread;
+  let changed = false;
+  const kept = Object.create(null);
+  for (const [hash, version] of Object.entries(versions)) {
+    if (held.has(hash) && version && typeof version === "object" && version.snapshot !== undefined) {
+      const { snapshot: _dropped, ...metadata } = version;
+      kept[hash] = metadata;
+      changed = true;
+    } else {
+      kept[hash] = version;
+    }
+  }
+  return changed ? { ...thread, workflowVersions: kept } : thread;
+}
+
+/**
  * Read every quarantined pre-v3 transcript out of the legacy store (#861).
  *
  * Returns `null` — NOT `[]` — when the store cannot be reached. The difference is
@@ -1884,6 +2148,8 @@ export class ChatHistoryStore {
     this.maxShadowBytes = Number.isFinite(options.maxShadowBytes)
       ? options.maxShadowBytes
       : LOCAL_SHADOW_MAX_BYTES;
+    this.lastDraftHeadroomOk = null;
+    this.lastShadowBytes = 0;
     /**
      * What the legacy store has ACCEPTED, as id -> content fingerprint (#861).
      *
@@ -2164,7 +2430,18 @@ export class ChatHistoryStore {
       ...thread,
       msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES),
     }));
-    const shadow = [...boundedOrdinary, ...legacyThreads]
+    // #861 recurrence — shed workflow-version PAYLOADS the canonical record is proven
+    // to hold before the byte bound is measured. Without this the bound cannot hold:
+    // the versions ride inside the live thread, and the live thread is protected from
+    // eviction. When this write follows the canonical merge, the snapshot itself is
+    // the receipt; otherwise the last committed canonical state is. No receipt — the
+    // first persist of a session, or any install where IndexedDB is unavailable — and
+    // every payload stays, because then the shadow is still their only copy.
+    const payloadReceipts = versionPayloadReceipts(canonicalDurable ? snapshot : this._lastCommitted);
+    const shadow = [
+      ...boundedOrdinary.map((thread) => stripDurableVersionPayloads(thread, payloadReceipts)),
+      ...legacyThreads,
+    ]
       .sort((a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts));
     // #861 — the byte bound. Everything here is a CACHE of something durable except
     // legacy threads, which are durable only once the legacy store has accepted
@@ -2203,26 +2480,51 @@ export class ChatHistoryStore {
     // fires onPersistenceError forever against a state that can never fit.
     const legacyComplete = legacyThreads.every((thread) =>
       shadowById.has(thread.id) || this._durableLegacy?.get(thread.id) === legacyFingerprint(thread));
-    try {
-      this.storage?.setItem(this.snapshotKey, bounded.serialized);
-      this.lastShadowWriteOk = true;
-      this.lastShadowError = null;
-    } catch (error) {
+    const shadowKeys = [this.snapshotKey, this.threadsKey, this.metaKey];
+    const dropDuplicateKeys = () => {
+      // The two-key shadow is a cache of the atomic snapshot (and of IndexedDB
+      // once canonicalDurable). Dropping it is not a delete of user data — it
+      // is how an already-full origin gets the headroom ComfyUI needs (#1305).
+      // Never run this without a durable copy: the caller gates on
+      // canonicalDurable.
+      try { this.storage?.removeItem(this.threadsKey); } catch { /* ignore */ }
+      try { this.storage?.removeItem(this.metaKey); } catch { /* ignore */ }
+    };
+    const measure = () => {
+      this.lastShadowBytes = measurePanelShadowBytes(this.storage, shadowKeys);
+      return this.lastShadowBytes;
+    };
+
+    let snapshotOk = writeLocalStorageItem(this.storage, this.snapshotKey, bounded.serialized);
+    if (!snapshotOk && canonicalDurable) {
+      dropDuplicateKeys();
+      snapshotOk = writeLocalStorageItem(this.storage, this.snapshotKey, bounded.serialized);
+    }
+    if (!snapshotOk) {
       this.lastShadowWriteOk = false;
-      this.lastShadowError = error;
-      this.onShadowError?.(error);
+      this.lastShadowError = writeLocalStorageItem.lastError
+        || new Error("localStorage shadow write failed");
+      this.onShadowError?.(this.lastShadowError);
+      measure();
       return { committed: false, complete: false, legacyComplete: false };
     }
-    try {
-      this.storage?.setItem(this.threadsKey, JSON.stringify(keptThreads));
-    } catch {
-      // The atomic shadow is already committed.
+    this.lastShadowWriteOk = true;
+    this.lastShadowError = null;
+
+    const threadsJson = JSON.stringify(keptThreads);
+    const metaJson = JSON.stringify(snapshot.meta ?? {});
+    const totalIfDuplicated = bounded.serialized.length + threadsJson.length + metaJson.length;
+    if (canonicalDurable && totalIfDuplicated > this.maxShadowBytes) {
+      // The byte bound was on the snapshot alone, so writing threads+meta
+      // again doubled the panel's share and left ComfyUI no room. Once
+      // canonical holds the transcripts, the two-key copy is the leftover
+      // occupancy #1305 is about — drop it rather than keep a second 1.5MB.
+      dropDuplicateKeys();
+    } else {
+      writeLocalStorageItem(this.storage, this.threadsKey, threadsJson);
+      writeLocalStorageItem(this.storage, this.metaKey, metaJson);
     }
-    try {
-      this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
-    } catch {
-      // The atomic shadow is already committed.
-    }
+    measure();
     return { committed: true, complete, legacyComplete };
   }
 
@@ -2386,12 +2688,30 @@ export class ChatHistoryStore {
       })
       .then((merged) => {
         let postMergeShadowWrite = null;
+        let draftHeadroom = null;
         if (merged) {
           this._lastCommitted = merged;
           this._observeSnapshot(merged);
           postMergeShadowWrite = this._writeLocalSnapshot(merged, protectedThreadIds, {
             canonicalDurable: true,
           });
+          // After the shadow has been given a chance to shrink, ask whether
+          // ComfyUI can still write its draft index. A failed probe is not a
+          // failed history persist — do not dirty the write — but it is the
+          // remaining #1305 failure, and it must be named rather than left
+          // as ComfyUI's "Failed to save workflow draft" with no pointer.
+          draftHeadroom = probeDraftIndexWrite(this.storage);
+          this.lastDraftHeadroomOk = draftHeadroom;
+          if (!draftHeadroom) {
+            this.onPersistenceError?.({
+              ok: true,
+              code: "history-draft-headroom-unavailable",
+              retryable: true,
+              shadowCommitted: Boolean(postMergeShadowWrite?.committed),
+              canonicalCommitted: true,
+              panelBytes: this.lastShadowBytes,
+            });
+          }
           try {
             this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });
           } catch {
@@ -2697,11 +3017,14 @@ export class ChatHistoryStore {
         messages.set(message.id, message);
         thread.updatedAt = Math.max(finiteTs(thread.updatedAt), finiteTs(message.updatedAt));
       }
-      thread.msgs = [...messages.values()].sort(
-        (left, right) =>
-          finiteTs(left.createdAt || left.ts) - finiteTs(right.createdAt || right.ts) ||
-          String(left.id).localeCompare(String(right.id)),
-      );
+      // #1516 — `messages` is already in the right order (the local thread's own
+      // messages, then whatever the archive adds), so its insertion order IS the
+      // rank. Without it an imported pre-v3 transcript arrives content-hash
+      // scrambled, and an import is a WRITE: that order becomes the thread's real
+      // one. Built before the sort, which reorders `collected` in place.
+      const collected = [...messages.values()];
+      const positions = messagePositions(collected);
+      thread.msgs = collected.sort(compareMessageOrder(positions));
       if (existing) {
         const versions = Object.assign(safeMap(), thread.workflowVersions || {});
         let versionState = importedVersionState.get(source.id);

@@ -5,9 +5,15 @@ import { readFileSync } from "node:fs";
 import {
   ChatHistoryStore,
   boundShadowBytes,
+  mergeHistorySnapshots,
+  measurePanelShadowBytes,
+  probeDraftIndexWrite,
+  writeLocalStorageItem,
   CHAT_HISTORY_SCHEMA,
   CHAT_HISTORY_DB_VERSION,
   CHAT_HISTORY_LEGACY_STORE,
+  CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
+  COMFY_DRAFT_INDEX_KEY,
 } from "../../web/js/lib/chat-history-store.js";
 
 // #861 — the panel's localStorage shadow kept every `legacyShadow` thread in full,
@@ -1098,4 +1104,315 @@ test("the fence exists BEFORE the record stops existing", async () => {
   assert.ok(intentAt > 0, "the intent must be recorded up front");
   assert.ok(deleteAt > 0, "…and the record deleted after");
   assert.ok(intentAt < deleteAt, "the fence must exist before the record does not");
+});
+
+// ── the recurrence: version payloads ride INSIDE the protected thread ──────
+//
+// #861 shipped the byte bound, and the symptom came back anyway: a long chat on a
+// frequently edited graph captures a workflow version (up to 300KB of serialized
+// graph) on every user turn, twenty per thread, INSIDE the thread record. The live
+// thread is protected from eviction, so whole-thread eviction could never reclaim
+// those bytes — the shadow grew past the budget again, and ComfyUI's saveDraft()
+// failed again on the shared origin. The fix keeps the version LIST in the shadow
+// but strips the restorable payload once canonical is PROVEN to hold it — the same
+// receipt discipline as the legacy eviction, one level down.
+
+const ordinaryThreadWithVersions = (id, ts, versionCount, payloadSize) => ({
+  id,
+  schemaVersion: CHAT_HISTORY_SCHEMA,
+  ts,
+  updatedAt: ts,
+  msgs: [{ id: `${id}-m`, role: "user", text: "hi" }],
+  workflowVersions: Object.fromEntries(
+    Array.from({ length: versionCount }, (_, i) => [
+      `hash-${id}-${i}`,
+      {
+        hash: `hash-${id}-${i}`,
+        capturedAt: ts + i,
+        nodeCount: i + 1,
+        snapshot: { pad: "g".repeat(payloadSize) },
+      },
+    ]),
+  ),
+});
+
+test("version payloads leave the shadow once canonical holds them — the list stays", async () => {
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  // Budget below the payload total: without the strip the thread could only be
+  // evicted whole or written oversized — the two failures this test must NOT see.
+  const store = new ChatHistoryStore({ storage, indexedDb, maxShadowBytes: 3000 });
+  const thread = ordinaryThreadWithVersions("T0", 1, 6, 800);
+  store.persist([thread], {});
+  await store._writePromise;
+
+  // Second persist: the canonical receipts now exist, so the shadow may shed payloads.
+  store.persist([thread], {});
+  await store._writePromise;
+
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  assert.ok(
+    JSON.stringify(written).length <= 3000,
+    "the shadow must respect the byte budget even with the live thread protected",
+  );
+  const shadowThread = (written.threads || []).find((t) => t.id === "T0");
+  assert.ok(shadowThread, "the thread itself must stay in the shadow");
+  const versions = Object.values(shadowThread.workflowVersions || {});
+  assert.equal(versions.length, 6, "the version LIST survives the strip");
+  for (const version of versions) {
+    assert.equal(version.snapshot, undefined, "a canonical-durable payload leaves the shadow");
+    assert.ok(version.hash && Number.isFinite(version.capturedAt), "the metadata stays");
+  }
+});
+
+test("version payloads STAY in the shadow while canonical has not accepted them", async () => {
+  // IndexedDB unavailable (private mode, blocked, quota): the shadow is the only
+  // copy of those graphs, and stripping them would be the data-loss path this whole
+  // change is built to avoid. Fail closed means the budget loses, not the data.
+  const storage = createMemoryStorage();
+  const store = new ChatHistoryStore({ storage, indexedDb: null, maxShadowBytes: 500 });
+  store.persist([ordinaryThreadWithVersions("T0", 1, 4, 800)], {});
+  await store._writePromise;
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  const versions = Object.values(written.threads[0].workflowVersions || {});
+  assert.equal(versions.length, 4);
+  for (const version of versions) {
+    assert.ok(version.snapshot, "no receipt, no strip — the only copy keeps its payload");
+  }
+});
+
+test("a stripped shadow cannot launder the payload out of canonical on reload", async () => {
+  // The strip makes the shadow metadata-only for durable versions, and the shadow
+  // merges AFTER canonical on every load. If the merge let a bare-metadata record
+  // displace the payload-carrier for the same hash, one reload would demote the
+  // in-memory copy, and the next persist would write that demotion INTO canonical —
+  // the durable graph gone, silently, exactly the failure a receipt exists to prevent.
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  const writer = new ChatHistoryStore({ storage, indexedDb });
+  const thread = ordinaryThreadWithVersions("T0", 1, 3, 200);
+  writer.persist([thread], {});
+  await writer._writePromise;
+  writer.persist([thread], {});
+  await writer._writePromise;
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  assert.ok(
+    Object.values(written.threads[0].workflowVersions).every((v) => v.snapshot === undefined),
+    "precondition: the shadow really is stripped",
+  );
+
+  const reader = new ChatHistoryStore({ storage, indexedDb });
+  const read = await reader.readCanonical();
+  const restored = (read?.threads || []).find((t) => t.id === "T0");
+  assert.ok(restored, "the thread must reload");
+  for (const [hash, version] of Object.entries(thread.workflowVersions)) {
+    assert.deepEqual(
+      restored.workflowVersions?.[hash]?.snapshot,
+      version.snapshot,
+      `canonical's payload for ${hash} must survive the merge with the stripped shadow`,
+    );
+  }
+});
+
+test("a metadata-only version never displaces the payload-carrier for the same hash", () => {
+  // The merge guard on its own, both argument orders: the hash is content-addressed,
+  // so a record without the graph must never win over the record that has it.
+  const withPayload = {
+    threads: [{
+      id: "T",
+      schemaVersion: CHAT_HISTORY_SCHEMA,
+      ts: 1,
+      updatedAt: 1,
+      msgs: [],
+      workflowVersions: { h: { hash: "h", capturedAt: 10, nodeCount: 3, snapshot: { nodes: [] } } },
+    }],
+    meta: {},
+  };
+  const strippedThread = {
+    id: "T",
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    ts: 2,
+    updatedAt: 2,
+    msgs: [],
+    workflowVersions: { h: { hash: "h", capturedAt: 10, nodeCount: 3 } },
+  };
+  const shadowLast = mergeHistorySnapshots(withPayload, { threads: [strippedThread], meta: {} });
+  assert.deepEqual(
+    shadowLast.threads[0].workflowVersions.h.snapshot,
+    { nodes: [] },
+    "a stripped shadow merged after canonical must not drop the payload",
+  );
+  const shadowFirst = mergeHistorySnapshots({ threads: [strippedThread], meta: {} }, withPayload);
+  assert.deepEqual(
+    shadowFirst.threads[0].workflowVersions.h.snapshot,
+    { nodes: [] },
+    "…and the payload obviously survives the canonical-last order too",
+  );
+});
+
+// ── #1305: an already-full origin still cannot take ComfyUI's draft ─────────
+//
+// #861 bounded the snapshot. #1318 stripped version payloads so the bound can
+// hold. The symptom came back on 0.14.44 anyway, because neither change
+// reclaimed a PREVIOUSLY over-budget origin:
+//
+//   1. Browsers measure remaining quota BEFORE freeing the value being
+//      replaced, so setItem of a smaller snapshot still throws.
+//   2. The two-key shadow (threads + historyMeta) is a second full copy of
+//      the same cache, so even a successful bound left ~3MB of a 5MB origin
+//      in panel keys and Comfy.Workflow.DraftIndex.v2 had nothing left.
+//
+// Do not clear the origin. Only panel keys that IndexedDB already holds may
+// move, and a failed draft probe is a recovery message — not a wipe.
+
+const THREADS_KEY = "comfyui-mcp.panel.threads";
+const META_KEY = "comfyui-mcp.panel.historyMeta";
+const SNAPSHOT_KEY = CHAT_HISTORY_LOCAL_SNAPSHOT_KEY;
+
+function createQuotaStorage(maxBytes) {
+  const map = new Map();
+  const used = () => {
+    let n = 0;
+    for (const value of map.values()) n += String(value).length;
+    return n;
+  };
+  class QuotaExceededError extends Error {
+    constructor() {
+      super("The quota has been exceeded.");
+      this.name = "QuotaExceededError";
+      this.code = 22;
+    }
+  }
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => {
+      const next = String(value);
+      // Chrome: remaining is checked BEFORE the old value is freed. A rewrite
+      // of a smaller payload still throws when leftover headroom is smaller
+      // than the new payload — the #1305 failure.
+      if (used() + next.length > maxBytes) throw new QuotaExceededError();
+      map.set(key, next);
+    },
+    removeItem: (key) => { map.delete(key); },
+    _map: map,
+    _used: used,
+  };
+}
+
+const preV1157Thread = (id, ts, size) => ({
+  id,
+  ts,
+  updatedAt: ts,
+  msgs: [{ id: `${id}-m`, role: "user", text: "x".repeat(size) }],
+});
+
+test("writeLocalStorageItem shrinks a key the naive setItem cannot replace", () => {
+  const storage = createQuotaStorage(1000);
+  storage.setItem("k", "a".repeat(800));
+  assert.throws(() => storage.setItem("k", "b".repeat(400)), { name: "QuotaExceededError" });
+  assert.equal(writeLocalStorageItem(storage, "k", "b".repeat(400)), true);
+  assert.equal(storage.getItem("k").length, 400);
+});
+
+test("an over-budget pre-0.11.57 shadow leaves room for Comfy.Workflow.DraftIndex.v2", async () => {
+  // The upgrade state the issue names: a 0.11.56-or-older install wrote every
+  // transcript into `threads` + `historyMeta`, no historySnapshot, no bound.
+  // Origin ~5MB. Panel keys already ~3.6MB. ComfyUI then cannot persist the
+  // draft index, and #861's post-bound setItem cannot replace the huge key.
+  const quota = 5_000_000;
+  const storage = createQuotaStorage(quota);
+  const threads = Array.from({ length: 24 }, (_, i) => preV1157Thread(`old-${i}`, i + 1, 140_000));
+  storage.setItem(THREADS_KEY, JSON.stringify(threads));
+  storage.setItem(META_KEY, JSON.stringify({ updatedAt: 1 }));
+  const foreign = { keep: true, pad: "c".repeat(200) };
+  storage.setItem("Comfy.Workflow.OpenTabs", JSON.stringify(foreign));
+  assert.equal(storage.getItem(SNAPSHOT_KEY), null, "precondition: pre-0.11.57 has no atomic snapshot");
+  assert.ok(storage._used() > 3_000_000, "precondition: the origin is already over the panel budget");
+
+  const indexedDb = createFakeIndexedDb();
+  const failures = [];
+  const store = new ChatHistoryStore({
+    storage,
+    indexedDb,
+    maxShadowBytes: 1_500_000,
+    onPersistenceError: (failure) => failures.push(failure),
+  });
+  const local = store.readLocal();
+  store.persist(local.threads, local.meta);
+  assert.equal(await store.flush(), true, "history must persist");
+  assert.equal(store.lastDraftHeadroomOk, true, "the draft-index probe must succeed after reclaim");
+  assert.ok(
+    store.lastShadowBytes <= 1_500_000,
+    `panel shadow still over budget: ${store.lastShadowBytes}`,
+  );
+  assert.deepEqual(
+    JSON.parse(storage.getItem("Comfy.Workflow.OpenTabs")),
+    foreign,
+    "a non-panel origin key must not be rewritten",
+  );
+
+  const draft = JSON.stringify({
+    version: 2,
+    workflows: { wf: { modified: true, pad: "d".repeat(80_000) } },
+  });
+  storage.setItem(COMFY_DRAFT_INDEX_KEY, draft);
+  assert.equal(storage.getItem(COMFY_DRAFT_INDEX_KEY), draft, "ComfyUI must be able to persist the draft index");
+
+  const reader = new ChatHistoryStore({ storage, indexedDb });
+  const read = await reader.readCanonical();
+  const ids = new Set((read?.threads || []).map((t) => t.id));
+  for (const thread of threads) {
+    assert.ok(ids.has(thread.id), `${thread.id} must still be recoverable from IndexedDB`);
+  }
+  assert.equal(
+    failures.some((f) => f.code === "history-draft-headroom-unavailable"),
+    false,
+    "a successful reclaim must not nag",
+  );
+});
+
+test("without IndexedDB the over-budget shadow is not deleted to make room", async () => {
+  const storage = createQuotaStorage(5_000_000);
+  const threads = Array.from({ length: 10 }, (_, i) => preV1157Thread(`only-${i}`, i + 1, 80_000));
+  storage.setItem(THREADS_KEY, JSON.stringify(threads));
+  storage.setItem(META_KEY, JSON.stringify({}));
+  const store = new ChatHistoryStore({ storage, indexedDb: null, maxShadowBytes: 1_500_000 });
+  store.persist(threads, {});
+  await store.flush();
+  const kept = JSON.parse(storage.getItem(THREADS_KEY) || "[]");
+  assert.equal(kept.length, 10, "an only-copy transcript must stay when nothing is durable");
+});
+
+test("a draft probe that still fails is reported, and foreign keys stay", async () => {
+  // After the panel has done everything it is allowed to, some other occupant
+  // of the origin can still leave no room. The recovery is a message, not a
+  // wipe of site data.
+  const storage = createQuotaStorage(2_000_000);
+  const hog = "z".repeat(1_999_996);
+  storage.setItem("other-extension.blob", hog);
+  const indexedDb = createFakeIndexedDb();
+  const failures = [];
+  const store = new ChatHistoryStore({
+    storage,
+    indexedDb,
+    maxShadowBytes: 50_000,
+    onPersistenceError: (failure) => failures.push(failure),
+  });
+  store.persist([preV1157Thread("T0", 1, 40)], {});
+  assert.equal(await store.flush(), true, "history itself persisted");
+  assert.equal(store.lastDraftHeadroomOk, false);
+  assert.ok(
+    failures.some((f) => f.code === "history-draft-headroom-unavailable"),
+    "the remaining failure must be named",
+  );
+  assert.equal(storage.getItem("other-extension.blob"), hog, "foreign origin data is not cleared");
+  assert.equal(probeDraftIndexWrite(storage), false);
+});
+
+test("measurePanelShadowBytes sums only the keys it is given", () => {
+  const storage = createMemoryStorage();
+  storage.setItem(THREADS_KEY, "aaa");
+  storage.setItem(META_KEY, "bb");
+  storage.setItem("ignore-me", "cccccccc");
+  assert.equal(measurePanelShadowBytes(storage, [THREADS_KEY, META_KEY]), 5);
 });

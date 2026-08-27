@@ -11,9 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     name: Lint pack (JS syntax + Python + pyproject)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -57,8 +60,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test:unit
+      - name: Changelog release guard
+        run: npm run check:changelog
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -199,10 +204,26 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # The YARA step above covers SVG onload/onerror and process-spawn literals ONLY.
+      # It knows nothing about python_network_operations, the rule family the registry
+      # added on 2026-08-26 — which is exactly how fifteen consecutive releases shipped
+      # with this job GREEN while the registry flagged every one of them (#1854/#1886).
+      # scripts/check-registry-yara.mjs (added in #1874) does model that family; it had
+      # simply never been wired to anything, so it only ran when someone remembered.
+      #
+      # Ratcheted to ZERO. Every rule in the family is now cleared from the shipped
+      # pack: aiohttp by bare-name import, the probe socket by buffered file wrappers
+      # both directions, our own rehello-gate property by rename, Function.prototype.bind
+      # by capture-then-call, and litegraph + WebSocket by name-reached calls. Zero is
+      # the real floor now, so any NEW match is a regression and must fail the build.
+      # This number must never go up.
+      - name: Security scan (Comfy Registry parity — network rules)
+        run: node scripts/check-registry-yara.mjs --allow 0
+
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
       # the root CI artefact also silently dropped web/js/vendor/ (the runtime
-      # marked/DOMPurify/qrcode/a2ui-lit imports) from the pack — the browser
+      # marked/DOMPurify/qrcode imports) from the pack — the browser
       # 404'd on import and the sidebar never registered (#749). The parity
       # scan above reimplements the matching root-anchored and cannot see this
       # class of loss, so assert with git's OWN ignore engine instead (empty
@@ -218,8 +239,16 @@ jobs:
             web/js/vendor/marked.esm.js \
             web/js/vendor/purify.es.js \
             web/js/vendor/qrcode.esm.js \
-            web/js/vendor/a2ui-lit.bundle.js \
           ; do
+            # A path that no longer exists passes check-ignore trivially, so a stale
+            # entry reads as coverage while asserting nothing at all.
+            # web/js/vendor/a2ui-lit.bundle.js sat in this list after #1865 deleted the
+            # file, and every publish stayed green over it (#1882). Fail on the stale
+            # entry itself, so this list cannot rot back into a no-op.
+            if [ ! -e "$f" ]; then
+              echo "::error file=.github/workflows/ci.yml::$f is listed in the pack-contents gate but does not exist — remove the entry or restore the file; a listed-but-missing path makes this check silently vacuous"
+              exit 1
+            fi
             if git -c core.excludesFile=.comfyignore check-ignore -q "$f"; then
               echo "::error file=.comfyignore::$f is exclude-matched but imported at runtime — the published pack would 404 on import and the sidebar would never register (#749)"
               exit 1
@@ -234,7 +263,7 @@ jobs:
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib, re, sys
+          import tomllib, re, sys, json
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -250,10 +279,41 @@ jobs:
           js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
           assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
-          if m.group(1) != proj["version"]:
+          # package.json is the version npm bumps at release; pyproject + PANEL_VERSION are
+          # what set-version.mjs writes. Comparing only the latter two could never catch the
+          # real failure — that set-version.mjs was not run AT ALL — because one script writes
+          # both, so they cannot disagree. That is exactly how 0.15.86..0.15.96 shipped with
+          # pyproject and PANEL_VERSION frozen at 0.15.85 while CI stayed green. Compare all
+          # four, so a release that skips set-version.mjs or omits the rendered artefact
+          # is a RED build.
+          pkg = json.load(open("package.json", encoding="utf-8")).get("version")
+          try:
+              rendered = json.load(open("web/changelog.json", encoding="utf-8"))
+          except (OSError, ValueError) as error:
+              sys.exit(f"VERSION MISMATCH: web/changelog.json is unreadable — {error}")
+          releases = rendered.get("releases") if isinstance(rendered, dict) else None
+          rendered_version = (
+              releases[0].get("version")
+              if isinstance(releases, list)
+              and releases
+              and isinstance(releases[0], dict)
+              and isinstance(releases[0].get("version"), str)
+              else None
+          )
+          # web/changelog.json is the rendered artefact the panel actually ships and displays.
+          # Its newest record is a fourth witness: a release can leave all three version files
+          # coherent while still shipping notes that stop one version short (#1899).
+          seen = {
+              "package.json": pkg,
+              "pyproject.toml": proj["version"],
+              "PANEL_VERSION": m.group(1),
+              "web/changelog.json": rendered_version,
+          }
+          if len(set(seen.values())) != 1:
               sys.exit(
-                  f"VERSION MISMATCH: pyproject={proj['version']} but PANEL_VERSION={m.group(1)} "
-                  f"in comfyui-mcp-panel.js — run `node scripts/set-version.mjs {proj['version']}`."
+                  "VERSION MISMATCH: "
+                  + ", ".join(f"{k}={v}" for k, v in seen.items())
+                  + f" — run `node scripts/set-version.mjs {pkg}`."
               )
-          print(f"pyproject OK: {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          print(f"pyproject OK: {proj['name']} {proj['version']} (all four release version witnesses match)")
           PY

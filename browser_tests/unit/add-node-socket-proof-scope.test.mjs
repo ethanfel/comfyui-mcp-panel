@@ -30,7 +30,7 @@
 // THE HARNESS: these tests run the SHIPPED `graph_add_node` body, extracted from the panel
 // source and given injected collaborators — the same technique as
 // add-node-upload-widget.test.mjs. A helper-only test could not have caught this: both
-// `registeredSocketTypes` and `fetchSingleNodeDef` are individually correct. The defect is
+// `registeredSocketTypes` and `fetchSingleNodeInfo` are individually correct. The defect is
 // entirely in which payload the CALL SITE hands to which question.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -50,7 +50,7 @@ import {
   assertAddNodeResolvableRefreshing,
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
-import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -115,7 +115,58 @@ function backendObjectInfo() {
   };
 }
 
-function makeComfy() {
+function wildcardDictObjectInfo() {
+  return {
+    JsonParseNode: {
+      name: "JsonParseNode",
+      input: { required: {} },
+      output: ["*,IMAGE"],
+    },
+    DictGetNode: {
+      name: "DictGetNode",
+      input: { required: { py_dict: ["DICT", {}] } },
+      output: ["DICT_VALUE"],
+    },
+  };
+}
+
+function videoObjectInfo({ widgetInput = false } = {}) {
+  return {
+    LoadVideo: {
+      name: "LoadVideo",
+      input: { required: {} },
+      output: ["VIDEO"],
+    },
+    GetVideoComponents: {
+      name: "GetVideoComponents",
+      input: {
+        required: {
+          video: ["VIDEO", widgetInput ? { default: "a-video-value" } : {}],
+        },
+      },
+      output: ["IMAGE", "AUDIO"],
+    },
+  };
+}
+
+function apiForObjectInfo(defs) {
+  return {
+    // The issue is the bounded whole-schema read not answering. The per-class route still
+    // answers, which is the production fast path for an already-registered core class.
+    async getNodeDefs() {
+      return NODE_DEFS_NO_ANSWER;
+    },
+    async fetchApi(route) {
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      const body = Object.prototype.hasOwnProperty.call(defs, classType)
+        ? { [classType]: defs[classType] }
+        : {};
+      return { status: 200, json: async () => body };
+    },
+  };
+}
+
+function makeComfy(defs = backendObjectInfo()) {
   const widgets = {
     COMBO(node, name, spec) {
       return { widget: node.addWidget("combo", name, spec[0][0], null, { values: spec[0] }) };
@@ -172,7 +223,7 @@ function makeComfy() {
 
   // Step 4 of the report: the tab was NOT reloaded, but the panel reconnected and the
   // pack's three classes are registered. That is precisely what arms the #780 fast path.
-  void app.registerNodesFromDefs(backendObjectInfo());
+  void app.registerNodesFromDefs(defs);
 
   const graph = {
     _nodes: [],
@@ -197,6 +248,10 @@ import {
   PANEL_SRC as widenSrcForConsts,
   WIDEN_SOCKET_PROOF_TIMEOUT_MS,
   monotonicNow,
+  // #1192 — the command-budget bindings graph_add_node now names. Collected in one place
+  // because three harnesses rebuild that executor and would otherwise each need their own
+  // copy, which is how a harness acquires a stale one.
+  addNodeCommandBudgetDeps,
 } from "./_panel-constants.mjs";
 
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
@@ -255,7 +310,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     isRegisteredNodeType,
-    fetchSingleNodeDef,
+    fetchSingleNodeInfo,
     describeUnmaterializedRequiredWidgets,
     // #1180 — the panel's bounded `api.getNodeDefs()` and its timeout sentinel. Both are
     // module-scope in the real file; this harness rebuilds `graph_add_node` in a synthetic
@@ -266,6 +321,9 @@ function realGraphAddNode(comfy, overrides = {}) {
     monotonicNow,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     withTimeout,
+    // #1192 — same rule, one issue later: the command budget and the constants its steps
+    // draw from are module scope in the real file, so this scope has to name them all.
+    ...addNodeCommandBudgetDeps(),
     ...overrides,
   };
 
@@ -383,6 +441,111 @@ test("#821: refusal is not merely deferred — it does not spend the wait window
     Date.now() - startedAt < 150,
     `add should not consume the registration wait window (took ${Date.now() - startedAt}ms)`,
   );
+});
+
+test("#1584: a live wildcard producer makes a custom dict input addable", async () => {
+  const comfy = makeComfy(wildcardDictObjectInfo());
+  const { graph_add_node } = realGraphAddNode(comfy, {
+    api: {
+      async getNodeDefs() {
+        return wildcardDictObjectInfo();
+      },
+      async fetchApi(route) {
+        const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+        const defs = wildcardDictObjectInfo();
+        const body = Object.prototype.hasOwnProperty.call(defs, classType)
+          ? { [classType]: defs[classType] }
+          : {};
+        return { status: 200, json: async () => body };
+      },
+    },
+  });
+
+  const producer = await graph_add_node({ class_type: "JsonParseNode" });
+  assert.equal(producer.added.type, "JsonParseNode");
+  assert.equal(comfy.graph._nodes[0].type, "JsonParseNode", "the wildcard producer is live");
+
+  const consumer = await graph_add_node({ class_type: "DictGetNode" });
+  assert.equal(consumer.added.type, "DictGetNode");
+  assert.deepEqual(consumer.added.inputs, ["py_dict"]);
+  assert.equal(comfy.graph._nodes.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// #1589 — a producer already live on the canvas is direct socket evidence even when the
+// bounded whole-schema widen cannot answer. The call-site tests below drive the shipped
+// graph_add_node body; helper-only coverage would miss the captured live graph callback.
+// ---------------------------------------------------------------------------
+
+function addLiveVideoProducer(comfy, outputType) {
+  comfy.graph._nodes.push({
+    type: "LoadVideo",
+    outputs: [{ name: "video", type: outputType }],
+    inputs: [],
+    widgets: [],
+  });
+}
+
+function videoAdd(comfy, defs = videoObjectInfo()) {
+  return realGraphAddNode(comfy, {
+    api: apiForObjectInfo(defs),
+    // Keep the regression test bounded without waiting ten seconds for a synthetic
+    // half-open whole-schema request.
+    boundedGetNodeDefs: async () => NODE_DEFS_NO_ANSWER,
+  });
+}
+
+test("#1589: GetVideoComponents adds when a live producer exposes VIDEO", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  addLiveVideoProducer(comfy, "VIDEO");
+  const { graph_add_node } = videoAdd(comfy);
+
+  const result = await graph_add_node({ class_type: "GetVideoComponents" });
+
+  assert.equal(result.added.type, "GetVideoComponents");
+  assert.deepEqual(result.added.inputs, ["video"]);
+  assert.deepEqual(result.added.widgets, []);
+  assert.equal(comfy.graph._nodes.length, 2);
+});
+
+test("#1589: no live VIDEO producer still refuses GetVideoComponents", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  const { graph_add_node } = videoAdd(comfy);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    (err) => {
+      assert.match(err.message, /whether any installed node outputs it is UNKNOWN/);
+      assert.match(err.message, /VIDEO/);
+      return true;
+    },
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the refused add does not mutate the graph");
+});
+
+test("#1589: a live producer of another type does not prove VIDEO", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  addLiveVideoProducer(comfy, "IMAGE");
+  const { graph_add_node } = videoAdd(comfy);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    /VIDEO/,
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the unrelated producer remains the only live node");
+});
+
+test("#1589: a VIDEO producer does not waive a widget-valued VIDEO input", async () => {
+  const defs = videoObjectInfo({ widgetInput: true });
+  const comfy = makeComfy(defs);
+  addLiveVideoProducer(comfy, "VIDEO");
+  const { graph_add_node } = videoAdd(comfy, defs);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    /needs a registered widget/,
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the widget-shaped refusal does not add a node");
 });
 
 // ---------------------------------------------------------------------------
@@ -553,7 +716,18 @@ for (const [label, bad] of [
       (e) => e,
     );
     assert.ok(err, "still fails closed — an unproven sibling type is not waived");
-    assert.match(err.message, /no installed node outputs "SEEDVR2_VAE"/);
+    // #1848 — the widen is what would have answered "does anything output SEEDVR2_VAE?",
+    // and in this fixture it could not. Refusing is right; asserting ABSENCE is not, and
+    // that over-claim is the same one #821 was filed about, left behind on the failure
+    // path after #821 fixed the success path.
+    assert.doesNotMatch(
+      err.message,
+      /no installed node outputs "SEEDVR2_VAE"/,
+      "a broken whole-schema read is not evidence that nothing produces the type",
+    );
+    assert.match(err.message, /whether any installed node outputs it is UNKNOWN/);
+    assert.match(err.message, /ALSO worth a RETRY/, "the unresolved producer question is surfaced");
+    assert.match(err.message, /Reload the ComfyUI browser tab/, "and the proven cause keeps its remedy");
     assert.doesNotMatch(
       err.message,
       /SEEDVR2_DIT/,
@@ -605,10 +779,18 @@ test("#821: a failed widen leaves the guard exactly as it fails closed today", a
     },
   });
 
-  await assert.rejects(
-    () => graph_add_node({ class_type: "SeedVR2VideoUpscaler" }),
-    /no installed node outputs "SEEDVR2_DIT"/,
+  // #1848 — the guard's behaviour is unchanged (still refused, nothing added); what the
+  // refusal SAYS is not. getNodeDefs throws here, so the whole-schema proof never
+  // happened, and this is the exact sentence #821 was reported for: SeedVR2VideoUpscaler
+  // told "no installed node outputs SEEDVR2_DIT" while SeedVR2LoadDiTModel — which
+  // outputs precisely that — sat on the canvas.
+  const err = await graph_add_node({ class_type: "SeedVR2VideoUpscaler" }).then(
+    () => null,
+    (e) => e,
   );
+  assert.ok(err, "still fails closed on a fetch that did not happen");
+  assert.doesNotMatch(err.message, /no installed node outputs "SEEDVR2_DIT"/);
+  assert.match(err.message, /UNKNOWN/);
   assert.equal(comfy.graph._nodes.length, 0);
 });
 

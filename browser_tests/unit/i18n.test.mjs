@@ -267,7 +267,12 @@ test("the catalog is loaded at startup, before the panel paints", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   const setupAt = src.indexOf("async setup() {");
   assert.notEqual(setupAt, -1, "registerExtension must still have a setup()");
-  const head = src.slice(setupAt, setupAt + 900);
+  // The window covers everything setup() does BEFORE the catalog load. It grew
+  // 900 → 1200 with #1269 (duplicate-copy gate mandated-first) and 1200 → 1600
+  // with #1585 (idempotent setup so a late registration that missed ComfyUI's
+  // setup wave still paints the Agent tab). The pin's purpose — awaited, and
+  // before the first paint — is unchanged.
+  const head = src.slice(setupAt, setupAt + 1600);
   assert.match(head, /await applyPanelLocale\(\)/, "setup() must await the catalog load");
 
   // AWAITED, not fired-and-forgotten: an unawaited load resolves after the first render and
@@ -395,7 +400,7 @@ test("translating a combo changes only its TEXT, never the value that gets store
   // "chatgpt". Both are ids on the wire and neither may ever be translated, which is what
   // this list is here to hold.
   assert.deepEqual(values, [
-    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ]);
   // Every one of those labels must go through tr() — a bare string here is a row that
@@ -416,7 +421,7 @@ test("EVERY backend section label is a getter — not most of them", () => {
 
   const getters = [...block.matchAll(/^\s*get (\w+)\(\) \{ return tr\(/gm)].map((m) => m[1]);
   assert.deepEqual(getters, [
-    "claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ], "every backend must resolve its section label lazily, through tr()");
 

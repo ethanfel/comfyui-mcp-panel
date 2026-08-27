@@ -1,5 +1,9 @@
-import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
+import {
+  definitionsDifferOnlyByCompletedLoadNormalization,
+  definitionsDifferOnlyByRenumber,
+} from "./definitions-renumber.js";
 import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
+import { nodePropertiesDifferOnlyByRandomRangeNormalization } from "./node-properties-random-range.js";
 import {
   isEmptyBaselineMismatch,
   emptyBaselineNote,
@@ -610,6 +614,108 @@ function nodeIdentityKey(node) {
 }
 
 /**
+ * #1618 — fields the ComfyUI frontend recomputes while loading a graph it
+ * otherwise reproduced. Restoring them from the payload we asked to load undoes
+ * that hydration so a later save does not persist box heights / execution order
+ * the user never authored. Color/bgcolor stay out: those are authored, and a
+ * difference in them is not a measured rewrite.
+ */
+const HYDRATED_PRESENTATION_FIELDS = ["size", "order"];
+
+function cloneHydratedPresentationValue(field, value) {
+  if (field === "size") {
+    if (!Array.isArray(value) || value.length < 2) return undefined;
+    const width = Number(value[0]);
+    const height = Number(value[1]);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
+    return [width, height];
+  }
+  if (field === "order") {
+    const order = Number(value);
+    return Number.isFinite(order) ? order : undefined;
+  }
+  return undefined;
+}
+
+function presentationFieldEquals(field, liveValue, savedValue) {
+  const saved = cloneHydratedPresentationValue(field, savedValue);
+  if (saved === undefined) return false;
+  if (field === "size") {
+    const live = cloneHydratedPresentationValue("size", liveValue);
+    return live !== undefined && live[0] === saved[0] && live[1] === saved[1];
+  }
+  return Number(liveValue) === saved;
+}
+
+function writeHydratedPresentationField(live, field, value) {
+  const copy = cloneHydratedPresentationValue(field, value);
+  if (copy === undefined) return false;
+  if (field === "size") {
+    const cur = live.size;
+    if (cur && typeof cur === "object") {
+      cur[0] = copy[0];
+      cur[1] = copy[1];
+      return true;
+    }
+    live.size = copy;
+    return true;
+  }
+  live.order = copy;
+  return true;
+}
+
+/**
+ * Put the saved `size` / `order` back onto live nodes after `loadGraphData`.
+ *
+ * The frontend recomputes both during configure. Leaving them rewritten marks
+ * a clean tab modified and makes the next save persist hydration (#1618).
+ * Only nodes with the same id AND type are written; widgets, title, flags and
+ * mode are never touched. Missing or unreadable inputs are a no-op.
+ *
+ * @returns {{ restored: number, skipped: number }}
+ */
+export function applySavedNodePresentation(liveRoot, savedGraph) {
+  const result = { restored: 0, skipped: 0 };
+  if (!liveRoot || !savedGraph || typeof savedGraph !== "object") return result;
+  const savedNodes = savedGraph.nodes;
+  if (!Array.isArray(savedNodes)) return result;
+  let liveNodes;
+  try {
+    liveNodes = liveRoot._nodes ?? liveRoot.nodes;
+  } catch {
+    return result;
+  }
+  if (!Array.isArray(liveNodes)) return result;
+
+  const savedByKey = new Map();
+  for (const node of savedNodes) {
+    if (!node || typeof node !== "object") continue;
+    savedByKey.set(nodeIdentityKey(node), node);
+  }
+
+  for (const live of liveNodes) {
+    if (!live || typeof live !== "object") {
+      result.skipped += 1;
+      continue;
+    }
+    const saved = savedByKey.get(nodeIdentityKey(live));
+    if (!saved) {
+      result.skipped += 1;
+      continue;
+    }
+    let restoredThis = false;
+    for (const field of HYDRATED_PRESENTATION_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(saved, field) || saved[field] === undefined) continue;
+      if (presentationFieldEquals(field, live[field], saved[field])) continue;
+      if (writeHydratedPresentationField(live, field, saved[field])) restoredThis = true;
+    }
+    if (restoredThis) result.restored += 1;
+    else result.skipped += 1;
+  }
+  return result;
+}
+
+/**
  * WHY two node arrays differ — specifically, whether anything was LOST.
  *
  * THE DEFECT THIS ANSWERS (#825). `nodes` is a single surface holding the whole
@@ -622,17 +728,22 @@ function nodeIdentityKey(node) {
  * `unknown` either way, deliberately. It makes the DISCLOSURE say which of the two
  * it observed, because they send a reader to opposite places.
  *
- * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields }`:
+ * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields, propertyFields }`:
  *  - `sameNodeSet` — every loaded node is present with the same id AND type, and
  *    no extra ones appeared. Nothing was dropped, added or retyped.
  *  - `cosmeticOnly` — sameNodeSet AND every per-node difference is confined to
  *    COSMETIC_NODE_FIELDS. This is the "the frontend re-measured it" case.
  *  - `fields` — the per-node keys that actually differed, so the disclosure can
  *    name them instead of asking the reader to guess.
+ *  - `propertyFields` — when `properties` is one of those fields, the keys INSIDE
+ *    it that differed (#886). One field name covers both a pack-version stamp the
+ *    frontend rewrote and an extension's stored settings; the disclosure needs
+ *    the keys to tell the reader which. Empty when properties matched or its
+ *    shape was unreadable — no keys are named rather than guessed at.
  * Anything unreadable is `comparable:false` and asserts nothing.
  */
 export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
-  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [] };
+  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [], propertyFields: [] };
   if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return NOT_COMPARABLE;
   try {
     const byKey = (list) => {
@@ -683,18 +794,39 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
     const has = (node, field) =>
       Object.prototype.hasOwnProperty.call(node, field) && node[field] !== undefined;
     const fields = new Set();
+    // #886 — `properties` is one field name standing in for a whole bag of keys, and
+    // the difference between a benign one (a pack-version stamp the frontend rewrote)
+    // and a real one (an extension's stored settings) is WHICH KEYS moved. The open
+    // refusal names the field; name the keys too, so the reader can judge and the
+    // report carries the measurement a per-key account would need. Same discipline as
+    // the field comparison above: presence before value, `undefined` is absent. Only
+    // when BOTH sides are readable objects — anything else names no keys rather than
+    // guessing, exactly as an unreadable node set asserts nothing.
+    const propertyFields = new Set();
+    const readableProps = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
     for (const [key, expectedNode] of expected) {
       const actualNode = actual.get(key);
       const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
       for (const field of keys) {
-        if (has(expectedNode, field) !== has(actualNode, field)) {
-          fields.add(field);
-          continue;
-        }
+        const present = has(expectedNode, field) === has(actualNode, field);
         const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
         const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
-        if (a !== b) fields.add(field);
+        if (present && a === b) continue;
+        fields.add(field);
+        if (field !== "properties") continue;
+        const before = expectedNode.properties;
+        const after = actualNode.properties;
+        if (!readableProps(before) || !readableProps(after)) continue;
+        for (const propKey of new Set([...Object.keys(before), ...Object.keys(after)])) {
+          if (has(before, propKey) !== has(after, propKey)) {
+            propertyFields.add(propKey);
+            continue;
+          }
+          const pa = JSON.stringify(canonicalizeShapeValue(before[propKey]));
+          const pb = JSON.stringify(canonicalizeShapeValue(after[propKey]));
+          if (pa !== pb) propertyFields.add(propKey);
+        }
       }
     }
     const list = [...fields].sort();
@@ -703,6 +835,7 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
       sameNodeSet: true,
       cosmeticOnly: list.length > 0 && list.every((field) => COSMETIC_NODE_FIELDS.has(field)),
       fields: list,
+      propertyFields: [...propertyFields].sort(),
     };
   } catch {
     return NOT_COMPARABLE;
@@ -728,7 +861,7 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
  * happened — it is never evidence of a mismatch.
  */
 export function describeGraphStateDifference({ rootGraph, state } = {}) {
-  const NOT_COMPARABLE = { comparable: false, surfaces: [], nodeDifference: null };
+  const NOT_COMPARABLE = { comparable: false, surfaces: [], accountedSurfaces: [], nodeDifference: null };
   try {
     const expectedShape = buildGraphShape(state);
     let actualShape = null;
@@ -748,9 +881,45 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     const expected = canon(expectedShape);
     const actual = canon(actualShape);
     const surfaces = Object.keys(expected).filter((key) => expected[key] !== actual[key]);
+    // #1588 — WHICH OF THOSE SURFACES IS ALREADY EXPLAINED.
+    //
+    // `surfaces` answers "what disagreed". It cannot answer "and is that a difference
+    // anyone should act on", and treating the two as the same sentence is what made a
+    // faithful open of any workflow containing SUBGRAPHS read as possible data loss:
+    // the reporter's message named `nodes, definitions`, and the mere presence of a
+    // second surface sent it down the maximal-alarm path.
+    //
+    // `definitions` is the one surface with a hardened account of WHY it differs.
+    // #886 measured it on the rig: loading a persisted workflow regenerates link
+    // identity inside `definitions.subgraphs` (`state.lastLinkId` 2092 -> 2106) while
+    // node ids, types and topology stay identical. `definitionsDifferOnlyByRenumber`
+    // is the predicate `graphRootReproducesStateContent` — the VERDICT — already trusts
+    // for exactly this, and it fails CLOSED: anything it cannot fully account for
+    // returns false, which is read as "not accounted for", never as "changed".
+    //
+    // So this reports the SAME judgement the verdict makes, to the sentence that had no
+    // access to it. It decides nothing new; it stops the disclosure from being blind to
+    // a difference the verdict has already characterised.
+    //
+    // comfyui-mcp#1706 — the SECOND rewrite on the same surface, and the reason the
+    // predicate now takes the ROOT nodes. The frontend also renumbers subgraph NODE ids
+    // on load (`deduplicateSubgraphNodeIds`, measured on 1.48.7: definition node ids
+    // 78/77/76 came back 182/183/184 with the definition's links patched through the
+    // same map and `state.lastNodeId` 196 -> 214, root `nodes` unchanged). A definition
+    // node id is also referenced from OUTSIDE `definitions` — a root node's
+    // `properties.proxyWidgets` names the definition node a promoted widget comes from —
+    // so the payload's root nodes are the evidence that admits or refuses that account.
+    const accountedSurfaces = surfaces.filter(
+      (key) =>
+        key === "definitions" &&
+        definitionsDifferOnlyByRenumber(state?.definitions, actualState?.definitions, {
+          rootNodes: state?.nodes,
+        }),
+    );
     return {
       comparable: true,
       surfaces,
+      accountedSurfaces,
       // Only when `nodes` is one of the disagreeing surfaces: otherwise there is
       // nothing about the nodes to explain, and an all-clear here would read as
       // one about the difference that actually fired.
@@ -811,6 +980,13 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
  *              `localized_name`/`widget` overlaid from it, unknown saved slots
  *              appended), so a faithful open cannot round-trip what was saved.
  *              Admitted only when every difference fits that rebuild.
+ *
+ * `properties` is deliberately absent even though #1608 characterised a rewrite
+ * inside it. The field is a bag: membership here would admit ANY key that moved
+ * on the strength of evidence about `randomMin`/`randomMax`. Those two keys are
+ * filtered out below, the same way a height-only `size` is admitted by its own
+ * check rather than by the field name. `geometry_rewritten`'s note asserts a
+ * height-only rewrite, so a properties-only proof must not land in that list.
  *
  * `widgets_values` is deliberately absent despite ALSO being rewritten on every
  * load (`migrateWidgetsValues`): it is the field a genuine partial load drops,
@@ -883,8 +1059,166 @@ function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
   }
 }
 
-export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
-  const NOT_PROVEN = { proven: false, exact: false, fields: [] };
+/**
+ * Is the whole difference confined to PRESENTATION — i.e. can nothing AUTHORED have
+ * been lost? (#1623)
+ *
+ * THE DEFECT THIS ANSWERS. `workflow_open`'s pass/fail is taken from
+ * `graphRootReproducesStateContent`, whose `RECOMPUTED_NODE_FIELDS` answers a
+ * different question — "is this difference explained by a rewrite this panel has
+ * MEASURED" — and holds only `size` (height-only) and `inputs`. The DISCLOSURE asks
+ * the question the caller acts on, `cosmeticOnly`, and on the very same observation
+ * answers "you are on the right workflow and there is no missing work to redo".
+ *
+ * A reporter got exactly that sentence with the call reported as an ERROR, on two
+ * consecutive workflow switches, and went and re-read a graph that was already
+ * correct (#1623). One reply cannot say both things. So the sentence's own predicate
+ * is promoted to a shared function, and the VERDICT is taken from it too: two lists
+ * that agreed by accident and then stopped is what produced the contradiction.
+ *
+ * WHY THIS IS SAFE, against the reason `content` blocks success at all.
+ * `resolveOpenRebindVerdict` records the mechanism: `loadGraphData` catches a
+ * `configure()` throw and returns, leaving the complete node id/type set, the links
+ * and the panel's marker over nodes that silently LOST their widget values and
+ * properties — byte-identical to "the loader normalized the values", with no
+ * discriminator to separate them. That failure cannot present HERE.
+ * `widgets_values`, `properties`, `title`, `flags`, `mode`, `inputs` and `outputs`
+ * are every one of them OUTSIDE `COSMETIC_NODE_FIELDS`, and `configure()` writes
+ * them in the same pass as the cosmetic five — so a load that died mid-configure
+ * answers false on the first node it reached. One discriminator that comment once said
+ * did not exist is WHICH FIELDS DIFFER, and the panel already computes it. (The other,
+ * an observation of the load itself, is `openContentDifferenceIsCompletedLoadNormalization`
+ * below.)
+ *
+ * It is deliberately NOT a widening of `RECOMPUTED_NODE_FIELDS`. That set licenses
+ * "the content was reproduced", which is why it demands a characterised rewrite per
+ * field; this one licenses only "nothing authored was lost", which is the weaker
+ * claim the open's pass/fail actually turns on. `widgets_values` stays outside BOTH,
+ * so the guard #1111 and #1089 exist for is untouched: a widget value that differs
+ * still fails the open, however plausibly a frontend might have normalized it.
+ */
+export function openContentDifferenceIsPresentationOnly({ comparable, surfaces, nodeDifference } = {}) {
+  // Never inferred from an absent comparison — `comparable:false` means no comparison
+  // happened, which is not evidence in either direction.
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  // `nodes`, and NOTHING else. A group, a link, a reroute or a definitions difference
+  // is unexplained by anything a node comparison establishes — #825's own rule, kept.
+  if (unique.length !== 1 || unique[0] !== "nodes") return false;
+  // THESE TWO OVERLAP for anything `classifyNodeDifference` produces — it computes
+  // `fields` only once the sets match, so its `cosmeticOnly:true` already implies
+  // `sameNodeSet:true`, and deleting the set check kills no test off that classifier
+  // alone (measured: the mutation survived until a test was written for it). Both are
+  // kept because they answer different questions — "is this the same graph" and "can
+  // the panel name what moved" — and this predicate is EXPORTED, so it must refuse an
+  // inconsistent shape rather than let a set difference through on a field list.
+  return (
+    nodeDifference?.comparable === true &&
+    nodeDifference.sameNodeSet === true &&
+    // `cosmeticOnly` is itself false for an EMPTY field list, so this cannot pass on a
+    // `nodes` surface nobody could name a difference in.
+    nodeDifference.cosmeticOnly === true
+  );
+}
+
+/**
+ * #1477 — the live root differs from what was loaded ONLY on `definitions`.
+ *
+ * Binding (instance, marker, identity) is a separate question, already proven by
+ * the time this is asked. A previous-workflow graph (#1111/#1089) disagrees on
+ * `nodes` / `links` / `groups`, not on this surface alone. So a definitions-only
+ * mismatch is a frontend id rewrite (or an unaccounted cousin of one), not a
+ * wrong canvas, and it must not leave the session fenced to the prior workflow.
+ *
+ * It does NOT claim the subgraph internals are the file's. Callers disclose.
+ */
+export function openContentDifferenceIsDefinitionsOnly({ comparable, surfaces } = {}) {
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  return unique.length === 1 && unique[0] === "definitions";
+}
+
+/**
+ * Did this open apply COMPLETELY, leaving only per-node fields the frontend rewrote?
+ * (panel#1283 / #1285 / #1307 / #1330, comfyui-mcp#1705)
+ *
+ * ## The defect this answers
+ *
+ * Five reporters got `isError` on an open the same reply describes as correct: the
+ * canvas bound, every node present with the same id and type, nothing extra — and a
+ * per-node difference in `widgets_values`, `outputs`, `properties` or
+ * `widgets_values_named`. None of those is on `COSMETIC_NODE_FIELDS`, so #1623's
+ * presentation-only ground does not reach them, and none has a per-field rewrite
+ * account, so `RECOMPUTED_NODE_FIELDS` does not either.
+ *
+ * The two existing grounds are both FIELD-LEVEL: they ask "is a difference in THIS
+ * NAME benign". That question cannot be answered for `widgets_values` — it is the
+ * field a genuine partial load drops, which is what #1111/#1089 are about — and
+ * chasing it field by field just moves the refusal to the next field a pack invents.
+ * `outputs` would be the sixth such entry; `widgets_values_named` the seventh.
+ *
+ * ## So this asks a different question, at a different level
+ *
+ * `resolveOpenRebindVerdict` states exactly one mechanism for why a content
+ * difference might mean data loss: `loadGraphData` catches a mid-`configure()` throw
+ * and returns, leaving the node id/type set and the marker over nodes that lost their
+ * values. Before panel#1283/#1358 it added that no discriminator separates that from
+ * normalization; that sentence is gone from it now and points back here instead.
+ *
+ * There is one, and the panel already owns half of it. `installNodeConfigureIsolation`
+ * (#1260) records every per-node `configure` throw; `installGraphConfigureWatch`
+ * records a throw out of the graph restore itself. MEASURED against the frontend
+ * source: those two are the ONLY places the restore can abort — `LGraph.configure`
+ * runs the node pass with no try/catch of its own, and nothing between it and
+ * `loadGraphData`'s catch adds one. So `loadRanToCompletion === true` REFUTES the
+ * hypothesis the refusal rests on, for this load, by observation.
+ *
+ * ## What it therefore may and may not claim
+ *
+ * It licenses "the load did not stop early, so nothing was dropped by a failed
+ * restore". It does NOT license "these values are the file's values" — the caller is
+ * told which fields differ and that a widget value is content. That is why the reply
+ * this feeds carries `content_normalized` with the field names rather than silence.
+ *
+ * Everything else still refuses, and deliberately:
+ *  - `loadRanToCompletion !== true` — a throw was recorded, OR the frontend could not
+ *    be instrumented at all. Unknown is not a yes: the strict `=== true` is what keeps
+ *    an un-watched load on the old, refusing path.
+ *  - any surface but `nodes` — a lost link, group, reroute or unaccounted definitions
+ *    block is not explained by anything a completed node pass establishes.
+ *  - a changed node SET — a missing, extra or retyped node is the shape real loss
+ *    takes, and a completed restore does not produce it.
+ *  - an unnamed difference — `fields` empty means the classifier could not point at
+ *    what moved, and proving an open off a difference nobody can name is the
+ *    fabricated all-clear this module exists to avoid.
+ */
+export function openContentDifferenceIsCompletedLoadNormalization({
+  comparable,
+  surfaces,
+  nodeDifference,
+  loadRanToCompletion,
+} = {}) {
+  // STRICTLY true. `null` is "nobody watched" and `false` is "something threw"; both
+  // must refuse, and collapsing either into a truthiness test is the same two-states-
+  // one-answer fold this predicate exists to undo.
+  if (loadRanToCompletion !== true) return false;
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  if (unique.length !== 1 || unique[0] !== "nodes") return false;
+  if (nodeDifference?.comparable !== true || nodeDifference.sameNodeSet !== true) return false;
+  return Array.isArray(nodeDifference.fields) && nodeDifference.fields.length > 0;
+}
+
+export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCompletion } = {}) {
+  const NOT_PROVEN = {
+    proven: false,
+    exact: false,
+    fields: [],
+    presentationOnly: false,
+    normalizedOnly: false,
+    normalizedFields: [],
+    definitionsNormalized: false,
+  };
   try {
     // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
     // per check let a synchronous serialization hook — a broken or hostile custom node —
@@ -894,11 +1228,128 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     const actualState = rootGraph?.serialize?.();
     if (actualState == null) return NOT_PROVEN;
     const frozen = { serialize: () => actualState };
-    if (graphRootMatchesState({ rootGraph: frozen, state })) return { proven: true, exact: true, fields: [] };
+    if (graphRootMatchesState({ rootGraph: frozen, state })) {
+      return {
+        proven: true,
+        exact: true,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+        definitionsNormalized: false,
+      };
+    }
     const diff = describeGraphStateDifference({ rootGraph: frozen, state });
     // Never inferred from an absent comparison: `comparable:false` means no
     // comparison happened, which is not evidence either way.
     if (diff?.comparable !== true) return NOT_PROVEN;
+    // panel#1283 family — the surfaces still UNEXPLAINED, which is what #1588's second
+    // round established the reassurance's own predicate must read. `definitions` differs
+    // on every open of a workflow containing subgraphs (#886: link ids are regenerated),
+    // and `describeGraphStateDifference` has already run the SAME fail-closed predicate
+    // the strict proof below trusts to decide whether THIS difference is only that. A
+    // surface that predicate accounted for is not a second unexplained difference, and
+    // comfyui-mcp#1705 is precisely the shape that fails on it: `nodes, definitions`.
+    //
+    // #1477 — computed BEFORE presentationOnly so that ground can read the same list.
+    // Passing the RAW surfaces made a cosmetic-only node rewrite plus an accounted
+    // `definitions` difference fail presentation-only (unique length 2), so a faithful
+    // tab-switch onto a subgraph workflow still refused as root-workflow-uuid-mismatch.
+    const accounted = Array.isArray(diff.accountedSurfaces) ? diff.accountedSurfaces : [];
+    const unexplainedSurfaces = (Array.isArray(diff.surfaces) ? diff.surfaces : []).filter(
+      (s) => !accounted.includes(s),
+    );
+    // #1623 — the WEAKER question ("could anything authored have been lost"), asked
+    // off THE SAME SNAPSHOT the strict proof below reads. Answering it from a second
+    // serialization would reopen exactly the hole the frozen snapshot closes: a
+    // synchronous serialization hook could show a cosmetic-only difference here and a
+    // changed widget to the proof, and the open would be reported applied on content
+    // no single comparison ever saw.
+    //
+    // Every refusal BELOW this line is a refusal of the strict proof only, so each one
+    // carries this answer out rather than discarding it — the reporter's own case
+    // (`pos`/`order`, and a `size` whose WIDTH moved) is refused by the strict proof
+    // and is presentation-only, and returning the shared `NOT_PROVEN` there is what
+    // would have left the fix wired into a branch its own bug report cannot reach.
+    //
+    // panel#1283 family — AND NOT WHEN A RESTORE FAILURE WAS RECORDED. This is a hole the
+    // observation OPENS if it is only ever used to say yes, and it is worth spelling out.
+    // Before it, `workflow_open` did not contain a per-node `configure` throw, so a node
+    // that threw aborted the whole restore and the links and groups never landed — which
+    // this predicate refuses on the surface list. With the throw contained, the rest of
+    // the graph restores and the throwing node sits at CONSTRUCTION DEFAULTS, including
+    // `pos: [10, 10]` — and `pos` IS cosmetic. A node whose saved state differed from its
+    // defaults only in position would then be waved through as "nothing authored was lost"
+    // while the user's layout for it was in fact lost.
+    //
+    // So a recorded throw vetoes the weaker ground. `proven` is deliberately NOT vetoed:
+    // byte equality with the payload means nothing was lost whatever threw. And this is
+    // `=== false`, so a caller that passes nothing (every caller but the open) behaves
+    // exactly as before.
+    const presentationOnly =
+      loadRanToCompletion !== false &&
+      openContentDifferenceIsPresentationOnly({
+        comparable: true,
+        surfaces: unexplainedSurfaces,
+        nodeDifference: diff.nodeDifference,
+      });
+    // The load RAN TO COMPLETION, so the mid-`configure()` partial load the strict
+    // refusal rests on did not happen here. Weaker than `presentationOnly` about the
+    // fields (it names them rather than vouching for them) and stronger about the LOAD
+    // (it is an observation of this restore, not a judgement about a field name).
+    //
+    // panel#1283 (the 2026-08-21 recurrence) — AND THE SAME GROUND ONE LEVEL DOWN.
+    //
+    // `definitions` is subtracted from `unexplainedSurfaces` above only by
+    // `definitionsDifferOnlyByRenumber`, which is FIELD-LEVEL: it enumerates what a
+    // renumbering may touch and requires every other field to be deep-equal. Measured in
+    // a real browser on v0.15.32 / ComfyUI 0.33.2 / frontend 1.49.6, an installed pack
+    // stamps a key into every node's `properties` during `configure`. On the ROOT nodes
+    // that is already accounted for — by the completed-load ground immediately below,
+    // which admits any NAMED per-node difference once the panel has watched the restore
+    // run to completion. The identical rewrite, on the same nodes, inside a subgraph
+    // definition had no account at all, so a faithful open of any subgraph workflow on
+    // that machine was refused on `nodes, definitions`, published no `workflow_uuid`, and
+    // sent the caller through the multi-call recovery this whole cluster is about.
+    //
+    // So the completed-load ground reads the surface list with that account applied too.
+    // Deliberately NOT applied to `presentationOnly`: that ground claims "nothing
+    // AUTHORED was lost", and this admits an arbitrary per-node field inside a definition
+    // — a claim only the weaker, observation-licensed ground may make.
+    const definitionsNormalized =
+      unexplainedSurfaces.includes("definitions") &&
+      definitionsDifferOnlyByCompletedLoadNormalization(state?.definitions, actualState?.definitions, {
+        loadRanToCompletion,
+      });
+    const normalizedOnly = openContentDifferenceIsCompletedLoadNormalization({
+      comparable: true,
+      surfaces: definitionsNormalized
+        ? unexplainedSurfaces.filter((surface) => surface !== "definitions")
+        : unexplainedSurfaces,
+      nodeDifference: diff.nodeDifference,
+      loadRanToCompletion,
+    });
+    const notProven = {
+      proven: false,
+      exact: false,
+      // NAMED, so the reply can tell the caller which fields moved instead of asking
+      // them to guess — the same contract `geometry_rewritten` already has. Empty
+      // unless presentation-only, because on any other refusal these fields describe a
+      // difference nobody has accounted for.
+      fields: presentationOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
+      presentationOnly,
+      normalizedOnly,
+      // Carried on EVERY refusal below, for the same reason `presentationOnly` is: the
+      // reporters' own cases (`widgets_values`, `outputs`, `properties`) are refused by
+      // the strict proof, so a fix that only populated this on the success path would be
+      // wired into a branch its own bug reports cannot reach.
+      normalizedFields: normalizedOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
+      // Only when it actually CARRIED the verdict. The caller turns this into the
+      // `definitions_unverified` disclosure, and a reply may not announce a subgraph
+      // difference the verdict never rested on — this is an account that was USED, not
+      // one that would have applied had some other refusal not fired first.
+      definitionsNormalized: normalizedOnly && definitionsNormalized,
+    };
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
     // unexplained by anything the node comparison establishes.
@@ -910,7 +1361,7 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
     // had characterised.
     //
-    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // Everything else still refuses. `definitionsDifferOnlyByRenumber` returns
     // false for anything it cannot fully account for, and the caller reads that as
     // "not proven" — never as "changed".
     // The surface set must be a subset of { nodes, definitions } — nothing else is
@@ -925,17 +1376,36 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // differing surface, so requiring `nodes` refused exactly the case this exists to
     // prove — a fix wired into a branch its own bug report cannot reach.
     const unique = [...new Set(surfaces)];
-    if (!unique.length) return NOT_PROVEN;
-    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return NOT_PROVEN;
+    if (!unique.length) return notProven;
+    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return notProven;
     if (unique.includes("definitions")) {
-      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
-        return NOT_PROVEN;
+      // comfyui-mcp#1706 — `state?.nodes` is not decoration here. The node-id
+      // relabeling is admitted only against the PAYLOAD's root nodes, because a root
+      // node's `properties.proxyWidgets` references a definition node BY ID: when the
+      // relabeling touches one of those, the frontend's own `patchProxyWidgets` runs
+      // over `rootNodes` too and the promoted widget's value did not survive (measured).
+      // Without this argument the predicate answers the pre-#1706 question, so removing
+      // it silently un-ships the fix.
+      if (
+        !definitionsDifferOnlyByRenumber(state?.definitions, actualState?.definitions, {
+          rootNodes: state?.nodes,
+        })
+      ) {
+        return notProven;
       }
     }
     // A definitions-only difference is fully accounted for once the renumber check
     // passes: there is no node difference to classify.
     if (!unique.includes("nodes")) {
-      return { proven: true, exact: false, fields: [] };
+      return {
+        proven: true,
+        exact: false,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+        definitionsNormalized: false,
+      };
     }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
@@ -945,14 +1415,14 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // because they answer different questions — "is this the same graph" and "can the
     // panel name what moved" — and a later change to one classifier must not silently
     // remove the other's guarantee.
-    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return NOT_PROVEN;
+    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return notProven;
     const fields = Array.isArray(nodes.fields) ? nodes.fields : [];
     // WIDTH IS NOT MEASURED (codex r2). The evidence is a recomputed HEIGHT, and a
     // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
     // width, or an arbitrary replacement, would have been PROVEN on the strength of a
     // measurement about something else. Every differing size must be height-only.
     if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
-      return NOT_PROVEN;
+      return notProven;
     }
     // #1467 — `inputs` is REBUILT by the frontend, not restored, and admitting it
     // needs the same treatment `size` gets: characterise the rewrite and require
@@ -974,14 +1444,50 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
       fields.includes("inputs") &&
       !nodeInputsDifferOnlyByDefinitionRebuild(state?.nodes, actualState?.nodes)
     ) {
-      return NOT_PROVEN;
+      return notProven;
+    }
+    // #1608 — `properties` is a bag, and the characterised rewrite is two keys
+    // inside it (`randomMin`/`randomMax`), not the field. A field-name allowlist
+    // would admit a pack-version stamp on the strength of evidence about Seed
+    // range bounds. The check refuses any other key; when it passes, drop
+    // `properties` from the remaining list so it cannot ride into
+    // `geometry_rewritten` (that note asserts a height-only rewrite).
+    let remaining = fields;
+    if (fields.includes("properties")) {
+      if (!nodePropertiesDifferOnlyByRandomRangeNormalization(state?.nodes, actualState?.nodes)) {
+        return notProven;
+      }
+      remaining = fields.filter((field) => field !== "properties");
     }
     // An empty field list with a differing `nodes` surface means the two disagreed
     // somewhere this classifier could not name — proving content off a difference
     // nobody can point at is exactly the fabricated all-clear to avoid.
-    if (!fields.length) return NOT_PROVEN;
-    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return NOT_PROVEN;
-    return { proven: true, exact: false, fields };
+    // An empty REMAINING list after the properties account is the opposite: the
+    // difference was named (`properties`) and fully characterised, same shape as
+    // a definitions-only renumber (proven, not exact, nothing to disclose as
+    // geometry).
+    if (!remaining.length) {
+      if (!fields.length) return notProven;
+      return {
+        proven: true,
+        exact: false,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+        definitionsNormalized: false,
+      };
+    }
+    if (!remaining.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
+    return {
+      proven: true,
+      exact: false,
+      fields: remaining,
+      presentationOnly: false,
+      normalizedOnly: false,
+      normalizedFields: [],
+      definitionsNormalized: false,
+    };
   } catch {
     return NOT_PROVEN;
   }
@@ -1016,6 +1522,11 @@ export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } 
   // belongs to a different tab.
   if (activeWorkflow?.isModified === true) return false;
   const activeState = activeWorkflowCurrentState(activeWorkflow);
+  // #1477 — a definitions-only (or presentation-only) rewrite is THIS workflow's
+  // canvas, not a different graph. Byte-shape treats regenerated subgraph ids as
+  // a mismatch, so after the tab-switch rebind restamped the tag the shape guard
+  // still refused panel_graph_outline. Same proof the rebind already asked.
+  if (graphRootAgreesWithActiveState(rootGraph, activeState)) return false;
   const expected = activeState?.nodes;
   const live = rootGraph?._nodes;
   if (!Array.isArray(expected) || !Array.isArray(live)) return false;
@@ -1201,6 +1712,100 @@ export function graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkf
 }
 
 /**
+ * #1187 — does the live root still CONTAIN the active workflow's whole structure?
+ * Every node the workflow's own current state carries is present with the same id
+ * and type, every one of its links survives, and each remaining structural surface
+ * (floating links, reroutes, groups, config, top-level subgraphs, definitions,
+ * content-bearing extra) is EQUAL. The live root may carry MORE — extra nodes and
+ * extra links — and that is the whole point:
+ *
+ * ChangeTracker captures on user-input events, so a structural HAND EDIT (a node
+ * added, a wire dropped) leaves `activeState` one capture behind the canvas while
+ * `isModified` has not flipped. In that window `graphRootStructureMatchesActive-
+ * Workflow` is false BY DEFINITION — the edit differs structurally — so the
+ * equality relaxation above can never rescue the read, and every graph tool
+ * refuses the workflow's own canvas until the tracker happens to capture. That
+ * window is exactly "the live root is the workflow's structure PLUS the edit",
+ * which this predicate proves from content alone.
+ *
+ * Why the addition-only direction, and why each clause is load-bearing:
+ *
+ *   CONTAINMENT, not intersection. An admitted canvas holds EVERY node and link
+ *   the workflow owns, unaltered — a read served from it can never under-report
+ *   the workflow (the count-short read is the #618 lesson, and a canvas missing
+ *   the workflow's content is what the whole guard exists to refuse). The mirror
+ *   relation — live ⊆ state, a hand REMOVAL still in the lag window — would admit
+ *   exactly that under-reporting canvas, so removals keep refusing here and
+ *   self-clear when the tracker captures. Deliberate, and disclosed in the PR.
+ *
+ *   Non-node/link surfaces stay EQUAL. Adding a node or a wire does not rewrite
+ *   groups, reroutes, subgraphs, definitions or extra, so a canvas that differs
+ *   there is not "A plus an edit" and stays refused, exactly as under the
+ *   equality relaxation.
+ *
+ *   Fail closed on an unreadable side, like every predicate in this module: a
+ *   comparison that could not run is not containment.
+ *
+ * IDENTITY IS STILL A SEPARATE CONJUNCT — this predicate is consulted only
+ * alongside `graphRootWorkflowUuidMatches`, so the stale-tag legs recorded in
+ * docs/design/graph-binding-tag-vs-tracker.md are answered the same way the
+ * equality relaxation answers them: the tag is never trusted alone, and the
+ * content proof demanded here is one no foreign canvas satisfies (a different
+ * workflow does not contain this one's node ids and links). The known residual
+ * is the seal's closed-duplicate gap, widened from "still structurally A" to
+ * "structurally A plus additions": a stranded duplicate canvas that already
+ * carries A's tag and then gains nodes keeps its reads. That is the same
+ * ambiguity `graphRootContentDriftOnBoundCanvas`'s comment accepts knowingly —
+ * the two canvases are observationally identical to every signal the panel has,
+ * and #1187 cannot be fixed without admitting the edit — while the bound still
+ * holds in the direction that matters: nothing A owns can be absent.
+ */
+export function graphRootStructureExtendsActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  try {
+    const expected = buildGraphStructureShape(activeWorkflowCurrentState(activeWorkflow));
+    if (expected == null) return false;
+    let actual = null;
+    try {
+      actual = buildGraphStructureShape(rootGraph?.serialize?.());
+    } catch {
+      return false;
+    }
+    if (actual == null) return false;
+    // Nodes: containment by identity (id + type), the same identity
+    // buildGraphStructureShape establishes — type-qualified, so numeric 1 and
+    // string "1" still cannot collide.
+    const actualNodes = new Set(actual.nodes.map((node) => JSON.stringify([node.id, node.type])));
+    for (const node of expected.nodes) {
+      if (!actualNodes.has(JSON.stringify([node.id, node.type]))) return false;
+    }
+    // Links: every link the workflow's state carries must survive on the live
+    // root; the live root may carry extra ones (a wire to the node just added).
+    // A links surface that is present but not an array is malformed — fail closed.
+    const linkSet = (surface) => {
+      if (!surface.present) return new Set();
+      if (!Array.isArray(surface.value)) return null;
+      return new Set(surface.value.map((link) => JSON.stringify(canonicalizeShapeValue(link))));
+    };
+    const expectedLinks = linkSet(expected.links);
+    const actualLinks = linkSet(actual.links);
+    if (expectedLinks == null || actualLinks == null) return false;
+    for (const link of expectedLinks) {
+      if (!actualLinks.has(link)) return false;
+    }
+    // Everything else that identifies a workflow must be EQUAL — an added node
+    // does not touch these surfaces, so a difference here is not the hand edit
+    // this relaxation exists for.
+    const restOf = (shape) => {
+      const { nodes, links, ...rest } = shape;
+      return JSON.stringify(canonicalizeShapeValue(rest));
+    };
+    return restOf(actual) === restOf(expected);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True only when a root graph carries a durable workflow UUID that conflicts
  * with the active workflow object's already-established UUID. Missing identity
  * on either side is inconclusive: older frontends and first observation must
@@ -1338,9 +1943,9 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
  *   NODE wrote (a populated wildcard, a rolled seed) is on the canvas, never marks
  *   the tab modified, and was never saved — the re-read would silently replace
  *   exactly what an agent just generated. The same flag fails in the other direction
- *   too: a first-time open never runs `clearSpuriousOpenModified`, so a cold-opened
- *   tab reads modified forever, and gating on it would have disarmed this guard for
- *   that entire population. #442's re-read survives the argument only because it
+ *   too: a first-time open can still read modified when freeze/re-baseline is
+ *   unavailable, and gating on it would have disarmed this guard for that
+ *   population. #442's re-read survives the argument only because it
  *   fires on the FILE provably having changed, which is independent evidence about
  *   the disk copy. A foreign source tag is no evidence about the file at all.
  *
@@ -1429,20 +2034,32 @@ export const OPEN_REBIND_STATUS = Object.freeze({
  * from the bytes handed in. It is therefore genuinely a false negative to deny the
  * OPEN for it, and softening it was tried here.
  *
- * It was reverted, because the two cases cannot currently be told apart. LiteGraph
- * creates every node (with its id and type) and THEN configures each one, and
- * `loadGraphData` catches a `configure()` failure and returns. A throw in that
+ * It was reverted the first time, because the two cases could not then be told apart.
+ * LiteGraph creates every node (with its id and type) and THEN configures each one,
+ * and `loadGraphData` catches a `configure()` failure and returns. A throw in that
  * second pass leaves the complete node id/type set, the links, and the panel's
  * marker — written by `_configureBase` before any node is built — over nodes that
  * silently LOST their widget values and properties. That is byte-for-byte the same
- * observation as "the loader normalized the widget values", and no discriminator
- * available to the panel separates them. Reporting it as a completed open would
- * fabricate a success over data loss, which is worse than the false negative.
+ * observation as "the loader normalized the widget values". Reporting it as a
+ * completed open would fabricate a success over data loss, which is worse than the
+ * false negative.
  *
- * So `unknown` stays `unknown` here — deliberately, and it is the honest answer to a
- * question this code cannot settle. What the status split buys is that the
- * DISCLOSURE can now say the binding IS proven and only the content is unconfirmed,
- * instead of implying the canvas may be the wrong workflow.
+ * THE DISCRIMINATOR NOW EXISTS (panel#1283 / #1358), and it is not a field-name
+ * judgement — it is an observation of THIS load. `installNodeConfigureIsolation` and
+ * `installGraphConfigureWatch` (web/js/lib/load-restore-isolation.js) wrap the only
+ * two places the restore can abort, `loadRestoreCompleted` folds them into
+ * true/false/null, and `openContentDifferenceIsCompletedLoadNormalization` (above)
+ * consumes it. In one line: **a mid-`configure()` abort is a THROW, and a load whose
+ * throws the panel watched for and did not see did not abort.** Only an explicit
+ * `true` licenses anything — `false` (something threw) and `null` (the watch was
+ * absent, or installed on a method this frontend's restore never called) both keep
+ * the old, refusing path.
+ *
+ * `resolveOpenRebindVerdict` itself is unchanged and still says `unknown` on
+ * `contentMatches !== true`: the discriminator is applied UPSTREAM, where the content
+ * proof is computed, so what arrives here is already the answer. What the status split
+ * buys is that the DISCLOSURE can say the binding IS proven and only the content is
+ * unconfirmed, instead of implying the canvas may be the wrong workflow.
  *
  * Every part is compared against `true` explicitly: an unreadable observation
  * arrives as null/undefined and must count as NOT proven, never as proven.
@@ -1532,6 +2149,21 @@ function nodeSurfaceClause(observed = {}) {
     );
   }
   const fields = (diff.fields ?? []).join(", ") || "no readable field";
+  // #886 — when `properties` is among the differing fields, name the KEYS that
+  // differ inside it. "properties" alone sends the reader to re-read the whole
+  // graph for what may be a rewritten pack-version stamp; the keys are the
+  // difference between that and an extension's stored settings, and naming them
+  // is what turns the next report of this shape into the measurement a per-key
+  // account could be written from. Capped, so a hostile properties bag cannot
+  // grow this clause without bound; the cap only trims the LIST, never the
+  // verdict, which this clause does not touch.
+  const propertyKeys = Array.isArray(diff.propertyFields) ? diff.propertyFields : [];
+  const namedKeys = propertyKeys.slice(0, 10).join(", ");
+  const keyDetail =
+    diff.fields?.includes("properties") && namedKeys
+      ? `; within properties, the keys that differ are: ${namedKeys}` +
+        (propertyKeys.length > 10 ? `, and ${propertyKeys.length - 10} more` : "")
+      : "";
   if (diff.cosmeticOnly) {
     // States the NODE observation and stops. The overall "nothing to redo"
     // conclusion is the headline's to draw, and only when `nodes` is the sole
@@ -1549,9 +2181,104 @@ function nodeSurfaceClause(observed = {}) {
   }
   return (
     ` — every node that was loaded IS on the canvas with the same id and type and nothing extra ` +
-    `appeared, so no node was lost; what differs is per-node (${fields}). A widget value is real ` +
+    `appeared, so no node was lost; what differs is per-node (${fields})${keyDetail}. A widget value is real ` +
     `content, so read it (panel_graph_outline) before assuming either way`
   );
+}
+
+/**
+ * The restore ABORTED — say so, and name what aborted it. (panel#1283 family)
+ *
+ * Only when `contentLoadRanToCompletion` is explicitly `false`: the panel watched this
+ * load and something threw. `null` means the load could not be watched, which is the
+ * pre-existing state of knowledge and gets no sentence — an absent observation must
+ * not be narrated as a clean one OR as a failed one.
+ *
+ * This is the ONE case where a content difference has a KNOWN cause other than the
+ * frontend rewriting its own fields, so it is the one the reader most needs named.
+ * Without it the refusal says "widget values differ" and leaves them to guess between
+ * a normalization and a node that never got its values at all.
+ */
+function abortedRestoreClause(observed = {}) {
+  if (observed.contentLoadRanToCompletion !== false) return "";
+  const failures = Array.isArray(observed.contentRestoreFailures) ? observed.contentRestoreFailures : [];
+  // Capped like `nodeSurfaceClause`'s property keys: a graph full of broken nodes must
+  // not grow this clause without bound. The cap trims the LIST, never the claim.
+  const named = failures
+    .slice(0, 10)
+    .map((f) => {
+      const widgets = Array.isArray(f?.widgetDifferences) && f.widgetDifferences.length
+        ? `; widgets not verified: ${f.widgetDifferences.join(", ")}`
+        : "";
+      const linkDriven =
+        Array.isArray(f?.linkDrivenWidgetDifferences) && f.linkDrivenWidgetDifferences.length
+          ? `; link-driven widgets observed: ${f.linkDrivenWidgetDifferences.join(", ")}`
+          : "";
+      return `${f?.type ?? "node"} (id ${f?.id ?? "?"})${f?.error ? `: ${f.error}` : ""}${widgets}${linkDriven}`;
+    })
+    .join("; ");
+  if (!named) {
+    // Something threw, and nothing is still broken that the panel can name — a node
+    // whose post-load retry repaired it, or a throw out of the graph restore itself.
+    // The refusal stands (a restore that stopped early is not one whose result can be
+    // called byte-identical) but it may NOT claim values are missing, because the
+    // observation that would support that is exactly the one that came back empty.
+    return (
+      `. The restore also DID NOT RUN TO COMPLETION: the panel watched this load and ` +
+      `something threw while the graph was being restored. No node is still reported ` +
+      `unrestored, so this may already be repaired — but the panel cannot call the result ` +
+      `byte-identical, which is why the content stays unconfirmed rather than applied`
+    );
+  }
+  return (
+    `. AND THE RESTORE DID NOT RUN TO COMPLETION: the panel watched this load and ` +
+    `${failures.length} node(s) are still at CONSTRUCTION DEFAULTS after a post-load retry — ` +
+    `${named}` +
+    (failures.length > 10 ? `, and ${failures.length - 10} more` : "") +
+    `. So this difference is NOT the frontend normalizing its own fields: part of what was ` +
+    `loaded never landed. Fix or update the pack that threw, then open again`
+  );
+}
+
+/** The only surfaces this file has a written account of. `definitions` differs on a
+ *  faithful open because loading a saved workflow regenerates ids inside subgraph
+ *  definitions — LINK ids (#886, measured: state.lastLinkId 2092 -> 2106) and, when they
+ *  collide with the payload's own root node ids, NODE ids (comfyui-mcp#1706, measured:
+ *  78/77/76 -> 182/183/184 with the definition's links patched through the same map).
+ *  `definitionsDifferOnlyByRenumber` decides per-case whether THIS difference is only
+ *  those. Nothing else has such an account, so nothing else may be waved through. */
+const ACCOUNTABLE_CONTENT_SURFACES = new Set(["definitions"]);
+
+/**
+ * #1588 — the differing surfaces, split by whether anything ACCOUNTS for them.
+ *
+ * `contentAccountedSurfaces` is produced by `describeGraphStateDifference` from the
+ * same predicate the content VERDICT uses, so the disclosure and the verdict cannot
+ * disagree about what a `definitions` difference means. Absent (an older caller, or a
+ * comparison that never happened) it is an empty list, which reproduces the previous
+ * behaviour exactly — an unknown account is not an account.
+ */
+function accountedContentSurfaces(observed = {}) {
+  const accounted = observed.contentAccountedSurfaces;
+  if (!Array.isArray(accounted)) return [];
+  const surfaces = observed.contentSurfaces ?? [];
+  // TWO gates, and both are about the direction that costs something. This list
+  // SHRINKS the set of differences a reader is asked to worry about, so a wrong entry
+  // here waves away a real one.
+  //  • `ACCOUNTABLE_CONTENT_SURFACES` — only a surface with a written, hardened account
+  //    of WHY it differs may appear. Today that is `definitions` and nothing else; a
+  //    caller cannot use this channel to excuse `groups` or `links`, whose differences
+  //    nothing has characterised. Widening it means writing the account first.
+  //  • membership in `contentSurfaces` — a name that did not actually differ is not an
+  //    account of anything, and must not be able to shorten the unexplained list.
+  return accounted.filter(
+    (s) => typeof s === "string" && ACCOUNTABLE_CONTENT_SURFACES.has(s) && surfaces.includes(s),
+  );
+}
+
+function unexplainedContentSurfaces(observed = {}) {
+  const accounted = accountedContentSurfaces(observed);
+  return (observed.contentSurfaces ?? []).filter((s) => !accounted.includes(s));
 }
 
 /** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
@@ -1587,12 +2314,36 @@ function openRebindPartClause(part, observed = {}) {
       // (which tests `=== true`) correctly said the panel could not read the graph,
       // and one disclosure contradicted itself. Both now ask the same question, and
       // the burden sits on the CLAIM: only a positive "yes, compared" licenses it.
-      return contentWasCompared(observed)
-        ? `the graph on the canvas differs from what was loaded on: ` +
-            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}` +
-            nodeSurfaceClause(observed)
-        : `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
-            `not established — whether the whole graph landed`;
+      if (!contentWasCompared(observed)) {
+        return (
+          `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
+          `not established — whether the whole graph landed`
+        );
+      }
+      // #1588 — name the surfaces that are still UNEXPLAINED, and account for the rest
+      // separately. Listing an accounted-for `definitions` alongside a genuinely
+      // unexplained `nodes` invites the reader to weigh two differences when only one
+      // of them is a question.
+      const unexplained = unexplainedContentSurfaces(observed);
+      const accounted = accountedContentSurfaces(observed);
+      const named = unexplained.join(", ") || "an unnamed surface";
+      return (
+        `the graph on the canvas differs from what was loaded on: ${named}` +
+        nodeSurfaceClause(observed) +
+        abortedRestoreClause(observed) +
+        // comfyui-mcp#1706 — this sentence used to name LINK renumbering as "the whole
+        // difference". There are TWO measured rewrites on this surface now (link ids,
+        // #886; subgraph node ids, #1706), and the predicate does not report which one
+        // it matched — so naming one would state a mechanism this reply never observed.
+        // It says instead exactly what the predicate PROVED, which covers both.
+        (accounted.length
+          ? `. Its \`${accounted.join("`, `")}\` also differ, and that one IS accounted for: the ` +
+            `whole difference is the frontend RENUMBERING its own ids on load — link ids, and the ` +
+            `node ids inside subgraph definitions when they collide — with the same nodes in the ` +
+            `same order, the same values, and every connection still joining the same two slots, ` +
+            `so it is not a content change and is not part of what is unconfirmed here`
+          : "")
+      );
     default:
       return `an unrecognized check (${part}) did not pass`;
   }
@@ -1634,6 +2385,29 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // apart and the caller passes that through as `contentComparable`; anything but
     // an explicit `true` takes the non-asserting wording.
     const compared = contentWasCompared(observed);
+    // panel#1283 family — AN ABORTED RESTORE GETS ITS OWN HEADLINE, before either of the
+    // sentences below can be reached.
+    //
+    // Both of those were written for a load that COMPLETED, and both are false here. The
+    // reassuring one says "there is no missing work to redo"; the generic one says "the
+    // panel cannot tell whether the ComfyUI frontend merely normalized it or the load only
+    // partly applied". Since the panel started watching the restore it CAN tell, and it
+    // knows the answer is the second — so leaving either in place would put a sentence
+    // next to `because`'s "part of what was loaded never landed" that contradicts it.
+    // A reply that says two opposite things about one observation is the defect #1623 was
+    // reported for, one level down.
+    if (compared && observed.contentLoadRanToCompletion === false) {
+      return (
+        `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the ` +
+        `RESTORE ITSELF DID NOT FINISH, so the graph on the canvas is not what was loaded. This is ` +
+        `not the frontend normalizing its own fields: the panel watched this load and something ` +
+        `threw part-way through it.${because} Treat the canvas as UNKNOWN and re-read it ` +
+        `(panel_graph_outline) before editing. Any node named above is at CONSTRUCTION DEFAULTS — ` +
+        `its saved widget values were never applied — so reconfigure it, or fix the pack it comes ` +
+        `from and open again. Do NOT save from here: it would write the unrestored state over ` +
+        `${workflow}.` + FENCE_NOT_REFRESHED
+      );
+    }
     // #825 — the headline may only claim "the panel cannot tell" while that is
     // still true. When the ONLY surface that differs is `nodes` and the node set
     // came through intact with just presentation rewritten, the panel CAN tell:
@@ -1642,8 +2416,22 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // reporter looking for work to redo that was never gone. Narrow on purpose —
     // any second differing surface is unexplained by a node-set observation, so
     // it falls back to the honest "cannot tell".
-    const nodesOnly =
-      (observed.contentSurfaces ?? []).length === 1 && (observed.contentSurfaces ?? [])[0] === "nodes";
+    //
+    // #1588 — UNEXPLAINED, not merely PRESENT, and the distinction is the whole bug.
+    // The gate above tested the raw surface list, so ANY workflow containing subgraphs
+    // failed it: #886 measured that loading one regenerates link ids inside
+    // `definitions.subgraphs`, which puts `definitions` in that list on every faithful
+    // open. The reporter's message named `nodes, definitions` and fell to the maximal-
+    // alarm paragraph — while the clause below it said every node had come through with
+    // the same id and type.
+    //
+    // The narrowness was right and is kept: what may not gate this is a surface the
+    // panel has already fully characterised with the same predicate the content VERDICT
+    // trusts. `definitionsDifferOnlyByRenumber` fails closed, so a `definitions`
+    // difference that is anything more than renumbering is NOT accounted for and still
+    // sends this to the honest "cannot tell" — as does any other second surface.
+    const unexplained = unexplainedContentSurfaces(observed);
+    const nodesOnly = unexplained.length === 1 && unexplained[0] === "nodes";
     // #696 — this used to also require `cosmeticOnly`, i.e. that every differing
     // field be on an allowlist of names. That made the reassurance hostage to
     // guessing what a field MEANS: one unrecognised display flag from any node pack
@@ -1659,7 +2447,29 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     const nodeSetIntact =
       observed.contentNodeDifference?.comparable === true &&
       observed.contentNodeDifference?.sameNodeSet === true;
-    const valuesMatched = observed.contentNodeDifference?.cosmeticOnly === true;
+    // #1623 — the SHARED predicate, not a fourth spelling of it. This sentence and
+    // `workflow_open`'s pass/fail must not be able to disagree about the same
+    // observation, which is the defect that was reported: the caller was told "there
+    // is no missing work to redo" on a call reported as an error.
+    //
+    // The panel now reports that case APPLIED, so reaching this branch means the
+    // strict proof saw something else — a second serialization of a live canvas can
+    // move between the verdict and this message. The sentence stays for that, and it
+    // stays TRUE of what it is describing, because it asks the same question.
+    //
+    // #1588 — fed the UNEXPLAINED surfaces, not the raw list, for the same reason
+    // `nodesOnly` above is: an accounted `definitions` difference (pure link
+    // renumbering, verified by the fail-closed predicate that produced
+    // `contentAccountedSurfaces`) is not a second surface anyone should weigh, and
+    // the predicate refuses on ANY second surface. Passing the raw list re-blocked
+    // the reassurance one level below the gate the accounted list was added to fix.
+    // Anything NOT accounted for still arrives here and still refuses — `unexplained`
+    // only ever drops a surface the panel has already fully characterised.
+    const valuesMatched = openContentDifferenceIsPresentationOnly({
+      comparable: compared,
+      surfaces: unexplained,
+      nodeDifference: observed.contentNodeDifference,
+    });
     if (compared && nodesOnly && nodeSetIntact) {
       // Two claims, and only the ones the comparison supports (codex). The node set
       // is proven in both branches. `cosmeticOnly` additionally establishes that the
@@ -1898,6 +2708,28 @@ export function graphCommandMayMutateWorkflow(command) {
  *     keeps the pre-seal fail-closed behaviour.
  * Returns true only when it actually wrote the stamp.
  */
+
+/**
+ * #1477 — does this root agree with the workflow's current state enough to
+ * prove it is THAT workflow's canvas?
+ *
+ * Byte-identity is too strict after a tab switch: subgraph definition ids are
+ * regenerated on the live canvas while the tracker still holds the saved ids.
+ * This is the same bar `workflow_open` uses to decide the canvas is this
+ * workflow (`proven` or `presentationOnly`), plus definitions-only — a previous
+ * workflow's graph disagrees on root nodes or links, not on this surface alone.
+ */
+function graphRootAgreesWithActiveState(rootGraph, state) {
+  if (state == null) return false;
+  const proof = graphRootReproducesStateContent({ rootGraph, state });
+  if (proof.proven === true || proof.presentationOnly === true) return true;
+  const diff = describeGraphStateDifference({ rootGraph, state });
+  return openContentDifferenceIsDefinitionsOnly({
+    comparable: diff.comparable,
+    surfaces: diff.surfaces,
+  });
+}
+
 /**
  * POSITIVE proof that the live root graph IS the active workflow's own canvas,
  * from its CONTENT alone — independent of whatever identity tag it happens to
@@ -1909,8 +2741,15 @@ export function graphCommandMayMutateWorkflow(command) {
  *   - ROOT scope: a descended subgraph is not the workflow's root canvas;
  *   - CLEAN tab: a dirty tracker's state can lag the real canvas (#545), so it
  *     cannot prove anything about it;
- *   - the root must serialize EQUAL to the workflow's own CURRENT state — not
- *     its load baseline, which legitimately differs from an edited canvas;
+ *   - the root must reproduce the workflow's own CURRENT state — not its load
+ *     baseline, which legitimately differs from an edited canvas. Byte-identity
+ *     (`graphRootMatchesState`) is too strict here: a tab switch onto a workflow
+ *     containing subgraphs regenerates definition link/node ids on the live
+ *     canvas (#886/#1706) while the tracker still holds the saved ids, so the
+ *     canvas IS this workflow's and a stale previous-tab tag still refused every
+ *     graph tool (#1477). `graphRootReproducesStateContent` is the same proof
+ *     `workflow_open` already trusts, and it still fails closed on a foreign
+ *     node set, a rewired link, or a widget-value change;
  *   - EXCLUSIVE: two clean, separately open DUPLICATE tabs can carry
  *     byte-identical state, and equality alone cannot tell the active tab's
  *     canvas from its twin's. The caller establishes this by enumerating the
@@ -1927,7 +2766,7 @@ export function rootContentProvesActiveWorkflow({
     if (proofExclusive !== true) return false;
     if (!rootGraph || !activeWorkflow) return false;
     if (activeWorkflow.isModified === true) return false;
-    return graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) });
+    return graphRootAgreesWithActiveState(rootGraph, activeWorkflowCurrentState(activeWorkflow));
   } catch {
     return false;
   }
@@ -1958,7 +2797,9 @@ export function contentProofExclusiveAmongOpen({ rootGraph, others } = {}) {
       if (other.isModified === true) return false;
       const state = activeWorkflowCurrentState(other);
       if (state == null) return false; // no readable state — same reason
-      if (graphRootMatchesState({ rootGraph, state })) return false; // a proven twin
+      // Same comparison the proof uses (#1477): a twin that only disagrees by
+      // definition renumbering is still a twin.
+      if (graphRootAgreesWithActiveState(rootGraph, state)) return false;
     }
     return true;
   } catch {
@@ -2015,7 +2856,7 @@ export function rootContentProvesActiveWorkflowDespiteEdits({
     const state = activeWorkflowCurrentState(activeWorkflow);
     if (state == null) return false;
     if (serializedStateProvenEmpty(state)) return false;
-    return graphRootMatchesState({ rootGraph, state });
+    return graphRootAgreesWithActiveState(rootGraph, state);
   } catch {
     return false;
   }
@@ -2166,12 +3007,29 @@ export function resolveGraphBindingVerdict({
   // refusal has to say when it does fire: without it a shape refusal cannot tell
   // "a different graph" from "this graph, drifted, with no identity stamp", and
   // the old message resolved that ambiguity by asserting the worse one.
+  //
+  // #1187 — the `structureMatches` conjunct alone cannot rescue a structural HAND
+  // EDIT: adding a node or a wire makes the structural comparison false by
+  // definition, so on a clean tab inside ChangeTracker's capture lag the
+  // workflow's own identity stamp never rescued the read and every graph tool
+  // refused the right canvas (docs/design/graph-binding-tag-vs-tracker.md records
+  // the two rejected fixes — dropping the conjunct, settling the tracker — and why
+  // both fail open). What rescues it instead is a CONTENT proof with the same
+  // conjunct discipline: the live root must still CONTAIN the workflow's whole
+  // structure (`graphRootStructureExtendsActiveWorkflow`), so nothing the workflow
+  // owns can be absent from a canvas this admits, and the identity tag is never
+  // trusted without it.
   const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
   const structureMatches =
     contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const structureExtends =
+    contentDiffers &&
+    structureMatches !== true &&
+    graphRootStructureExtendsActiveWorkflow({ rootGraph, activeWorkflow });
   const rootShapeMismatch =
     contentDiffers &&
-    !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
+    !((structureMatches || structureExtends) &&
+      graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&

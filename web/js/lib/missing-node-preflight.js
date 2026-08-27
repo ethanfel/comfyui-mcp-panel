@@ -32,6 +32,13 @@
  * are the bytes that would have been sent.
  */
 
+// comfyui-mcp#1871 — a scoped run must only be refused for nodes that are IN its scope.
+// The backward-closure walk that decides what "in its scope" means already lives in
+// partial-run-prune.js, where #1511 put it; this file imports the verdict rather than
+// restating it. Two answers to one question is two chances to disagree, and the two
+// places that ask it here are the two ends of the same refusal.
+import { upstreamClosure } from "./partial-run-prune.js";
+
 /** A serialized entry the server cannot execute: no usable `class_type`. */
 function unrunnable(entry) {
   const ct = entry?.class_type;
@@ -57,6 +64,45 @@ export function unrunnableNodeIds(prompt) {
 }
 
 /**
+ * The unrunnable ids a run should actually be REFUSED for (comfyui-mcp#1871).
+ *
+ * #1511 removed ComfyUI's veto of a branch a run-to-node excluded: when the server
+ * refuses over a node outside the requested closure, the run gets one more post with
+ * that branch left out. But the server only gets to refuse if we post at all, and this
+ * pre-flight refuses FIRST — unscoped. So the retry never fires for the case where the
+ * pack is missing ENTIRELY rather than backend-only: no frontend registration means no
+ * `class_type` in the serialized prompt, which is this check's whole trigger. Measured
+ * on main after #1511: `panel_run(to_node_id: 43)` with an unregistered pack on nodes
+ * 56/57 is still refused here, naming 56 and 57, and ComfyUI is never asked.
+ *
+ * The refusal rests on one claim: "a run carrying an unregistered type cannot succeed,
+ * so this blocks no working run." That is true of a full run. It stopped being true of a
+ * run-to-node the moment the excluded branch could be dropped from a retry — the run CAN
+ * succeed, and refusing here is the only thing preventing it.
+ *
+ * So the scope narrows the refusal and nothing else. What it does NOT do:
+ *   - it never adds an id (the result is always a subset of `badIds`);
+ *   - it never narrows a full run — with no targets, today's answer is returned;
+ *   - it never narrows on a guess — when the closure cannot be computed (roots that are
+ *     not keys of this prompt, an unreadable prompt), today's answer is returned.
+ * Every uncertain case therefore refuses exactly as it does now.
+ *
+ * @param {unknown} prompt          graphToPrompt() result, or its `output` map
+ * @param {string[]|null|undefined} targetIds  partial-execution roots, null for a full run
+ * @returns {string[]} ids to refuse for
+ */
+export function unrunnableNodeIdsInScope(prompt, targetIds) {
+  const badIds = unrunnableNodeIds(prompt);
+  if (!badIds.length) return badIds;
+  const roots = Array.isArray(targetIds) ? targetIds.map(String) : [];
+  if (!roots.length) return badIds; // full run — every unrunnable node is submitted
+  const map = prompt?.output && typeof prompt.output === "object" ? prompt.output : prompt;
+  const closure = upstreamClosure(map, roots);
+  if (!closure) return badIds; // cannot tell what is unrelated ⇒ refuse as before
+  return badIds.filter((id) => closure.has(id));
+}
+
+/**
  * #1582 — did `graphToPrompt()` fail to produce anything we can reason about?
  *
  * A DIFFERENT question from `unrunnableNodeIds`, and the whole defect is that the two were
@@ -75,6 +121,42 @@ export function graphToPromptUnusable(built) {
   if (!built || typeof built !== "object" || Array.isArray(built)) return true;
   const output = built.output;
   return !output || typeof output !== "object" || Array.isArray(output);
+}
+
+/**
+ * A refusal for a graph serializer that THREW rather than returning an unusable result.
+ *
+ * `graph_run` preflights `graphToPrompt()` before handing the graph to the frontend queue.
+ * The thrown value is the only useful evidence when a dynamic widget or extension
+ * serializer rejects the live graph, so keep a bounded, total rendering of it in the
+ * refusal. This is deliberately a separate helper from `unserializableGraphRefusal`: a
+ * thrown serializer does not establish that any node type is missing.
+ */
+export function graphToPromptFailureRefusal(error) {
+  let raw = "";
+  try {
+    if (error instanceof Error) raw = error.message;
+    else if (typeof error === "string") raw = error;
+    else raw = String(error ?? "");
+  } catch {
+    raw = "";
+  }
+  let detail = "";
+  try {
+    detail = String(raw ?? "").trim().replace(/\s+/g, " ");
+  } catch {
+    detail = "";
+  }
+  if (detail.length > 400) detail = `${detail.slice(0, 400)}…`;
+  const cause = detail
+    ? ` The frontend serializer reported: "${detail}".`
+    : " The frontend did not provide an error detail.";
+  return (
+    `NOT queued: this workflow could not be serialized into a prompt because ` +
+    `graphToPrompt threw.${cause} Nothing was queued and the queue is untouched. ` +
+    `This is the ComfyUI frontend or an extension's serializer error, not evidence that ` +
+    `a node type is missing; inspect the named widget or extension before retrying.`
+  );
 }
 
 /**
@@ -153,17 +235,56 @@ export function unserializableGraphRefusal(types) {
  * The serialized entry has lost the type — that is precisely why it is unrunnable — so
  * the canvas is consulted for LABELS ONLY, never to decide whether to refuse. A node
  * the graph cannot name still counts; it is reported by id.
+ *
+ * comfyui-mcp#1648 — `registry` (this page's `LiteGraph.registered_node_types`) is
+ * consulted for the DIAGNOSIS only, never for the refusal. The refusal is still decided
+ * entirely by the serialized prompt, exactly as before; this only lets the message tell
+ * apart two states it used to collapse (see `missingNodeRunRefusal`).
+ *
+ * Each entry gains `registered: true | false` when a registry was supplied, and the key
+ * is OMITTED entirely when it was not — a caller that cannot read the registry says
+ * nothing about registration rather than claiming `false` for everything. A registry
+ * object with no own keys is treated the same way: a page that registered NOTHING has
+ * not observed anything about this type either.
  */
-export function describeUnrunnable(ids, liveNodes) {
+export function describeUnrunnable(ids, liveNodes, registry) {
   const byId = new Map();
   for (const n of Array.isArray(liveNodes) ? liveNodes : []) {
     if (n && n.id != null) byId.set(String(n.id), n);
   }
+  let reg = null;
+  try {
+    if (registry && typeof registry === "object" && Object.keys(registry).length > 0) {
+      reg = registry;
+    }
+  } catch {
+    reg = null; // an unreadable registry is "unknown", never "not registered"
+  }
   return ids.map((id) => {
     const n = byId.get(id);
     const type = typeof n?.type === "string" && n.type ? n.type : null;
-    return { id, type };
+    if (!reg) return { id, type };
+    return {
+      id,
+      type,
+      // A node the graph could not even name tells us nothing about registration.
+      registered: type == null ? null : Object.prototype.hasOwnProperty.call(reg, type),
+    };
   });
+}
+
+/** The escape hatch, kept identical in every branch: a caller with deliberately-optional
+ *  nodes must never be stuck, and a bypassed node is dropped during serialization. */
+const BYPASS_NOTE =
+  `If you expected these nodes to be optional, delete or bypass them first — a bypassed ` +
+  `node is dropped during serialization and will not trip this check.`;
+
+/** Up to six distinct type names from a set of offenders, for a sentence. */
+function typeList(offenders) {
+  const types = [...new Set(offenders.map((o) => o?.type).filter((t) => typeof t === "string" && t))];
+  if (!types.length) return "them";
+  const shown = types.slice(0, 6).join(", ");
+  return types.length > 6 ? `${shown}, and ${types.length - 6} more` : shown;
 }
 
 /**
@@ -171,23 +292,105 @@ export function describeUnrunnable(ids, liveNodes) {
  *
  * Prefixed `NOT queued:` so the caller can tell a refusal from an incidental error in
  * the same block, and so it is unmistakable that nothing was sent.
+ *
+ * ## comfyui-mcp#1648 — the refusal was right and the remedy was wrong
+ *
+ * The reporter installed KJNodes, restarted ComfyUI, and was told by this message to
+ * install the pack and restart ComfyUI. They had. The refusal itself was correct — their
+ * companion report (panel#1284, same rig) shows ComfyUI's OWN missing-nodes store naming
+ * `GetNode`/`SetNode`, so those nodes really were placeholders and the run really would
+ * have failed validation. What was wrong is that this text named ONE cause for a state
+ * that has two, and named the one they had already ruled out:
+ *
+ *   1. the pack is not installed; or
+ *   2. the pack IS installed and the SERVER is fine, but THIS BROWSER TAB never loaded
+ *      the pack's frontend JS — those scripts are fetched when the ComfyUI page loads, so
+ *      a server restart does not put new node classes into an already-open tab.
+ *
+ * Case 2 is the whole story for a FRONTEND-ONLY node type (the Get/Set bus, rgthree's
+ * canvas-only toggles): it never appears in /object_info at all, so no amount of asking
+ * the server distinguishes "not installed" from "installed, tab is stale". The one thing
+ * that does distinguish them is THIS PAGE's own litegraph registry, which is what
+ * `describeUnrunnable` now reads. When it has no class for the type, "reload the tab"
+ * is a remedy the old text never offered.
+ *
+ * With no registry reading available the message is byte-identical to before — an
+ * unobserved registry must not become a claim about one.
  */
 export function missingNodeRunRefusal(offenders) {
-  const list = (Array.isArray(offenders) ? offenders : []).map((o) =>
-    o?.type ? `${o.type} (node ${o.id})` : `node ${o.id}`,
-  );
+  const all = Array.isArray(offenders) ? offenders : [];
+  const list = all.map((o) => (o?.type ? `${o.type} (node ${o.id})` : `node ${o.id}`));
   const shown = list.slice(0, 12);
   const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : "";
   const plural = list.length === 1 ? "" : "s";
-  return (
+  const head =
     `NOT queued: ${list.length} node${plural} in this workflow cannot be executed by the ` +
-    `server — ${shown.join(", ")}${more}. Their node types are not registered on this ` +
-    `ComfyUI, so the prompt was built with no class_type for them and would have failed ` +
+    `server — ${shown.join(", ")}${more}. `;
+  const tail =
+    `so the prompt was built with no class_type for them and would have failed ` +
     `validation after being queued (comfyui-mcp#1460). Nothing was sent and the queue is ` +
-    `untouched. This usually means a custom-node pack is missing or failed to load: ` +
-    `install the pack that provides these types (list_packs / install_custom_node), ` +
-    `restart ComfyUI so the frontend registers them, then run again. If you expected ` +
-    `these nodes to be optional, delete or bypass them first — a bypassed node is ` +
-    `dropped during serialization and will not trip this check.`
+    `untouched. `;
+
+  const observed = all.filter((o) => typeof o?.registered === "boolean");
+  const unregistered = observed.filter((o) => o.registered === false);
+
+  // Nothing was observed about this page's registry — say exactly what was said before.
+  if (!observed.length) {
+    return (
+      head +
+      `Their node types are not registered on this ComfyUI, ` +
+      tail +
+      `This usually means a custom-node pack is missing or failed to load: ` +
+      `install the pack that provides these types (list_packs / install_custom_node), ` +
+      `restart ComfyUI so the frontend registers them, then run again. ` +
+      BYPASS_NOTE
+    );
+  }
+
+  if (unregistered.length) {
+    return (
+      head +
+      `This page has no node class registered for ${typeList(unregistered)}, ` +
+      tail +
+      `TWO different things produce that, and they need different fixes. ` +
+      `(1) The pack is not installed — install it (list_packs / install_custom_node) and ` +
+      `restart ComfyUI. ` +
+      `(2) The pack IS installed and the server is fine, but THIS BROWSER TAB never loaded ` +
+      `its frontend JS: a pack's scripts are fetched when the ComfyUI page loads, so ` +
+      `installing a pack and restarting the server does NOT add its node classes to a tab ` +
+      `that was already open — RELOAD the ComfyUI tab. If you have already installed the ` +
+      `pack and restarted ComfyUI, do that first. ` +
+      `Case (2) is the only possibility for a FRONTEND-ONLY node type (KJNodes' Get/Set ` +
+      `bus, rgthree's Label and Fast Groups toggles): those never appear in /object_info ` +
+      `at all, so nothing the server reports can confirm or deny them. ` +
+      BYPASS_NOTE
+    );
+  }
+
+  // Every type this page WAS ASKED ABOUT is registered here, so a reload changes nothing
+  // for those. Only what the serializer observed is asserted: it takes an entry's
+  // class_type from the node's own `comfyClass`, and it omits a node entirely when that
+  // node reports `isVirtualNode` — so an entry that arrived with neither came from a
+  // registered class that has no backend node behind it and does not declare itself
+  // virtual. Nothing is claimed about which pack is at fault or how to repair it.
+  //
+  // SCOPED to the offenders the graph could name. A node the canvas could not name has an
+  // unknown type, so nothing was established about it and the sentence must not sweep it
+  // in — that would be a claim of "nothing is missing" built on a node never looked at.
+  const unnamed = all.length - observed.length;
+  return (
+    head +
+    `This page DOES have a node class registered for ${typeList(observed)}, so reloading ` +
+    `will not change those — but the serializer still emitted no class_type for them, ` +
+    tail +
+    `An entry's class_type comes from the node's own comfyClass, and a node that reports ` +
+    `isVirtualNode is left out of the prompt entirely; these did neither, so the registered ` +
+    `class has no backend node behind it and does not declare itself virtual. That is a ` +
+    `problem in the pack's own frontend node rather than anything this ComfyUI is missing. ` +
+    (unnamed
+      ? `The other ${unnamed} node${unnamed === 1 ? "" : "s"} could not be named from the ` +
+        `canvas, so nothing is established about ${unnamed === 1 ? "it" : "them"}. `
+      : "") +
+    BYPASS_NOTE
   );
 }

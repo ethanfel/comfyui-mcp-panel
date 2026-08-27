@@ -36,6 +36,7 @@ import {
   classifyOpenOutcome,
 } from "../../web/js/lib/open-outcome.js";
 import { savedWorkflowHandle } from "../../web/js/lib/bridge-route.js";
+import { rawWorkflowObject, sameWorkflowObject } from "../../web/js/lib/workflow-chat-identity.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -122,6 +123,26 @@ function namedFunctionSource(src, name) {
     if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
   }
   return null;
+}
+
+/** Prelude so extracted `activeWorkflowUuidForOpenReply` can call the shipped
+ *  proxy-safe identity helper instead of a sandbox `===`. */
+const SAME_WORKFLOW_PRELUDE = `${rawWorkflowObject.toString()}\n${sameWorkflowObject.toString()}\n`;
+
+function compileActiveWorkflowUuidForOpenReply(paramNames, ...paramValues) {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  assert.ok(
+    pathSource && canonicalUuidSource && identitySource && helperSource,
+    "the reply identity check must live in the shipped panel source",
+  );
+  return new Function(
+    ...paramNames,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(...paramValues);
 }
 
 const receiptFor = (requested, extra = {}) =>
@@ -505,8 +526,36 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   // and demanding byte-identity made every such open report CONTENT_UNVERIFIED (which
   // throws, which withholds the fence). The predicate still refuses anything but a
   // nodes-only, same-set, geometry-only difference.
-  assert.match(repaint, /graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
-  assert.match(repaint, /const contentMatches = contentProof\.proven;/);
+  // panel#1283 family — the call now also hands over `loadRanToCompletion`, the
+  // observation of whether this restore aborted, so the pin spans the call rather than
+  // one formatted line. Both payload arguments are still named: dropping either one
+  // fails here.
+  assert.match(repaint, /graphRootReproducesStateContent\(\{[\s\S]{0,600}?state: repaintState,/);
+  assert.match(
+    repaint,
+    /graphRootReproducesStateContent\(\{[\s\S]{0,600}?loadRanToCompletion,/,
+    "the completed-restore observation must actually reach the proof",
+  );
+  // #1623 — TWO grounds now, and BOTH must be named here. `proven` is the strict
+  // "the content was reproduced"; `presentationOnly` is the weaker "nothing authored
+  // was lost", which is the question the caller acts on and the one the panel's own
+  // disclosure already answered on the same observation. Pinning the expression
+  // rather than either half is deliberate: dropping `presentationOnly` restores the
+  // reported false error, and dropping `proven` silently narrows the #1001 fix.
+  // panel#1283 family — a THIRD ground, `normalizedOnly`, licensed by an observation
+  // that the restore ran to completion rather than by a judgement about a field name.
+  // All three are pinned: dropping `presentationOnly` restores #1623's false error,
+  // dropping `proven` silently narrows the #1001 fix, and dropping `normalizedOnly`
+  // restores the false error this family reported.
+  assert.match(
+    repaint,
+    /const contentMatches =\s*contentProof\.proven \|\| contentProof\.presentationOnly \|\| contentProof\.normalizedOnly;/,
+  );
+  // The two disclosures stay SEPARATE. Folding the weaker case into
+  // `openGeometryRewritten` would attach a note asserting a characterised
+  // height-only rewrite to a difference where no such thing was established.
+  assert.match(repaint, /if \(contentProof\.proven && !contentProof\.exact\) \{\r?\n\s*openGeometryRewritten = contentProof\.fields;/);
+  assert.match(repaint, /if \(contentProof\.presentationOnly\) \{\r?\n\s*openPresentationRewritten = contentProof\.fields;/);
   // The ATTEMPT-scoped marker: a workflow uuid can be on the root from a previous load
   // or a rebind heal, so it cannot say that THIS load landed.
   assert.match(repaint, /\[OPEN_PROOF_FIELD\]: openProofMarker/, "the payload must carry a single-use marker");
@@ -618,7 +667,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
@@ -740,15 +789,15 @@ test("#442 DATA-LOSS: the defensive ceiling still ages out a guard stuck BETWEEN
 test("#442 DATA-LOSS: every mutating await of the section is held across its own await", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  const begins = (body.match(/beginWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
+  const begins = (body.match(/if \(!beginWorkflowReloadStep\(reloadGuardToken\)\)/g) || []).length;
   const ends = (body.match(/endWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
-  assert.ok(begins >= 4, `the switch, repaint, reload and re-baseline awaits must each be held (got ${begins})`);
-  assert.equal(begins, ends, "every held step needs its own end (balanced via finally)");
+  assert.ok(begins >= 6, `the switch, repaint, reload and re-baseline awaits must each be held (got ${begins})`);
+  assert.ok(ends >= begins, "every held step needs its own end (balanced via finally)");
   // THE finding's case — the destructive disk reload: begin before the await, end in a
   // finally after it, so neither a slow load nor a throwing one can drop/strand the fence.
   const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
   assert.notEqual(loadAt, -1);
-  const beginAt = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", loadAt);
+  const beginAt = body.lastIndexOf("if (!beginWorkflowReloadStep(reloadGuardToken))", loadAt);
   const endAt = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", loadAt);
   assert.ok(beginAt !== -1 && beginAt < loadAt, "the reload await must start INSIDE a held step");
   assert.ok(loadAt < endAt, "…and the step must end only AFTER the load settles");
@@ -761,7 +810,7 @@ test("#442 DATA-LOSS: every mutating await of the section is held across its own
   // pre-edit buffer), so it must be held too.
   const repaintAt = body.indexOf("await app.loadGraphData(repaintState, true, true, target);");
   assert.notEqual(repaintAt, -1);
-  const repaintBegin = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", repaintAt);
+  const repaintBegin = body.lastIndexOf("if (!beginWorkflowReloadStep(reloadGuardToken))", repaintAt);
   const repaintEnd = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", repaintAt);
   assert.ok(repaintBegin !== -1 && repaintBegin < repaintAt && repaintAt < repaintEnd, "the repaint await must be held too");
   // The mechanism: expiry requires NO step in flight, and ending a step rearms the clock.
@@ -798,8 +847,9 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   // makes that frame safe. On a frontend WITHOUT the flag the reload is skipped for
   // exactly that reason (priorInteraction === null) — so the tracker must not be
   // re-baselined either: an edit landing in the unprotected frame would be adopted as
-  // clean, erasing unsaved-work protection and inviting later silent loss. (Round 3
-  // extended the same exclusion to the first-time open — see the round-3 test below.)
+  // clean, erasing unsaved-work protection and inviting later silent loss. Round 3
+  // keeps the freeze-gated re-baseline; #1618 makes first-time opens freeze too so
+  // they can take that gated path.
   const skipGate = body.indexOf("if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null)");
   const firstRebaseline = body.indexOf("await clearSpuriousOpenModified(target, {");
   assert.notEqual(skipGate, -1, "the no-freeze skip gate must exist");
@@ -807,7 +857,7 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   assert.ok(firstRebaseline < skipGate, "fixture order: the re-baseline precedes the reload decision");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
     "the pre-reload re-baseline must be gated on the freeze holding — the same condition whose absence skips the reload",
   );
   // The only OTHER re-baseline is the post-reload one, and it stays gated on the reload
@@ -823,25 +873,30 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   );
 });
 
-test("#442 round-3: a FIRST-TIME open never re-baselines without the freeze (edit in the frame stays dirty)", () => {
+test("#442 round-3 / #1618: re-baseline stays gated on the freeze; first-time opens freeze too", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  // The freeze handle is non-null ONLY for an already-open tab on a frontend exposing
-  // allow_interaction — exactly the case where the freeze below is actually applied.
+  // #1618 — a first-time open must freeze so the post-open re-baseline is safe.
+  // Without it, frontend size/order hydration leaves a clean tab modified.
+  // priorInteraction !== null still means "the freeze is holding"; the acquire
+  // is no longer gated on wasOpen. Disk reload stays gated on wasOpen via
+  // decideOpenStaleness (`if (!wasOpen) return { stale: false, reload: false }`).
   assert.match(
     body,
+    /const priorInteraction = acquireCanvasInteractionLock\(canvasView\);/,
+    "first-time opens freeze too — that is what makes the re-baseline safe",
+  );
+  assert.doesNotMatch(
+    body,
     /const priorInteraction = wasOpen \? acquireCanvasInteractionLock\(canvasView\) : null;/,
-    "priorInteraction !== null ⟺ the freeze is held",
+    "the freeze must not skip first-time opens",
   );
   // clearSpuriousOpenModified awaits a frame, then captures the canvas as the CLEAN
-  // baseline and forces isModified=false. A first-time open holds NO freeze by design,
-  // so if the cleanup ran there an edit landing in that frame would be adopted as
-  // clean — and a later stale open could then auto-reload the disk file over that
-  // unsaved work (the round-3 DATA-LOSS finding). The gate must require the freeze
-  // with NO !wasOpen exception; the fresh tab keeps a spurious flag (loud, cosmetic)
-  // instead of a silent clean-slate.
+  // baseline and forces isModified=false. The gate must still require the freeze
+  // with NO !wasOpen exception: a frontend without allow_interaction still must
+  // not re-baseline in an unprotected frame (the round-3 DATA-LOSS finding).
   const gate = body.match(
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
   );
   assert.ok(gate, "the pre-reload re-baseline must be gated on the freeze holding");
   assert.doesNotMatch(
@@ -849,9 +904,6 @@ test("#442 round-3: a FIRST-TIME open never re-baselines without the freeze (edi
     /!wasOpen/,
     "no first-time-open exception may re-open the unprotected frame",
   );
-  // …which means a first-time open (wasOpen false ⇒ priorInteraction null) can NEVER
-  // reach the capture/reset: an in-frame edit keeps the tracker dirty, so BOTH reload
-  // paths below (each requires !dirtyNow && !wasDirty) stay closed over that work.
   const gates = [...body.matchAll(/if \(staleInfo\.reload && !dirtyNow[^)]*\)/g)].map((m) => m[0]);
   assert.ok(gates.length >= 2, "both reload paths stay gated on the fresh dirty re-check");
 });
@@ -888,17 +940,13 @@ test("#402 round-2: once NewBlankWorkflow has run, the guidance forbids a retry 
   // workflow. Once creation has run the receipt truthfully records applied:"unknown" — so
   // the guidance must match it: do NOT retry, check workflow_list / canvas state first.
   const afterCreate = stripComments(body.slice(created));
-  const errBlock = afterCreate.match(/const error =\s*\n?([\s\S]*?);/);
-  assert.ok(errBlock, "the post-creation failure must build an explicit message");
-  // Reassemble the concatenated literal so the check reads the message the caller gets.
-  const msg = [...errBlock[1].matchAll(/"([^"\n]*)"/g)].map((m) => m[1]).join("");
   assert.doesNotMatch(
-    msg,
+    afterCreate,
     /(^|[.!?]\s+)Retry\b/,
-    `no sentence may open with a blanket Retry once the blank tab exists: "${msg}"`,
+    "the post-creation guidance must not open a sentence with a blanket Retry",
   );
-  assert.match(msg, /Do NOT retry/i, "the guidance must forbid the retry outright");
-  assert.match(msg, /workflow_list/, "…and point at workflow_list / the canvas state instead");
+  assert.match(afterCreate, /Do NOT retry/i, "the guidance must forbid the retry outright");
+  assert.match(afterCreate, /panel_list_workflows/, "…and point at the public workflow-list command");
 });
 
 test("#570 P0b: the #442 re-read must KEEP this tab's instance identity (no mid-open fork)", () => {
@@ -955,6 +1003,22 @@ test("#716 wiring: post-open and active workflow responses carry the live instan
     "the binding report must use the shared snapshot, not read the active workflow again",
   );
   assert.match(open, /activeWorkflowUuid \? \{ workflow_uuid: activeWorkflowUuid \} : \{\}/);
+  // #1014 — the callee must CONSUME that snapshot. The call-site match above is
+  // not enough: a helper that re-reads the live binding discards the argument
+  // and the suite still goes green. Code-only so a comment cannot fake it.
+  const helperCode = stripComments(namedFunctionSource(src, "activeWorkflowUuidForOpenReply") || "");
+  assert.match(helperCode, /\bactiveSnapshot\b/, "the helper must read the snapshot it is passed");
+  assert.doesNotMatch(
+    helperCode,
+    /activeWorkflowRef\s*\(/,
+    "the helper must not take a second live read of the active workflow",
+  );
+  // #1581 — the identity gate is the proxy-safe helper, never a raw `!==`.
+  // `target` comes from openWorkflows (Vue proxies) and the snapshot from
+  // activeWorkflowRef() (often the raw object). `!==` withholds workflow_uuid
+  // from a successful open of an already-open saved tab.
+  assert.match(helperCode, /sameWorkflowObject\s*\(\s*active,\s*target\s*\)/);
+  assert.doesNotMatch(helperCode, /active\s*!==\s*target/);
 });
 
 test("#716 P1: service rebind during workflow_open omits the former target UUID", () => {
@@ -979,7 +1043,7 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => currentService.activeWorkflow,
     (wf) => workflowUuids.get(wf),
@@ -989,7 +1053,11 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
     savedWorkflowHandle,
   );
 
-  assert.equal(replyUuid(openedTarget), "11111111-1111-4111-8111-111111111111", "the normal completed open reports its actual active tab");
+  assert.equal(
+    replyUuid(openedTarget, openedTarget),
+    "11111111-1111-4111-8111-111111111111",
+    "the normal completed open reports its actual active tab",
+  );
   // workflow_open has retained its old local `s`, but a reconnect/rebind has
   // replaced the service before the final reply. The old service could still
   // report A; the actual binding now says B. Returning target.uuid here would
@@ -997,8 +1065,129 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
   const staleService = currentService;
   currentService = { activeWorkflow: otherActive };
   assert.equal(staleService.activeWorkflow, openedTarget, "the pre-await service still looks like the opened target");
-  assert.equal(replyUuid(openedTarget), null, "the re-bound live service omits the stale reply UUID and leaves the MCP fence unchanged");
-  assert.equal(replyUuid(otherActive), "22222222-2222-4222-8222-222222222222", "the same helper still reports the actual active tab");
+  assert.equal(
+    replyUuid(openedTarget, otherActive),
+    null,
+    "the re-bound live service omits the stale reply UUID and leaves the MCP fence unchanged",
+  );
+  assert.equal(
+    replyUuid(otherActive, otherActive),
+    "22222222-2222-4222-8222-222222222222",
+    "the same helper still reports the actual active tab",
+  );
+});
+
+test("#1014: open-reply uuid is decided against the shared snapshot, not a second live read", () => {
+  // The park on #1014 measured that `activeWorkflowUuidForOpenReply` declared
+  // `activeSnapshot` and then re-read the live binding. The call-site wiring
+  // test could only see that the snapshot was PASSED; it could not see that
+  // the callee discarded it. A live re-read after any await would pair a uuid
+  // decided against one observation with binding fields decided against another.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  assert.ok(pathSource && canonicalUuidSource && identitySource && helperSource, "the reply identity check must live in the shipped panel source");
+
+  const openedTarget = { isPersisted: true, isTemporary: false, path: "workflows/a.json" };
+  const otherActive = { isPersisted: true, isTemporary: false, path: "workflows/b.json" };
+  const workflowUuids = new WeakMap([
+    [openedTarget, "11111111-1111-4111-8111-111111111111"],
+    [otherActive, "22222222-2222-4222-8222-222222222222"],
+  ]);
+  let liveReads = 0;
+  let currentService = { activeWorkflow: otherActive };
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => {
+      liveReads += 1;
+      return currentService.activeWorkflow;
+    },
+    (wf) => workflowUuids.get(wf),
+    savedWorkflowHandle,
+  );
+
+  // Snapshot says A (the opened target). A live re-read would see B and omit.
+  // Using the snapshot keeps the uuid aligned with the binding fields the
+  // caller derived from the same observation.
+  assert.equal(
+    replyUuid(openedTarget, openedTarget),
+    "11111111-1111-4111-8111-111111111111",
+    "a matching snapshot publishes even when a later live read would see a different tab",
+  );
+  // Snapshot says B, target is A. A live re-read of A would publish A's uuid
+  // and contradict the binding report that observed B.
+  currentService = { activeWorkflow: openedTarget };
+  assert.equal(
+    replyUuid(openedTarget, otherActive),
+    null,
+    "a mismatched snapshot omits even when a later live read would see the target",
+  );
+  // No snapshot at all — fail closed. The discarded-argument helper used to
+  // succeed here by re-reading.
+  assert.equal(replyUuid(openedTarget), null, "a missing snapshot omits rather than guessing from a second live read");
+  assert.equal(liveReads, 0, "the helper must not consult the live binding at all");
+});
+
+test("#1581: opening an already-open saved tab still publishes its fence uuid across a Vue proxy", () => {
+  // The reporter opened a previously saved workflow that was already a tab, then
+  // the next panel_graph_outline was refused: command stamped for the OLD
+  // instance, canvas reporting the NEW one. The open itself succeeded.
+  //
+  // Root cause: activeWorkflowUuidForOpenReply compared target and the live
+  // snapshot with `!==`. ComfyUI's workflow service hands out Vue proxies from
+  // openWorkflows (how an already-open tab is found) while activeWorkflowRef()
+  // can yield the raw object the uuid WeakMap is keyed on. A successful switch
+  // to that tab then withheld workflow_uuid, so the MCP never refreshed its
+  // command fence. sameWorkflowObject is the comparison the rest of the panel
+  // already uses for this split.
+  const tracker = { id: "shared-tracker" };
+  const raw = { isPersisted: true, isTemporary: false, path: "workflows/saved.json", changeTracker: tracker };
+  const proxy = {
+    __v_raw: raw,
+    isPersisted: true,
+    isTemporary: false,
+    path: "workflows/saved.json",
+    changeTracker: tracker,
+  };
+  const uuid = "115f55be-528e-4d7b-8af9-d732ae2e3bb6";
+  const uuids = new WeakMap([[raw, uuid]]);
+  const replyUuid = compileActiveWorkflowUuidForOpenReply(
+    ["activeWorkflowRef", "workflowObjectUuid", "savedWorkflowHandle"],
+    () => proxy,
+    (wf) => uuids.get(rawWorkflowObject(wf)),
+    savedWorkflowHandle,
+  );
+
+  assert.notEqual(proxy, raw, "the Vue-proxy shape is a different reference");
+  assert.equal(
+    sameWorkflowObject(proxy, raw),
+    true,
+    "the shipped identity helper treats proxy and raw as the same tab",
+  );
+  assert.equal(
+    replyUuid(proxy, raw),
+    uuid,
+    "an already-open saved tab found via openWorkflows still publishes the fence uuid",
+  );
+  assert.equal(
+    replyUuid(raw, proxy),
+    uuid,
+    "the inverse carrier split publishes too — the snapshot may be the proxy",
+  );
+
+  const other = { isPersisted: true, isTemporary: false, path: "workflows/other.json", changeTracker: { id: "other" } };
+  uuids.set(other, "e39a0a22-9ab2-43b8-b9b9-f44e76acacb0");
+  assert.equal(
+    replyUuid(proxy, other),
+    null,
+    "a genuinely different live tab still withholds — the #716 fail-closed is unchanged",
+  );
 });
 
 test("#716 P1: service rebind during workflow_list reports only the current active UUID", () => {
@@ -1052,7 +1241,7 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => malformedActive,
     (wf) => workflowUuids.get(wf),
@@ -1065,7 +1254,7 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   // Execute the actual shipped reply helper against a truthy but malformed
   // binding. It must be an observation only: no tmp routing id and no UUID can
   // be initialized while deciding whether to publish the response field.
-  assert.equal(replyUuid(malformedActive), null);
+  assert.equal(replyUuid(malformedActive, malformedActive), null);
   assert.equal(workflowUuids.has(malformedActive), false, "must not mint an ephemeral workflow UUID");
 });
 
@@ -1106,7 +1295,7 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     (wf) => workflowUuids.get(wf),
@@ -1118,7 +1307,7 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
   );
 
   // The FENCE uuid is published — the canonical live-object value, not the handle.
-  assert.equal(replyUuid(temporaryActive), "33333333-3333-4333-8333-333333333333");
+  assert.equal(replyUuid(temporaryActive, temporaryActive), "33333333-3333-4333-8333-333333333333");
 });
 
 test("#760: an unsaved canvas with NO established uuid still publishes nothing (#716 holds)", () => {
@@ -1137,7 +1326,7 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => unestablished,
     () => undefined, // never established
@@ -1148,7 +1337,7 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
     },
   );
 
-  assert.equal(replyUuid(unestablished), null);
+  assert.equal(replyUuid(unestablished, unestablished), null);
   // …and it bailed BEFORE reaching the handle, so nothing was minted on the way.
   assert.equal(tabIdCalls, 0, "an unestablished object must not even ask for a routing handle");
 });
@@ -1166,7 +1355,7 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     () => "tmp:not-a-uuid", // the ROUTING handle, wrongly offered as the uuid
@@ -1174,7 +1363,7 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
     (wf) => `tmp:${String(!!wf)}`,
   );
 
-  assert.equal(replyUuid(temporaryActive), null);
+  assert.equal(replyUuid(temporaryActive, temporaryActive), null);
 });
 
 test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
@@ -1196,7 +1385,7 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => active,
     (wf) => workflowUuids.get(wf),
@@ -1208,6 +1397,6 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
 
   for (const workflow of [invalidVersion, invalidVariant, uppercase]) {
     active = workflow;
-    assert.equal(replyUuid(workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
+    assert.equal(replyUuid(workflow, workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
   }
 });

@@ -23,9 +23,9 @@
     "name": "預設代理後端",
     "tooltip": "面板預設要連線的背景代理。Claude 使用你的 Claude 訂閱；ChatGPT 使用你的 Codex（ChatGPT）帳號；Gemini 使用你的 Google（Gemini）登入。這會決定面板的初始後端（以及下方哪一組設定會用於執行階段）；你仍然可以在模型選單中即時切換（即時切換只影響目前的工作階段，不會更動這個預設值）。"
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "載入時自動連線",
-    "tooltip": "面板開啟時就自動連線代理（並啟動本機協調器），不必按「連線」。預設為關閉 —— 否則協調器只會在你明確按下「連線」時才啟動。"
+  "comfyui-mcp_autostartMcp": {
+    "name": "自動啟動 MCP",
+    "tooltip": "開啟此面板時，如果 MCP 尚未執行，便要求已明確安裝的配套啟動器開啟一個執行 MCP 的終端機。"
   },
   "comfyui-mcp_language": {
     "name": "面板語言",
@@ -47,6 +47,10 @@
     "name": "顯示「RunPod／本機」",
     "tooltip": "在工具列顯示「RunPod／本機」主機按鈕 —— 部署／啟動／停止／連線雲端 GPU Pod，或切回本機。預設關閉；這個開關也會傳給已連線的手機 App。"
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "聊天中的影片預覽",
+    "tooltip": "在聊天中內嵌播放生成的影片。關閉以節省記憶體：影片會顯示為帶有第一幀和檔名的佔位符，點擊即可在燈箱中開啟完整影片。適用於變更後生成的影片；聊天中已有的卡片保留其播放器。"
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "取得 Beta 版 App",
     "tooltip": "ComfyUI MCP 手機 App 的測試版下載。iOS 透過 Apple TestFlight 安裝，Android 透過 Firebase App Distribution。兩個管道都是 Beta：版本更新頻繁，可能需要重新與這個面板配對。"
@@ -65,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "橋接網址（進階）",
-    "tooltip": "面板協調器橋接的 WebSocket 網址 —— 現在「一條」橋接就服務所有供應商（預設 ws://127.0.0.1:9180）。只有在你用非預設連接埠啟動協調器時才需要更改 (COMFYUI_MCP_BRIDGE_PORT)。下次按「連線」時生效。"
+    "tooltip": "面板協調器橋接的 WebSocket 網址 —— 現在「一條」橋接就服務所有供應商（預設 ws://127.0.0.1:9199）。只有在你用非預設連接埠啟動協調器時才需要更改 (COMFYUI_MCP_BRIDGE_PORT)。下次按「連線」時生效。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "縮放到代理的修改處",
@@ -110,6 +114,10 @@
   "comfyui-mcp_defaultModel_grok": {
     "name": "預設模型",
     "tooltip": "Grok 背景代理的預設模型，從為 Grok 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Grok 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "預設模型",
+    "tooltip": "Qwen Code 背景代理的預設模型，從為 Qwen Code 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Qwen Code 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
   },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "預設模型",
@@ -170,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "預設推理強度",
     "tooltip": "Grok 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "預設推理強度",
+    "tooltip": "Qwen Code 沒有提供推理強度的控制項；請保持在「模型預設」。"
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "預設推理強度",

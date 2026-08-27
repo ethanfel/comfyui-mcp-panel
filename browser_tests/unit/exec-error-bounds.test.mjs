@@ -22,7 +22,15 @@ import {
   EXEC_ERR_EXECUTED_CAP,
   EXEC_ERR_OUTPUTS_JSON_CAP,
   boundExecFailurePayload,
+  executionErrorMatchesCurrentGraph,
+  applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
+import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -220,14 +228,443 @@ test("current_outputs omission note states the cap is fixed and names no phantom
 // EMITS through them. A revert to the verbatim emission — the exact #664
 // defect — must fail the build, not slip through (a fix on one branch was
 // once silently reverted by a later bulk rewrite; token presence ≠ wiring).
+// #1448: the argument is the correlated detail, not the raw lastExecFailure
+// capture — emitting lastExecFailure here re-joins a stale error by id alone.
 test("graph_get_errors emits the bounded payload and the verbatim emission is gone (#664)", () => {
   assert.match(
     PANEL_SOURCE,
-    /last_execution_error:\s*boundExecFailurePayload\(lastExecFailure\)/,
-    "graph_get_errors must emit lastExecFailure through boundExecFailurePayload",
+    /last_execution_error:\s*boundExecFailurePayload\(execFailureDetail\)/,
+    "graph_get_errors must emit the correlated execFailureDetail through boundExecFailurePayload",
   );
   assert.ok(
     !/last_execution_error:\s*lastExecFailure\b/.test(PANEL_SOURCE),
     "the verbatim `last_execution_error: lastExecFailure` emission must not reappear",
   );
+  assert.ok(
+    !/last_execution_error:\s*boundExecFailurePayload\(lastExecFailure\)/.test(PANEL_SOURCE),
+    "emitting the raw lastExecFailure capture re-opens #1448 (id-only join across workflows)",
+  );
+});
+
+function nodesById(...nodes) {
+  return new Map(nodes.map((n) => [String(n.id), n]));
+}
+
+test("#1448 reporter: RCAITKLoadPipeline failure is not joined onto LoadImage id 2", () => {
+  // Measured: workflow A failed at node id 2 (RCAITKLoadPipeline,
+  // ModuleNotFoundError: No module named 'src.pipelines'). After switching to
+  // workflow B, node id 2 was LoadImage, and panel_get_errors still attached
+  // that exception to it because correlation was id-only.
+  const e = {
+    node_id: 2,
+    node_type: "RCAITKLoadPipeline",
+    exception_type: "ModuleNotFoundError",
+    exception_message: "No module named 'src.pipelines'",
+  };
+  const byId = nodesById({ id: 2, type: "LoadImage" });
+  const applied = applyRuntimeExecFailure(e, byId);
+  assert.equal(applied.detail, null, "last_execution_error must omit the foreign failure");
+  assert.equal(applied.failure, null, "clean must not be dirtied by the foreign failure");
+  assert.equal(applied.reason, null, "LoadImage must not receive an execution reason");
+  assert.equal(boundExecFailurePayload(applied.detail), null);
+  assert.equal(executionErrorMatchesCurrentGraph(e, byId), false);
+});
+
+test("#1448 a matching id AND type still reports the runtime failure", () => {
+  const e = {
+    node_id: 2,
+    node_type: "RCAITKLoadPipeline",
+    exception_type: "ModuleNotFoundError",
+    exception_message: "No module named 'src.pipelines'",
+  };
+  const byId = nodesById({ id: 2, type: "RCAITKLoadPipeline" });
+  const applied = applyRuntimeExecFailure(e, byId);
+  assert.equal(applied.detail, e);
+  assert.equal(applied.failure.node_id, 2);
+  assert.equal(applied.failure.node_type, "RCAITKLoadPipeline");
+  assert.equal(applied.failure.exception_type, "ModuleNotFoundError");
+  assert.equal(applied.failure.message, "No module named 'src.pipelines'");
+  assert.deepEqual(applied.reason, {
+    kind: "execution",
+    exception_type: "ModuleNotFoundError",
+    message: "No module named 'src.pipelines'",
+  });
+  const payload = boundExecFailurePayload(applied.detail);
+  assert.equal(payload.node_id, 2);
+  assert.equal(payload.node_type, "RCAITKLoadPipeline");
+});
+
+test("#1448 a reused id whose current node is absent from the viewed graph is omitted", () => {
+  const e = { node_id: 2, node_type: "RCAITKLoadPipeline", exception_message: "gone" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 9, type: "LoadImage" }));
+  assert.equal(applied.detail, null);
+  assert.equal(applied.reason, null);
+});
+
+test("#1448 missing type information fails OPEN so a genuine failure is not swallowed", () => {
+  const noErrorType = applyRuntimeExecFailure(
+    { node_id: 2, exception_message: "boom" },
+    nodesById({ id: 2, type: "LoadImage" }),
+  );
+  assert.equal(noErrorType.failure.node_id, 2);
+  assert.equal(noErrorType.reason.kind, "execution");
+
+  const noNodeType = applyRuntimeExecFailure(
+    { node_id: 2, node_type: "LoadImage", exception_message: "boom" },
+    nodesById({ id: 2 }),
+  );
+  assert.equal(noNodeType.failure.node_id, 2);
+});
+
+test("#1448 comfyClass is the type that execution_error.node_type names", () => {
+  const e = { node_id: 2, node_type: "LoadImage", exception_message: "bad image" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "Load Image", comfyClass: "LoadImage" }));
+  assert.equal(applied.detail, e);
+  const mismatch = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "LoadImage", comfyClass: "RCAITKLoadPipeline" }));
+  assert.equal(mismatch.detail, null);
+});
+
+test("#1448 a node-id-less failure stays graph-level — there is no node to mis-blame", () => {
+  const e = { exception_type: "RuntimeError", exception_message: "prompt failed" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "LoadImage" }));
+  assert.equal(applied.detail, e);
+  assert.equal(applied.reason, null);
+  assert.equal(applied.failure.node_id, null);
+});
+
+test("graph_get_errors correlates runtime failures through applyRuntimeExecFailure (#1448)", () => {
+  assert.match(
+    PANEL_SOURCE,
+    /applyRuntimeExecFailure\(e,\s*byId\)/,
+    "graph_get_errors must correlate the captured error against the current graph's node map",
+  );
+  assert.match(
+    PANEL_SOURCE,
+    /const clean =\s*!nodeErrors &&\s*!execFailure &&/,
+    "clean must follow the correlated execFailure, not the raw lastExecFailure capture",
+  );
+  assert.ok(
+    !/const clean =\s*!nodeErrors &&\s*!lastExecFailure &&/.test(PANEL_SOURCE),
+    "clean must not be dirtied by a stale lastExecFailure from another workflow",
+  );
+});
+
+// #1685: the regression is in the shipped graph_get_errors executor, not in the
+// standalone correlation helper. The shared harness drives that executor against a
+// root graph with a native subgraph so a scoped execution_error survives the complete scan.
+
+function makeScopedErrorGraph() {
+  const inner = { id: 125, type: "SamplerCustomAdvanced" };
+  const innerGraph = {
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === "125" ? inner : null),
+  };
+  const siblingInner = { id: 225, type: "SamplerCustomAdvanced" };
+  const siblingGraph = {
+    _nodes: [siblingInner],
+    getNodeById: (id) => (String(id) === "225" ? siblingInner : null),
+  };
+  const host = { id: 140, type: "Subgraph", subgraph: innerGraph };
+  const siblingHost = { id: 141, type: "Subgraph", subgraph: siblingGraph };
+  const rootNode = { id: 900, type: "SamplerCustomAdvanced" };
+  const collidingRootNode = { id: 125, type: "SamplerCustomAdvanced" };
+  const rootGraph = {
+    _nodes: [host, siblingHost, rootNode, collidingRootNode],
+    getNodeById: (id) =>
+      ({ 140: host, 141: siblingHost, 900: rootNode, 125: collidingRootNode })[String(id)] ?? null,
+  };
+  return {
+    inner,
+    innerGraph,
+    host,
+    siblingInner,
+    siblingGraph,
+    siblingHost,
+    rootNode,
+    collidingRootNode,
+    rootGraph,
+  };
+}
+
+test("#1691 production graph_get_errors batches live class reads and keeps uncertain types unchecked", async () => {
+  const working = {
+    id: 1,
+    type: "WorkingPack",
+    widgets: [{ name: "pick", value: "bad" }],
+    has_errors: true,
+  };
+  const uncertain = {
+    id: 2,
+    type: "InstalledButUnreachablePack",
+    widgets: [{ name: "pick", value: "ok" }],
+    constructor: { nodeData: { output_node: true } },
+  };
+  const graph = {
+    _nodes: [working, uncertain],
+    getNodeById: (id) => ([working, uncertain].find((node) => String(node.id) === String(id)) ?? null),
+  };
+  const fetchInfo = async (className) => {
+    if (className === "WorkingPack") {
+      return {
+        [SINGLE_NODE_INFO_OUTCOME]: true,
+        kind: "present",
+        body: { WorkingPack: { input: { required: { pick: [["ok"], {}] } } } },
+      };
+    }
+    return { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" };
+  };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    stepBudget: () => 1000,
+  });
+
+  assert.equal(result.unavailable_widget_values.length, 1);
+  assert.equal(result.unavailable_widget_values[0].type, "WorkingPack");
+  assert.equal(result.unchecked_nodes.length, 1);
+  assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
+  assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
+  assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
+});
+
+test("#1709 production graph_get_errors retires add proof on definitive class presence and absence", async () => {
+  const node = {
+    id: 31,
+    type: "RemovedNode",
+    widgets: [{ name: "mode", type: "combo", value: "old" }],
+  };
+  const graph = { _nodes: [node], getNodeById: () => node };
+  const def = { input: { required: { mode: [["old"], {}] } } };
+  const cache = createVerifiedNodeDefCache();
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const wholeDefs = { RemovedNode: def, OtherNode: { input: { required: {} } } };
+  const proofContext = {};
+  let generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  await objectInfoCache.read(async () => wholeDefs);
+  assert.equal(objectInfoCache.peek().cached, true, "the whole payload starts cached");
+  assert.equal(
+    objectInfoSnapshot.record(wholeDefs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: generation,
+      currentGeneration: generation,
+      whole: true,
+    }),
+    true,
+    "the whole membership snapshot starts held",
+  );
+  let present = true;
+  const fetchInfo = async () =>
+    present
+      ? { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "present", body: { RemovedNode: def } }
+      : { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "absent", body: {} };
+
+  await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.ok(cache.generation() > generation, "a definitive present class read retired old proof");
+  assert.equal(objectInfoCache.peek().cached, false, "definitive class presence retires whole cache authority");
+  assert.equal(objectInfoSnapshot.peek().held, false, "definitive class presence retires whole snapshot authority");
+
+  present = false;
+  generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  await objectInfoCache.read(async () => wholeDefs);
+  assert.equal(objectInfoCache.peek().cached, true, "the whole payload is reseeded before absence");
+  assert.equal(
+    objectInfoSnapshot.record(wholeDefs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: generation,
+      currentGeneration: generation,
+      whole: true,
+    }),
+    true,
+    "the whole membership snapshot is reseeded before absence",
+  );
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(result.unchecked_nodes.length, 1, "the explicit absent class remains unchecked, not falsely clean");
+  assert.ok(cache.generation() > generation, "a definitive absent class read retired old proof");
+  assert.equal(objectInfoCache.peek().cached, false, "definitive class absence retires whole cache authority");
+  assert.equal(objectInfoSnapshot.peek().held, false, "definitive class absence retires whole snapshot authority");
+  assert.equal(
+    cache.get("RemovedNode", { epoch: 0, context: proofContext, generation: cache.generation() }),
+    undefined,
+    "the absent class has no reusable proof after get_errors",
+  );
+
+  const afterAbsence = cache.generation();
+  const timeout = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: async () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" }),
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(cache.generation(), afterAbsence, "an unknown/timeout class read remains non-authoritative");
+  assert.equal(timeout.unchecked_nodes.length, 1);
+});
+
+test("#1691 production graph_get_errors keeps budget-cutoff scans non-clean and uses its monotonic clock", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const monotonicNow = () => 123;
+  let scanOptions;
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async (_nodes, _fetch, options) => {
+      scanOptions = options;
+      return { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
+    },
+    stepBudget: () => 1000,
+    monotonicNow,
+  });
+
+  assert.equal(scanOptions.now, monotonicNow);
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a budget-cutoff live scan must not emit a clean note");
+});
+
+test("#1691 production graph_get_errors discloses a scan skipped after the shared budget is spent", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async () => {
+      throw new Error("the scan must not start without a budget");
+    },
+    stepBudget: () => 0,
+  });
+
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a skipped live scan must not emit a clean note");
+});
+
+test("#1685 production graph_get_errors preserves a scoped runtime error and blames its root host", async () => {
+  const { rootGraph, host } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: rootGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "SamplerCustomAdvanced",
+      exception_type: "NotImplementedError",
+      exception_message: "aten::_int_mm",
+    },
+  });
+
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.nodes[0].id, host.id);
+  assert.deepEqual(result.nodes[0].reasons, [
+    {
+      kind: "execution",
+      exception_type: "NotImplementedError",
+      message: "aten::_int_mm",
+    },
+  ]);
+  assert.equal(result.last_execution_error.node_id, "140:125");
+  assert.equal(result.note, undefined, "a scoped execution failure must not be reported clean");
+});
+
+test("#1685 production graph_get_errors blames the inner node when that subgraph is visible", async () => {
+  const { inner, innerGraph, rootGraph } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: innerGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "SamplerCustomAdvanced",
+      exception_message: "inner failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.nodes[0].id, inner.id);
+  assert.equal(result.nodes[0].reasons[0].message, "inner failure");
+});
+
+test("#1685 production graph_get_errors omits same-type errors outside the visible subgraph", async () => {
+  const { innerGraph, rootGraph } = makeScopedErrorGraph();
+  for (const node_id of ["141:225", "900"]) {
+    const result = await runProductionGraphGetErrors({
+      graph: innerGraph,
+      rootGraph,
+      lastExecFailure: {
+        node_id,
+        node_type: "SamplerCustomAdvanced",
+        exception_message: "foreign failure",
+      },
+    });
+
+    assert.equal(result.errored_count, 0, `foreign ${node_id} must not create an errored node`);
+    assert.deepEqual(result.nodes, [], `foreign ${node_id} must not receive a reason`);
+    assert.equal(result.last_execution_error, null, `foreign ${node_id} must be omitted`);
+    assert.equal(result.note, "no errors recorded since the last execution start");
+  }
+});
+
+test("#1685 production graph_get_errors rejects an ambiguous plain id colliding with the visible inner node", async () => {
+  const { inner, innerGraph, rootGraph, collidingRootNode } = makeScopedErrorGraph();
+  assert.equal(inner.id, collidingRootNode.id, "the fixture must reproduce the root/inner id collision");
+  assert.equal(inner.type, collidingRootNode.type, "the fixture must reproduce the same-type collision");
+  const result = await runProductionGraphGetErrors({
+    graph: innerGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: String(collidingRootNode.id),
+      node_type: collidingRootNode.type,
+      exception_message: "root collision failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 0);
+  assert.deepEqual(result.nodes, []);
+  assert.equal(result.last_execution_error, null);
+  assert.equal(result.note, "no errors recorded since the last execution start");
+});
+
+test("#1685 production graph_get_errors still rejects a type-mismatched scoped failure", async () => {
+  const { rootGraph } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: rootGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "DifferentNodeType",
+      exception_message: "foreign failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 0);
+  assert.equal(result.last_execution_error, null);
+  assert.equal(result.note, "no errors recorded since the last execution start");
 });

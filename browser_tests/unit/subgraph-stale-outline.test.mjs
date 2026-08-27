@@ -9,6 +9,16 @@ import {
   collectMissingNodeTypeReasons,
   nodeRedFlagIsStale,
 } from "../../web/js/lib/asset-staleness.js";
+import {
+  danglingInputLinks,
+  disconnectedBoundaryInputs,
+  brokenConversionRefusal,
+  brokenConversionWarning,
+  detachedConversionNodes,
+  detachedConversionRefusal,
+  conversionSnapshot,
+  conversionThrowReport,
+} from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -21,7 +31,10 @@ function methodSource(name, args) {
 
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
-const setWidgetSource = methodSource("async graph_set_widget", "\\{ node_id, widget, value, workflow_uuid \\}");
+// Param list matched loosely on purpose: pinning the exact destructuring made this
+// locator fail on any added or removed argument, which reads as a broken
+// subgraph-staleness test and says nothing about staleness.
+const setWidgetSource = methodSource("async graph_set_widget", "\\{[^}]*\\}");
 // Extract the actual helper through its unindented closing brace. Do not depend on
 // the following doc comment or on checkout line endings: Windows worktrees retain
 // CRLF, while the test runner reads the source verbatim.
@@ -42,13 +55,61 @@ const assertSubgraphNodeLanded = new Function(
   `return ${landedMatch[0]};`,
 )();
 
+// #1571 — and the same again for the serializability guard the two executors now run
+// after the landing check. Injected from the REAL source with the REAL lib helpers, for
+// the same reason: a stub here would hide a regression in the shipped guard. Both
+// helpers answer "no findings" for the deliberately minimal graphs below (no readable
+// link table, no inputs on the wrapper), which is the fail-silent property they promise.
+const serializableMatch = panelSrc.match(
+  /function assertSubgraphConversionSerializable\(res, node, what\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(serializableMatch, "could not locate assertSubgraphConversionSerializable in panel source");
+const assertSubgraphConversionSerializable = new Function(
+  "danglingInputLinks",
+  "disconnectedBoundaryInputs",
+  "brokenConversionRefusal",
+  "brokenConversionWarning",
+  `return ${serializableMatch[0]};`,
+)(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal, brokenConversionWarning);
+const advisoriesMatch = panelSrc.match(
+  /function subgraphConversionAdvisories\(\{ disconnected, dangling, warning \}\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(advisoriesMatch, "could not locate subgraphConversionAdvisories in panel source");
+const subgraphConversionAdvisories = new Function(`return ${advisoriesMatch[0]};`)();
+
+// #1463 — both executors now reach convertToSubgraph through a shared runner that
+// refuses a detached selection up front and reports a throw with a measured
+// mutation verdict. Same treatment again: the REAL runner, wired to the REAL lib
+// helpers, so a regression in it fails here instead of hiding behind a stub.
+const runnerMatch = panelSrc.match(
+  /function convertSelectionToSubgraph\(\{ graph, canvas, nodes, what \}\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(runnerMatch, "could not locate convertSelectionToSubgraph in panel source");
+const convertSelectionToSubgraph = new Function(
+  "detachedConversionNodes",
+  "detachedConversionRefusal",
+  "conversionSnapshot",
+  "conversionThrowReport",
+  `return ${runnerMatch[0]};`,
+)(detachedConversionNodes, detachedConversionRefusal, conversionSnapshot, conversionThrowReport);
+
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
     "getGraphCtx",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "convertSelectionToSubgraph",
     "assertSubgraphNodeLanded",
+    "assertSubgraphConversionSerializable",
+    "subgraphConversionAdvisories",
     `const executors = { ${createSource} }; return executors.graph_create_subgraph;`,
-  )(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion, assertSubgraphNodeLanded);
+  )(
+    getGraphCtx,
+    clearStaleRedFlagsAfterSubgraphConversion,
+    convertSelectionToSubgraph,
+    assertSubgraphNodeLanded,
+    assertSubgraphConversionSerializable,
+    subgraphConversionAdvisories,
+  );
 }
 
 function realGroup(
@@ -64,7 +125,10 @@ function realGroup(
     "syncGraphNodeAreas",
     "groupMemberNodes",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "convertSelectionToSubgraph",
     "assertSubgraphNodeLanded",
+    "assertSubgraphConversionSerializable",
+    "subgraphConversionAdvisories",
     `const executors = { ${groupSource} }; return executors.graph_subgraph_group;`,
   )(
     getGraphCtx,
@@ -72,7 +136,10 @@ function realGroup(
     syncGraphNodeAreas,
     groupMemberNodes,
     clearStaleRedFlagsAfterSubgraphConversion,
+    convertSelectionToSubgraph,
     assertSubgraphNodeLanded,
+    assertSubgraphConversionSerializable,
+    subgraphConversionAdvisories,
   );
 }
 

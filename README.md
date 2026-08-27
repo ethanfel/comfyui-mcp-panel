@@ -48,8 +48,8 @@ is just its window into your graph.
 this panel ⇄ loopback bridge ⇄ comfyui-mcp orchestrator (background, Claude OR ChatGPT — your subscription) ⇄ your graph
 ```
 
-Each provider runs its own orchestrator on its own loopback port (Claude on
-`ws://127.0.0.1:9180`), so you can pick a provider rather than juggle ports.
+Every provider shares one orchestrator on one loopback port (default
+`ws://127.0.0.1:9199`; 9180 is a legacy fallback), so you pick a provider rather than juggle ports.
 
 ## Features
 
@@ -114,18 +114,19 @@ your canvas. **Disconnect** stops the agent; nothing is ever started without
 your click.
 
 Switching providers starts a fresh chat — conversations aren't shared across
-Claude and ChatGPT — and the panel tells you so. Each provider runs its own
-orchestrator on its own loopback port (Claude defaults to `ws://127.0.0.1:9180`,
-overridable via `COMFYUI_MCP_BRIDGE_PORT`), so you pick a provider rather than a
-port. The bridge is loopback-only. To run an orchestrator yourself, set
+Claude and ChatGPT — and the panel tells you so. Every provider shares one
+orchestrator on one loopback port (default `ws://127.0.0.1:9199`, overridable via
+`COMFYUI_MCP_BRIDGE_PORT`; 9180 is a legacy fallback so a live session there is
+not stranded). The bridge is loopback-only. To run an orchestrator yourself, set
 `COMFYUI_MCP_NO_AUTOSPAWN=1`, launch it manually, then click Connect (the Bridge
 URL lives under **Advanced**).
 
 Type `/` in the composer for commands — panel ones like **`/reload`** (pick up
 new code, keep the chat), **`/reload-ui`** (reload just the panel), **`/revert`**
-(undo the last turn's graph edits), and **`/restart`** (recover an unresponsive
-agent — kills the orchestrator and its child tree, starts fresh). On the Claude
-backend, provider slash commands (`/compact`, `/loop`, …) are available too.
+(undo the last turn's graph edits), **`/record-skill`** (save the open graph as a
+reusable skill), and **`/restart`** (recover an unresponsive agent — kills the
+orchestrator and its child tree, starts fresh). On the Claude backend, provider
+slash commands (`/compact`, `/loop`, …) are available too.
 
 ## What the agent can do
 
@@ -164,7 +165,7 @@ which receives `panel_*` by a different route.
 | `panel_get_subgraph` | Read inside a subgraph node's inner graph |
 | `panel_get_errors` | Read the last execution error + per-node validation errors |
 | `panel_list_workflows` | List open workflow tabs and which is active |
-| `panel_list_nodes` | List installed custom-node packs |
+| `panel_list_nodes` | List installed custom-node packs (optional `search` or `query` filters by pack name) |
 | `panel_list_mcp` | List connected MCP servers |
 | `panel_get_content_mode` | Read the adult-content (NSFW) consent state |
 
@@ -173,7 +174,7 @@ which receives `panel_*` by a different route.
 | Tool | Effect |
 |---|---|
 | `panel_add_node` | Add a node by class_type |
-| `panel_remove_node` | Remove a node |
+| `panel_remove_node` | Remove a node, or several as one undo step (`node_ids`) |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
 | `panel_set_property` | Set a node **property** (right-click → Properties), e.g. rgthree Fast Groups Bypasser `matchTitle` — the counterpart to `panel_set_widget` |
@@ -194,7 +195,7 @@ which receives `panel_*` by a different route.
 | Tool | Effect |
 |---|---|
 | `panel_move_rail` | Move a subgraph's input / output rail so boundary wires stay short |
-| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor, or delete a labeled group box |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor/resize the box, or delete a labeled group box. `panel_edit_group({bounds})` writes the rectangle only — contained nodes stay put (`panel_move_group` translates them) |
 | `panel_screenshot` | Render the canvas to a PNG so the agent can verify its own layout |
 
 **Workflow tabs**
@@ -233,7 +234,7 @@ which receives `panel_*` by a different route.
 
 | Tool | Effect |
 |---|---|
-| `panel_search_nodes` | Search installable node packs (the Manager's own source) |
+| `panel_search_nodes` | Search installable node packs (the Manager's own source; `limit` defaults to 15, max 40) |
 | `panel_install_node` | Queue a pack install (registry id or git URL) |
 | `panel_node_queue_status` | Check the Manager's install / update queue |
 | `panel_restart_comfyui` | Restart ComfyUI to load new nodes — panel auto-reconnects and the agent resumes |

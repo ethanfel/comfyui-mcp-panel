@@ -45,6 +45,12 @@
 // names it. That is what makes the remedy actionable rather than decorative.
 
 import { withTimeout } from "./bounded-step.js";
+import {
+  appendImageCacheBust,
+  appendStoryboardCacheBust,
+  createStoryboardIdentity,
+  storyboardUploadName,
+} from "./storyboard-cache-identity.js";
 
 /**
  * Whole wall-clock bound for ONE video's preview (size probe + sample + upload).
@@ -57,6 +63,9 @@ export const MEDIA_PREVIEW_TIMEOUT_MS = 20000;
 /** Bound on the size probe alone, so a hanging HEAD cannot consume the budget
  *  the storyboard needs. Unknown size still produces a preview. */
 export const MEDIA_SIZE_PROBE_TIMEOUT_MS = 8000;
+
+/** Bound on the browser-side /view availability check for a ComfyUI ref. */
+export const MEDIA_VIEW_PROBE_TIMEOUT_MS = 4000;
 
 /**
  * WHAT THE PANEL CAN ACTUALLY PRESENT (#710).
@@ -313,6 +322,19 @@ function safePaint(paint, url, caption, warn, what) {
   return deferred ? "unconfirmed" : "shown";
 }
 
+/** A failed browser-side /view check, or null when the check passed. */
+function viewProbeFailure(result) {
+  try {
+    if (result === true || (result && result.ok === true)) return null;
+    if (result && typeof result.reason === "string" && result.reason.trim()) {
+      return result.reason.trim();
+    }
+  } catch {
+    // A malformed probe result must still become an honest delivery failure.
+  }
+  return "the panel could not verify that the requested /view media was served";
+}
+
 /** A ComfyUI ref written the way `get_image` takes its arguments. */
 function refClause(ref, coerce) {
   const filename = coerce(ref?.filename);
@@ -359,6 +381,8 @@ export async function composeShowMediaReply(items, deps = {}) {
     warn = () => {},
     timeoutMs = MEDIA_PREVIEW_TIMEOUT_MS,
     sizeProbeTimeoutMs = MEDIA_SIZE_PROBE_TIMEOUT_MS,
+    viewProbeTimeoutMs = MEDIA_VIEW_PROBE_TIMEOUT_MS,
+    probeMedia,
     setTimer,
     clearTimer,
   } = deps;
@@ -414,6 +438,7 @@ export async function composeShowMediaReply(items, deps = {}) {
     const caption = text(item?.caption) || text(item?.filename) || "";
     const { kind, ext } = classifyShowMediaItem(item, text);
     const isVideo = kind === "video";
+    const storyboardIdentity = isVideo ? createStoryboardIdentity() : null;
     let url = null;
     let ref = null;
     let why = null;
@@ -433,6 +458,19 @@ export async function composeShowMediaReply(items, deps = {}) {
       // reference is right there, and the caller would be told to re-send
       // something it already sent correctly.
       if (!url) why = "the panel could not build a view URL for its ComfyUI reference";
+      // #1718 — a temp video can be rerendered in place. The stable /view URL
+      // otherwise lets the browser sample the previous video's bytes.
+      if (isVideo && url) url = appendStoryboardCacheBust(url, storyboardIdentity);
+      // #1834 — a STILL is exposed to exactly the same thing, and was the half
+      // of it left unguarded: /view is keyed by filename, ComfyUI sets no
+      // Cache-Control on it, so showing a name whose file has since been
+      // rewritten paints the old pixels. There is no run identity on this
+      // surface — the agent is naming a file, not a run — so this mints one,
+      // which is what "show me this" already means. Minting is safe HERE and
+      // nowhere else in this fix: the single `url` local below feeds both the
+      // /view probe and the painter, so the two cannot land on different
+      // bytes. Busting BEFORE the probe is what preserves that, as video does.
+      if (kind === "image" && url) url = appendImageCacheBust(url, createStoryboardIdentity());
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
       url = item.dataUrl;
     }
@@ -495,6 +533,35 @@ export async function composeShowMediaReply(items, deps = {}) {
       });
       continue;
     }
+    // A viewRef is fetched by the browser AFTER this handler returns. A card
+    // created before that request answers is not evidence that the requested
+    // media can be served — especially on a remote/authenticated /view route.
+    // Probe the same URL in the panel's browser session first, and fail closed
+    // when it is unavailable or the probe is inconclusive. Inline data URLs do
+    // not take this branch: their bytes are already in the panel.
+    if (ref && typeof probeMedia === "function") {
+      const probe = await withTimeout(
+        Promise.resolve().then(() => probeMedia(url, ref)),
+        viewProbeTimeoutMs,
+        () => ({
+          ok: false,
+          reason: "the panel's /view availability probe timed out before it answered",
+        }),
+        { setTimer, clearTimer },
+      );
+      const probeWhy = viewProbeFailure(probe);
+      if (probeWhy) {
+        dropped.push({
+          name,
+          why: `the panel could not serve its ComfyUI /view reference: ${probeWhy}`,
+          remedy:
+            `The reference itself is intact — call get_image with ${refClause(ref, text)} ` +
+            `to fetch it without relying on this panel's browser /view session, then fix the ` +
+            `remote /view authorization or target and retry panel_show_media.`,
+        });
+        continue;
+      }
+    }
     const shownState = safePaint(painter, url, caption, note, name);
     if (shownState === "failed") {
       dropped.push({
@@ -542,6 +609,7 @@ export async function composeShowMediaReply(items, deps = {}) {
         url,
         name: name || "video",
         ref,
+        storyboardIdentity,
         // Whether the USER got a player. The no-preview remedy leans on "ask
         // the user"; telling the agent to ask about something the user cannot
         // see is a remedy that does not work from where the caller is.
@@ -911,7 +979,8 @@ async function produceSheet(job, deps) {
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
     // #209 — a panel-generated sheet is not a user input: it goes to ComfyUI's
     // swept temp/ namespace so it cannot accumulate as permanent input litter.
-    const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`, { type: "temp" });
+    const identity = job.storyboardIdentity || createStoryboardIdentity();
+    const ref = await uploadBlobToInput(blob, storyboardUploadName(base, identity), { type: "temp" });
     if (!ref) {
       warn("[cmcp] show_media: storyboard upload failed for", job.name);
       return {

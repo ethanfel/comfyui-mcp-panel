@@ -53,6 +53,11 @@ import {
   SUBGRAPH_OUTPUT_RAIL_ID,
 } from "../../web/js/lib/subgraph-scope.js";
 import {
+  rememberAutoLayoutScope,
+  layoutScopeFingerprint,
+} from "../../web/js/lib/auto-layout-scope.js";
+import { applyReconnectScopeFence } from "../../web/js/lib/reconnect-scope-fence.js";
+import {
   graphBindingRefusalMessage,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
@@ -103,8 +108,11 @@ function buildGetGraphCtx(app) {
     "app",
     "window",
     "resolveScope",
+    "applyReconnectScopeFence",
+    "rememberAutoLayoutScope",
+    "layoutScopeFingerprint",
     `${source}\nreturn getGraphCtx;`,
-  )(app, { LiteGraph: {} }, resolveScope);
+  )(app, { LiteGraph: {} }, resolveScope, applyReconnectScopeFence, rememberAutoLayoutScope, layoutScopeFingerprint);
 }
 
 function nodes(n, offset = 0) {
@@ -438,6 +446,7 @@ const MUTATING_GRAPH_COMMANDS = [
   "graph_clear",
   "graph_load",
   "graph_run",
+  "graph_configure_app_mode",
   "graph_future_command", // unknown commands fail closed as mutations
 ];
 

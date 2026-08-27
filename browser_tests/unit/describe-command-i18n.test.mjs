@@ -57,10 +57,26 @@ test("English is unchanged by being keyed — same words, both plural forms", ()
   assert.equal(say("graph_clear", { cleared: 1 }), "Cleared canvas — removed 1 node (one Ctrl+Z restores all)");
   assert.equal(say("graph_clear", { cleared: 3 }), "Cleared canvas — removed 3 nodes (one Ctrl+Z restores all)");
   assert.equal(say("graph_find_nodes", { count: 5, total: 20, truncated: true }), "Found 5+ of 20 nodes");
+  // #1310 — outline/query used to fall through to JSON.stringify(result), which
+  // painted budget_overrun / groups_omitted in the activity card.
+  assert.equal(say("graph_outline", { node_count: 12, degraded_reason: "raise max_chars" }), "Read graph — 12 nodes");
+  assert.equal(say("graph_query", { total: 20, shown: 8, truncated: true, budget_overrun: "huge" }), "Found 8+ of 20 nodes");
   // Two independent counts in one sentence — nodes and columns pluralise separately.
   assert.equal(say("graph_auto_layout", { node_count: 1, columns: 1 }), "Auto-arranged 1 node (1 column)");
   assert.equal(say("graph_auto_layout", { node_count: 9, columns: 1 }), "Auto-arranged 9 nodes (1 column)");
   assert.equal(say("graph_auto_layout", { node_count: 1, columns: 4 }), "Auto-arranged 1 node (4 columns)");
+});
+
+test("#1776 graph_get_virtual_types renders a user-facing counted activity card", () => {
+  __setCatalogForTest("en", {});
+  assert.equal(
+    describeCommand("graph_get_virtual_types", {}, { ok: true, result: { virtual_type_count: 1 } }).text,
+    "Checked UI-only node types — 1 type",
+  );
+  const many = describeCommand("graph_get_virtual_types", {}, { ok: true, result: { virtual_type_count: 4 } });
+  assert.equal(many.icon, "pi-eye");
+  assert.equal(many.text, "Checked UI-only node types — 4 types");
+  assert.doesNotMatch(many.text, /graph_get_virtual_types/);
 });
 
 test("a number that is not a count never selects a plural form", () => {
@@ -69,6 +85,49 @@ test("a number that is not a count never selects a plural form", () => {
   __setCatalogForTest("en", {});
   assert.equal(say("graph_run", { queued: true, batch_count: 4 }), "Queued workflow ×4");
   assert.equal(say("graph_screenshot", { width: 1024, height: 768 }), "Captured workflow image (1024×768)");
+});
+
+test("#1750 orphan repair renders a repair card and preserves its warning", () => {
+  __setCatalogForTest("en", {});
+  const warning =
+    'nothing was disconnected — the input carried link id 21, which the graph link store did not have. The panel cleared it.';
+  const card = describeCommand(
+    "graph_disconnect",
+    {},
+    {
+      ok: true,
+      result: {
+        cleared_orphan_link: { node_id: 79, input: "source_latent_b", link_id: 21 },
+        warning,
+      },
+    },
+  );
+
+  assert.equal(card.icon, "pi-exclamation-triangle");
+  assert.equal(card.text, "Cleared orphaned link 79.source_latent_b");
+  assert.equal(card.detail, warning);
+  assert.doesNotMatch(card.text, /undefined/);
+
+  const normal = describeCommand(
+    "graph_disconnect",
+    {},
+    { ok: true, result: { disconnected: { node_id: 79, input: "source_latent" } } },
+  );
+  assert.equal(normal.text, "Disconnected 79.source_latent");
+  assert.equal(normal.detail, undefined);
+});
+
+test("#1690: queued_unknown activity is uncertain, not blocked or duplicate-retry messaging", () => {
+  __setCatalogForTest("en", {});
+  const card = describeCommand("graph_run", {}, { ok: true, result: {
+    queued_unknown: true,
+    error: "The queue acknowledgement was incomplete",
+    retry_guidance: "A blind retry can duplicate the render",
+  } });
+  assert.equal(card.text, "Run outcome uncertain");
+  assert.equal(card.detail, "The queue acknowledgement was incomplete");
+  assert.doesNotMatch(card.text, /blocked/i);
+  assert.doesNotMatch(String(card.detail), /retry|duplicate/i);
 });
 
 test("Korean gets its single form for every number", () => {
@@ -104,6 +163,17 @@ test("a count can drive the FORM without being rendered", () => {
   assert.equal(
     say("graph_remove_node", { removed: { type: "T", id: 3 }, cleaned_boundary_slots: { inputs: ["a"], outputs: ["b"] } }),
     "Removed T (id 3) — cleaned orphaned boundary slots a, b",
+  );
+  assert.equal(
+    say("graph_remove_node", { removed: [{ type: "T", id: 3 }, { type: "U", id: 8 }] }),
+    "Removed 2 nodes (one Ctrl+Z restores all)",
+  );
+  assert.equal(
+    say("graph_remove_node", {
+      removed: [{ type: "T", id: 3 }],
+      not_removed: [{ id: 8 }],
+    }),
+    "Removed T (id 3) — 1 still on the canvas",
   );
 });
 
@@ -197,4 +267,133 @@ test("user data in a summary is never mistaken for a placeholder", () => {
     say("graph_set_widget", { set: { widget: "text", value: "a {node_id} b", node_id: 12, previous: null } }),
     'Set text = "a {node_id} b" on node 12',
   );
+});
+
+test("#1310 graph_query / the default do not dump the raw tool payload", () => {
+  __setCatalogForTest("en", {});
+  const query = describeCommand(
+    "graph_query",
+    {},
+    { ok: true, result: { total: 4, shown: 4, budget_overrun: "max_chars", groups_omitted: 3 } },
+  );
+  assert.equal(query.detail, undefined);
+  assert.doesNotMatch(String(query.text), /budget_overrun|groups_omitted|max_chars/);
+
+  const fallback = describeCommand(
+    "some_new_cmd",
+    {},
+    { ok: true, result: { budget_overrun: "secret", groups_omitted: 3 } },
+  );
+  assert.equal(fallback.detail, undefined);
+  assert.equal(fallback.text, "some_new_cmd");
+});
+
+test("#1126: the summary discloses an unvalidated write, scoped to the widget it is about", () => {
+  // Driven through the REAL extracted describeCommand, not matched in source: a wiring scan
+  // cannot tell a live branch from a dead one, and this text is the only line most users
+  // read about a write nothing compared to anything.
+  __setCatalogForTest("en", {});
+  const plain = say("graph_set_widget", { set: { widget: "model", value: "x.fbx", node_id: 4, previous: "" } });
+  assert.equal(plain, 'Set model = "x.fbx" on node 4', "an ordinary write is unchanged");
+
+  const unread = say("graph_set_widget", {
+    option_list_unreadable: true,
+    set: { widget: "model", value: "F:/x.fbx", node_id: 4, previous: "" },
+  });
+  assert.match(unread, /^Set model = "F:\/x\.fbx" on node 4/);
+  assert.match(unread, /NOT validated/);
+  // Scoped: the claim is about THIS widget's own list, which is the only list that went
+  // unread. An unqualified "nothing checked the value" is false when a rail did.
+  assert.match(unread, /this combo's own option list could not be read/);
+});
+
+test("#1126: a value the parent RAIL validated is NOT reported as wholly unchecked", () => {
+  // The promoted case. The sibling cross-check compares the value against the rail's list
+  // and proceeds only on membership, so "nothing checked the value" would be false in
+  // precisely the case where the most checking happened.
+  __setCatalogForTest("en", {});
+  const railChecked = say("graph_set_widget", {
+    option_list_unreadable: true,
+    promoted_rail_validated: true,
+    set: { widget: "model_alias", value: "b.fbx", node_id: 320, previous: "" },
+  });
+  assert.match(railChecked, /^Set model_alias = "b\.fbx" on node 320/);
+  assert.match(railChecked, /this combo's own option list could not be read/);
+  assert.match(railChecked, /checked against the parent subgraph rail's list/);
+  // It must NOT keep asserting that nothing checked it.
+  assert.doesNotMatch(railChecked, /nothing checked the value/);
+  assert.doesNotMatch(railChecked, /NOT validated/);
+});
+
+// ------------------------------------------- #1492: the side effects it did NOT run
+
+/** The reported reply shape: wrapper 1512, promoted BOOLEAN, inner status switch 2448. */
+const skippedInnerCallback = (promotedExtra) => ({
+  set: {
+    widget: "enabled_3",
+    value: false,
+    node_id: 1512,
+    previous: true,
+    inner_previous: true,
+    promoted_from: {
+      subgraph_node_id: 1512,
+      inner_node_id: 2448,
+      parent_widget_synced: true,
+      value_scope: "instance",
+      ...promotedExtra,
+    },
+  },
+});
+
+test("#1492: a write that skipped the shared inner callback SAYS SO, with the warning icon", () => {
+  // The card is the one line a user actually reads. Rendered as a plain "Set … " success,
+  // it asserts the opposite of what happened: the value landed on this instance and the
+  // inner switch that flips another node between ACTIVE and BYPASS never ran.
+  __setCatalogForTest("en", {});
+  const card = describeCommand(
+    "graph_set_widget",
+    {},
+    {
+      ok: true,
+      result: skippedInnerCallback({
+        inner_callback_not_invoked: true,
+        inner_callback_note: "…the lib's long-form note, which the card does not print…",
+      }),
+    },
+  );
+  assert.match(card.text, /^Set enabled_3 = false on node 1512/);
+  assert.match(card.text, /the shared inner node's own callback did NOT run/);
+  assert.match(card.text, /may still be stale/);
+  assert.equal(card.icon, "pi-exclamation-triangle", "a half-applied change must not read as a clean success");
+});
+
+test("#1492: an instance-scoped write that skipped NOTHING still renders the plain success line", () => {
+  // The over-claim to avoid on the rendering side. Most instance-scoped promoted writes
+  // skip nothing at all, and a warning triangle on every one of them is a warning nobody
+  // reads by the time the real one arrives.
+  __setCatalogForTest("en", {});
+  const card = describeCommand("graph_set_widget", {}, { ok: true, result: skippedInnerCallback({}) });
+  assert.equal(card.text, "Set enabled_3 = false on node 1512");
+  assert.equal(card.icon, "pi-sliders-h");
+});
+
+test("#1492: the disclosure is TRANSLATED — it renders from the shipped catalog, not from English", () => {
+  // A disclosure that only exists in English is a disclosure eleven of twelve panels do
+  // not show. Driven from the REAL ja catalog on disk, so a key that was added to the
+  // code and never shipped to the locales fails here rather than at a user's screen.
+  const ja = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../../locales/ja/main.json", import.meta.url)), "utf8"),
+  ).comfyuiMcpPanel;
+  const clause = ja.panel.set_widget_inner_callback_not_invoked;
+  assert.ok(clause && clause.length > 0, "ja must ship the disclosure clause");
+  __setCatalogForTest("ja", ja);
+  const card = describeCommand(
+    "graph_set_widget",
+    {},
+    { ok: true, result: skippedInnerCallback({ inner_callback_not_invoked: true }) },
+  );
+  assert.ok(card.text.includes(clause), "the ja card must render the ja clause");
+  assert.doesNotMatch(card.text, /the shared inner node's own callback did NOT run/, "and not the English one");
+  assert.doesNotMatch(card.text, /panel\./, "and never a raw key");
+  __setCatalogForTest("en", {});
 });

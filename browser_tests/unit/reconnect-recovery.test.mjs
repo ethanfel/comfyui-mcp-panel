@@ -25,6 +25,10 @@ import {
   graphMutationReconnectGate,
   reconnectRefusalError,
   readReconnectRefusal,
+  backendSocketIsDown,
+  classifyBackendStatusEvent,
+  describeGraphMutationReadiness,
+  WS_OPEN,
 } from "../../web/js/lib/reconnect-recovery.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -154,6 +158,85 @@ test("#663: a restore that NEVER settles is bounded — the watch exhausts and p
 // ---------------------------------------------------------------------------
 // graphMutationReconnectGate
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// #1325 — sticky down-flag vs live socket
+// ---------------------------------------------------------------------------
+
+test("#1325: a flagged-down socket that is still OPEN is not down", () => {
+  // ComfyUI's `_pollQueue` dispatches status(null) on a failed /prompt while a
+  // long Wan render blocks the backend. The websocket never left OPEN.
+  assert.equal(backendSocketIsDown({ flaggedDown: true, socketReadyState: WS_OPEN }), false);
+});
+
+test("#1325: a flagged-down socket that is not OPEN is down", () => {
+  assert.equal(backendSocketIsDown({ flaggedDown: true, socketReadyState: 0 }), true, "CONNECTING");
+  assert.equal(backendSocketIsDown({ flaggedDown: true, socketReadyState: 2 }), true, "CLOSING");
+  assert.equal(backendSocketIsDown({ flaggedDown: true, socketReadyState: 3 }), true, "CLOSED");
+  assert.equal(backendSocketIsDown({ flaggedDown: true }), true, "unknown readyState fails closed");
+});
+
+test("#1325: an unflagged socket is never down, even if readyState is missing", () => {
+  assert.equal(backendSocketIsDown({ flaggedDown: false, socketReadyState: 3 }), false);
+  assert.equal(backendSocketIsDown({}), false);
+});
+
+test("#1325: a real status payload is the backend talking", () => {
+  assert.equal(
+    classifyBackendStatusEvent({ detail: { exec_info: { queue_remaining: 0 } }, socketReadyState: 3 }),
+    "alive",
+  );
+});
+
+test("#1325: a null status while the socket is OPEN is a busy poll, not a drop", () => {
+  assert.equal(classifyBackendStatusEvent({ detail: null, socketReadyState: WS_OPEN }), "ignore");
+  assert.equal(classifyBackendStatusEvent({ detail: undefined, socketReadyState: WS_OPEN }), "ignore");
+});
+
+test("#1325: a null status while the socket is not OPEN is a lost connection", () => {
+  assert.equal(classifyBackendStatusEvent({ detail: null, socketReadyState: 3 }), "lost");
+  assert.equal(classifyBackendStatusEvent({ detail: null }), "lost", "unknown readyState fails closed");
+});
+
+test("#1325: binding status distinguishes canvas identity from backend readiness", () => {
+  const down = describeGraphMutationReadiness({
+    flaggedDown: true,
+    socketReadyState: 3,
+    canvasBinding: "bound",
+  });
+  assert.equal(down.graph_binding, "reconnecting");
+  assert.equal(down.canvas_binding, "bound", "the canvas is still this workflow's");
+  assert.equal(down.backend_socket, "reconnecting");
+  assert.equal(down.mutations_ready, false);
+  assert.match(down.backend_socket_note, /reload the ComfyUI page or restart ComfyUI/);
+
+  const up = describeGraphMutationReadiness({
+    flaggedDown: true,
+    socketReadyState: WS_OPEN,
+    canvasBinding: "bound",
+  });
+  assert.equal(up.graph_binding, "bound");
+  assert.equal(up.backend_socket, "up");
+  assert.equal(up.mutations_ready, true);
+  assert.equal(up.backend_socket_note, undefined);
+});
+
+test("#1325: a live execution after a Wan render must not stay gated", () => {
+  // The shipped path: flag armed by a busy-poll null status, socket still OPEN.
+  assert.equal(
+    graphMutationReconnectGate({
+      cmd: "graph_set_widget",
+      backendDown: backendSocketIsDown({ flaggedDown: true, socketReadyState: WS_OPEN }),
+    }),
+    null,
+    "OPEN socket + sticky flag must not refuse the mutation",
+  );
+  const stillDown = graphMutationReconnectGate({
+    cmd: "graph_set_widget",
+    backendDown: backendSocketIsDown({ flaggedDown: true, socketReadyState: 3 }),
+  });
+  assert.equal(stillDown?.code, "backend-reconnecting");
+});
 
 test("#646: no instability signal → no gate", () => {
   assert.equal(
@@ -536,7 +619,7 @@ test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list
   // The reviewer's P2: a send boundary that rebuilt the frame as {rid, ok, error}
   // would drop `refusal` silently — the tests above would all still pass while
   // the contract was gone. Asserted on the actual send.
-  assert.match(SRC, /thisSock\.send\(JSON\.stringify\(reply\)\)/, "the whole reply object goes to the wire");
+  assert.match(SRC, /thisSock\["send"\]\(JSON\.stringify\(reply\)\)/, "the whole reply object goes to the wire");
 });
 
 // ---------------------------------------------------------------------------
@@ -546,7 +629,8 @@ test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list
 test("#663 wiring: the 'reconnected' listener kicks the settle watch for the NEW epoch", () => {
   const start = SRC.indexOf('api.addEventListener("reconnected"');
   assert.notEqual(start, -1);
-  const block = SRC.slice(start, start + 1600);
+  const next = SRC.indexOf("api.addEventListener(", start + 1);
+  const block = SRC.slice(start, next === -1 ? SRC.length : next);
   assert.match(block, /backendReconnectEpoch \+= 1/, "the epoch bump is intact (#433)");
   assert.match(
     block,
@@ -575,7 +659,7 @@ test("#646 wiring: the dispatch fence gates MUTATING graph commands through the 
   assert.match(fence, /graphCommandMayMutateWorkflow\(msg\.cmd\)/, "reads are NOT gated — mutations are");
   assert.match(
     fence,
-    /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendSocketDown,[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
+    /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendIsDown\(\),[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
     "the gate reads both live signals",
   );
   assert.ok(
@@ -587,7 +671,23 @@ test("#646 wiring: the dispatch fence gates MUTATING graph commands through the 
 test("#663 wiring: BOTH resync sites (open + new) stamp the binding proof, TOCTOU-guarded", () => {
   const stamps =
     SRC.match(/if \(backendReconnectEpoch === openedForEpoch\) postReconnectBindingProofEpoch = openedForEpoch;/g) ?? [];
-  assert.equal(stamps.length, 2, "workflow_new AND workflow_open both stamp the proof");
+  // #1641's pre-load handshake wait retains the compact form. workflow_new now
+  // carries the same ownership and binding-generation fence as workflow_open, and
+  // the final workflow_open stamp remains conditional on its post-load active settle.
+  assert.equal(stamps.length, 1, "the #1641 handshake wait");
+  const newStart = SRC.indexOf("async workflow_new({");
+  const openStart = SRC.indexOf("async workflow_open({", newStart);
+  const newBody = SRC.slice(newStart, openStart);
+  assert.match(
+    newBody,
+    /ownsWorkflowReloadGuard\(reloadGuardToken\)[\s\S]*workflowBindingGeneration === bindingGeneration[\s\S]*backendReconnectEpoch === openedForEpoch[\s\S]*postReconnectBindingProofEpoch = openedForEpoch;/,
+    "workflow_new stamps proof only while its shared binding operation remains current",
+  );
+  assert.match(
+    SRC,
+    /if \(!rebindFailed && backendReconnectEpoch === openedForEpoch\) \{[\s\S]*?postReconnectBindingProofEpoch = openedForEpoch;/,
+    "workflow_open stamps only after its complete active-binding proof",
+  );
 });
 
 test("#663/#646 wiring: the binding gate consults the #433 window AND the proof epoch, one invariant", () => {
@@ -611,7 +711,7 @@ test("#646 wiring: the async write boundary re-checks the gate (a dispatch can s
   const body = SRC.slice(start, start + 1400);
   assert.match(
     body,
-    /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendSocketDown,[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
+    /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendIsDown\(\),[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
     "the pre-write revalidation consults the same live signals",
   );
   assert.ok(
@@ -621,5 +721,43 @@ test("#646 wiring: the async write boundary re-checks the gate (a dispatch can s
   assert.ok(
     body.indexOf("graphMutationReconnectGate({") < body.indexOf("assertGraphBoundToActiveWorkflow("),
     "the gate fires BEFORE the write-boundary binding assert",
+  );
+});
+
+test("#1325 wiring: a null status only arms the flag when the live socket is not OPEN", () => {
+  const start = SRC.indexOf('api.addEventListener("status"');
+  assert.notEqual(start, -1);
+  const block = SRC.slice(start, start + 1600);
+  assert.match(block, /classifyBackendStatusEvent\(\{/, "the status handler classifies before arming");
+  assert.match(block, /statusKind === "alive"/, "a real queue payload clears a stale flag");
+  assert.match(block, /statusKind === "lost"/, "only a lost-connection null arms the gate");
+  assert.match(block, /noteComfyBackendAlive\(\)/, "alive status un-sticks the mutation guard");
+});
+
+test("#1325 wiring: a live execution frame un-sticks the mutation guard", () => {
+  for (const ev of ["execution_start", "execution_success", "executed", "progress"]) {
+    const start = SRC.indexOf(`api.addEventListener("${ev}"`);
+    assert.notEqual(start, -1, `${ev} listener is still wired`);
+    const block = SRC.slice(start, start + 280);
+    assert.match(block, /noteComfyBackendAlive\(\)/, `${ev} is proof the backend is talking`);
+  }
+});
+
+test("#1325 wiring: binding-status replies publish backend readiness, not just canvas identity", () => {
+  assert.match(SRC, /function backendSocketReplyFields\(/);
+  assert.match(
+    SRC,
+    /outline,[\s\S]{0,400}?\.\.\.backendSocketReplyFields\(activeWorkflowRef\(\)\)/,
+    "graph_outline discloses backend readiness beside the readable canvas",
+  );
+  assert.match(
+    SRC,
+    /\.\.\.backendSocketReplyFields\(active\),/,
+    "workflow_list discloses it on the bound-tab reply",
+  );
+  assert.match(
+    SRC,
+    /\.\.\.backendSocketReplyFields\(target\),/,
+    "workflow_open (set_workflow_target current) discloses it",
   );
 });

@@ -17,9 +17,90 @@ import { dirname, join } from "node:path";
 
 import {
   collectRelativeImportSpecifiers,
+  createDirtySafeBundleHealRetry,
   primeModuleCache,
   resolveBundleStaleness,
 } from "../../web/js/lib/bundle-version.js";
+
+test("#1830 dirty-safe bundle heal waits for every unsaved workflow to become clean", async () => {
+  const timers = [];
+  let blocked = true;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => blocked,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cancelled = true;
+    },
+    retryMs: 25,
+  });
+
+  assert.equal(retry.schedule(), true);
+  assert.equal(retry.schedule(), false, "repeated stale probes share one waiter");
+  assert.equal(timers[0].ms, 25);
+  timers[0].fn();
+  await Promise.resolve();
+  assert.equal(heals, 0, "dirty work never triggers navigation/healing");
+  assert.equal(timers.length, 2, "the cheap blocker poll remains armed");
+
+  blocked = false;
+  timers[1].fn();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(heals, 1, "healing is retried once the workflows are clean");
+  assert.equal(retry.pending(), false);
+});
+
+test("#1830 dirty-safe bundle heal cancellation prevents a stale timer from navigating", () => {
+  let timer;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => false,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn) => (timer = { fn, cancelled: false }),
+    clearTimer: (value) => {
+      value.cancelled = true;
+    },
+  });
+  retry.schedule();
+  retry.cancel();
+  if (!timer.cancelled) timer.fn();
+  assert.equal(heals, 0);
+  assert.equal(retry.pending(), false);
+});
+
+test("#1830 root-new/child-old ESM linking tolerates a missing optional healer export", async () => {
+  const oldChildUrl =
+    "data:text/javascript," +
+    encodeURIComponent("export const primeModuleCache = () => {}; export const resolveBundleStaleness = () => 'stale';");
+  const rootUrl =
+    "data:text/javascript," +
+    encodeURIComponent(
+      `import * as bundleVersion from ${JSON.stringify(oldChildUrl)};
+       export const linked = typeof bundleVersion.createDirtySafeBundleHealRetry === "function";
+       export const prime = typeof bundleVersion.primeModuleCache === "function";`,
+    );
+  const linked = await import(rootUrl);
+  assert.equal(linked.linked, false, "the stale child has no optional healer export");
+  assert.equal(linked.prime, true, "the old child still links its existing required exports");
+
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  assert.match(source, /import \* as bundleVersion from "\.\/lib\/bundle-version\.js";/);
+  assert.match(source, /typeof bundleVersion\.createDirtySafeBundleHealRetry === "function"/);
+  assert.doesNotMatch(source, /import \{[\s\S]*createDirtySafeBundleHealRetry[\s\S]*\} from "\.\/lib\/bundle-version\.js";/);
+});
 
 test("resolveBundleStaleness: equal versions are current", () => {
   assert.equal(resolveBundleStaleness({ running: "0.11.39", installed: "0.11.39" }), "current");
@@ -202,5 +283,84 @@ test("#584 healer invariants: loop-guard read-back and bounded prime are present
   assert.ok(
     healCall < src.indexOf("registerSidebarTab(tabSpec)"),
     "the probe settles before the sidebar tab registers (no stale-capability window)",
+  );
+});
+
+// The setup()-time heal cannot fire for the scenario this issue keeps
+// recurring with: a pack update + ComfyUI restart UNDER an already-open tab
+// (panel_restart_comfyui, Manager reboot) — no page load happens, the tab
+// keeps re-advertising its old version in every re-hello, and the write fence
+// refuses every mutation while reads keep working. The panel already detects
+// exactly that event (the "reconnected" listener invalidates the Manager
+// dialect cache and node defs for the same reason); the version re-probe must
+// ride the same signal.
+test("#584 reconnect trigger: the reconnected listener re-probes the pack version", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  // Anchor on the post-reconnect settle watch kick — unique to the listener
+  // that owns the backend-restart invalidations.
+  const kick = src.indexOf("kickPostReconnectSettleWatch(backendReconnectEpoch);");
+  assert.notEqual(kick, -1, "the reconnected listener kicks the settle watch");
+  const heal = src.indexOf("void healStaleBundleIfNeeded();", kick);
+  assert.ok(heal !== -1 && heal - kick < 2000, "the version re-probe rides the same reconnect signal");
+});
+
+// A reconnect-triggered heal navigates without a user at the keyboard, so the
+// healer's reload needs the same guards the commanded frontend reload got in
+// #701 — and one more, because its loop-guard marker is armed BEFORE the
+// navigation: a cancelled unload must not burn the tab's one heal attempt.
+test("#584 healer navigation guards: unsaved-work refusal, socket-down defer, cancelled-unload recovery", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const healStart = src.indexOf("async function healStaleBundleIfNeeded()");
+  assert.notEqual(healStart, -1);
+  const body = src.slice(healStart, src.indexOf("\n}\n", healStart));
+
+  // Unsaved work is detected BEFORE the marker is armed — a refused heal
+  // leaves the marker un-armed so a later load/reconnect can still heal.
+  const blockers = body.indexOf("unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows)");
+  assert.notEqual(blockers, -1, "the healer consults the unsaved-work blockers");
+  const arm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, marker);");
+  assert.ok(arm !== -1 && blockers < arm, "blockers are checked before the loop-guard marker is armed");
+
+  // The probe + prime can span a NEW disconnect: a heal that finds the backend
+  // socket down defers its navigation and UN-ARMS the marker, or the next
+  // reconnect would read the attempt as spent and never retry.
+  const prime = body.indexOf("primeModuleCache({");
+  const socketDown = body.indexOf("if (comfyBackendIsDown())", prime);
+  assert.ok(socketDown > prime, "the socket is re-checked after the prime, before navigating");
+  const postPrimeDirty = body.indexOf("const postPrimeHealBlockers", prime);
+  assert.ok(postPrimeDirty > prime && postPrimeDirty < socketDown, "dirtiness is rechecked after the bounded prime");
+  assert.ok(
+    body.indexOf("dirtySafeBundleHealRetry.schedule();", postPrimeDirty) < socketDown,
+    "new edits after the prime return the heal to its dirty-safe retry loop",
+  );
+  const deferUnarm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", socketDown);
+  assert.ok(
+    deferUnarm !== -1 && deferUnarm < body.indexOf("window.location.replace", socketDown),
+    "a deferred heal un-arms the marker so the next reconnect retries",
+  );
+
+  // The blocked-navigation notice is armed BEFORE navigating (same order as
+  // the commanded reload path), and its fire-path un-arms the marker —
+  // surviving the deadline proves the unload was cancelled, so the reload
+  // never happened and the heal attempt must not be counted as spent.
+  const notice = body.indexOf("armReloadBlockedNotice({");
+  const navigate = body.indexOf("window.location.replace");
+  const finalDirty = body.indexOf("const finalHealBlockers", postPrimeDirty);
+  assert.ok(finalDirty > postPrimeDirty && finalDirty < navigate, "dirtiness is rechecked immediately before navigation");
+  assert.ok(
+    body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", finalDirty) < navigate,
+    "the final TOCTOU refusal un-arms the marker",
+  );
+  assert.ok(notice !== -1 && notice < navigate, "the cancelled-navigation notice is armed before navigating");
+  const noticeBlock = body.slice(notice, navigate);
+  assert.ok(
+    noticeBlock.includes("ssSet(BUNDLE_HEAL_KEY, null);"),
+    "a provably-cancelled navigation returns the heal attempt",
   );
 });

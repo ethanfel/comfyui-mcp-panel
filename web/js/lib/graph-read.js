@@ -13,10 +13,25 @@
 //          the whole max_chars budget, returning `shown:0` for a node you asked for
 //          by id. capSummaryWidgets() bounds each value; isLineProtected() keeps the
 //          FIRST match and any explicitly-requested id renderable regardless.
+//   #342 — a link record's `target_slot` goes stale when the target node's inputs
+//          are compacted (dynamic-combo rebuild, removed ref_video_N input).
+//          liveLinkTargetInput() resolves the LIVE slot through the target's own
+//          inputs[].link backlink so the outline never renders an orphaned link
+//          against a slot it no longer feeds.
 
-/** Per-widget-value character cap for the `detail` projection (#609). Big enough
- *  to identify a value, small enough that one blob can't starve a whole query. */
+/** Default per-widget-value character cap for the `detail` projection (#609). Big
+ *  enough to identify a value, small enough that one blob can't starve a whole query.
+ *  An explicit detail read may opt into the bounded ceiling below. */
 export const WIDGET_VALUE_CAP = 2048;
+export const DETAIL_WIDGET_VALUE_CEILING = 32768;
+
+/** Normalize the optional detail-only per-widget cap without changing the default. */
+export function clampDetailWidgetCap(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > WIDGET_VALUE_CAP
+    ? Math.min(Math.floor(n), DETAIL_WIDGET_VALUE_CEILING)
+    : WIDGET_VALUE_CAP;
+}
 
 // #809: the REAL clamps for panel_query_graph / panel_graph_outline, exported so every
 // remedy string below quotes a ceiling the runtime actually enforces. A hint that names
@@ -27,6 +42,12 @@ export const MAX_CHARS_CEILING = 60000;
 export const MAX_CHARS_FLOOR = 500;
 /** Widget values are clipped to this in the `compact` projection (a FIXED cap). */
 export const COMPACT_VALUE_CLIP = 60;
+
+/** #1748: frontend node types whose widget value IS on-canvas prose — the place
+ *  workflow authors put trigger words, download paths and usage instructions. A
+ *  clipped value on one of these is lost instructions, not a re-queryable detail,
+ *  so the outline footer names them instead of folding them into a bare count. */
+export const NOTE_NODE_TYPES = new Set(["Note", "MarkdownNote"]);
 
 /**
  * #809 (codex gate): "raise `X` up to N" is ITSELF a dead retry when the caller is
@@ -59,6 +80,42 @@ export function linkDrivenWidgets(node) {
   return out;
 }
 
+/**
+ * #342: the LIVE input slot a link actually lands on, resolved through the target
+ * node's OWN `inputs[].link` backlink — never through the link record's
+ * `target_slot`.
+ *
+ * `target_slot` is captured at connect time and goes STALE when the target's inputs
+ * are compacted afterwards — a dynamic combo (COMFY_DYNAMICCOMBO_V3) rebuilding its
+ * slots on a selection change, or a removed ref_video_N input shifting the tail.
+ * Rendering the stale index reports connectivity against whatever slot now OCCUPIES
+ * it: panel_graph_outline showed `VAEDecode → node.output_mode.save_metadata` (a
+ * BOOLEAN slot) while panel_query_graph, which reads the live backlink, correctly
+ * showed the link was gone. The backlink is also what the prompt serializer walks,
+ * so it is the one source of truth for "is this actually connected".
+ *
+ * Returns `{ index, name }` for the input that backlinks `linkId`, or null when NO
+ * input does — an ORPHANED link record whose slot was removed. The caller must
+ * render NOTHING for an orphaned link: showing it against a slot it no longer feeds
+ * fabricates connectivity that does not execute.
+ *
+ * Call only when `Array.isArray(targetNode.inputs)`; without a live inputs list
+ * there is nothing to verify against and the caller falls back to the recorded
+ * `target_slot` (rendered as a bare index, exactly as before).
+ */
+export function liveLinkTargetInput(targetNode, linkId) {
+  const inputs = targetNode?.inputs ?? [];
+  for (let i = 0; i < inputs.length; i++) {
+    const inp = inputs[i];
+    // `!= null` first: Number(null) is 0, and a real link id of 0 must not match an
+    // input that has NO link.
+    if (inp && inp.link != null && Number(inp.link) === Number(linkId)) {
+      return { index: i, name: inp.name };
+    }
+  }
+  return null;
+}
+
 /** Restrict a full link-driven map to only the names that are actually WIDGETS on
  *  the node (a link-connected input with no matching widget is a normal input,
  *  already shown under `inputs`). `widgetNames` is any iterable of names. */
@@ -82,21 +139,25 @@ export function drivenTag(src) {
  *  escape to 6 chars each, not 2. Returns the value unchanged when it already fits;
  *  otherwise the longest head prefix whose encoding fits `cap`, with an honest marker
  *  naming how many raw chars were dropped. */
-export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinity) {
+export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinity, fixedCap = cap) {
   if (value == null) return value;
   const isString = typeof value === "string";
   const s = isString ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
   if (typeof s !== "string") return value;
-  if (JSON.stringify(s).length <= cap) return value;
+  // Strings are emitted as JSON strings, so their quotes/escapes count twice. A
+  // non-string is emitted as its serialized JSON value, so serializing `s` again
+  // would double-count escapes and turn a fitting object/array into a string.
+  const serializedSize = isString ? JSON.stringify(s).length : s.length;
+  if (serializedSize <= cap) return value;
   // #809: name the lever that ACTUALLY applies. capSummaryWidgets() tightens the
-  // per-value cap to the char budget only when the budget is the smaller of the two, so
-  // `cap < WIDGET_VALUE_CAP` ⟺ max_chars is what cut this value and raising it helps. At
-  // the FIXED 2048 cap raising max_chars does nothing, and saying so stops the caller
-  // burning a retry on a parameter that cannot move this.
+  // per-value cap to the char budget only when the budget is smaller than the requested
+  // fixed cap, so `cap < fixedCap` means max_chars is what cut this value and raising it
+  // helps. At the fixed per-widget cap raising max_chars does nothing, and saying so stops
+  // the caller burning a retry on a parameter that cannot move this.
   const remedy =
-    cap < WIDGET_VALUE_CAP
+    cap < fixedCap
       ? `over the \`max_chars\` budget; ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)}`
-      : `at the ${WIDGET_VALUE_CAP}-char per-widget cap, which \`max_chars\` does not raise`;
+      : `at the ${fixedCap}-char per-widget cap, which \`max_chars\` does not raise`;
   const marker = (dropped) => `…(+${dropped} chars cut ${remedy})`;
   // Binary-search the longest raw prefix whose ESCAPED length fits, reserving EXACTLY
   // the marker's own worst-case size (its digit count is bounded by s.length) rather
@@ -129,8 +190,9 @@ function entrySize(key, value) {
   return JSON.stringify(String(key)).length + vLen + 2; // "key": value ,
 }
 
-/** Return a shallow clone of a summarizeNode() result whose `widgets` are bounded
- *  (#609): each value is clipped, AND the total serialized widgets size is kept under
+/** Return a shallow clone of a summarizeNode() result whose `widgets` (and
+ *  `duplicate_widgets`, #1402) are bounded (#609): each value is clipped, AND the
+ *  total serialized widgets size is kept under
  *  `totalCap` by DROPPING overflow widgets (keeping valid JSON) with an elision
  *  marker — so even a node with many oversized widgets can't blow the char budget.
  *  When a budget is set, the per-value cap is tightened to it so even the single
@@ -150,7 +212,7 @@ export function capSummaryWidgets(summary, cap = WIDGET_VALUE_CAP, totalCap = In
     const [rawKey, v] = entries[i];
     const k = capKey(rawKey);
     if (k !== rawKey) changed = true;
-    const capped = capWidgetValue(v, perValueCap, totalCap);
+    const capped = capWidgetValue(v, perValueCap, totalCap, cap);
     if (capped !== v) changed = true;
     const size = entrySize(k, capped);
     // Keep at least one widget, then stop once the total would exceed the budget.
@@ -168,7 +230,56 @@ export function capSummaryWidgets(summary, cap = WIDGET_VALUE_CAP, totalCap = In
     widgets["…"] =
       `${omitted} more widget(s) cut by the \`max_chars\` budget; ` +
       raiseOrCeiling("max_chars", totalCap, MAX_CHARS_CEILING);
-  return changed ? { ...summary, widgets } : summary;
+  // #1402: `duplicate_widgets` carries a VALUE PER OCCURRENCE, so it is unbounded input
+  // on the very line #609 exists to bound — and the node class it exists for (a Fast
+  // Groups Bypasser over many groups) is precisely the one that repeats a row many
+  // times. Left uncapped it could push the detail past `max_chars`, and fitDetailLine
+  // would then degrade the WHOLE row to a stub: the read this field was added to
+  // improve would come back carrying LESS than before it existed. Bound it in the same
+  // clip-then-drop-with-a-marker idiom, against whatever budget the name-keyed map left
+  // — `widgets` is the addressable, back-compatible field and is served first.
+  const dup = summary.duplicate_widgets;
+  let duplicates = dup;
+  if (dup && typeof dup === "object" && Object.keys(dup).length) {
+    const budget = Number.isFinite(totalCap) ? Math.max(0, totalCap - used) : Infinity;
+    // A Map, then Object.fromEntries — a widget name is third-party data, and
+    // `bucket["__proto__"] ??= []` reads Object.prototype instead of a missing key and
+    // then throws on .push. See web/js/lib/widget-rows.js for the same reasoning.
+    const kept = new Map();
+    let dUsed = 0;
+    let dOmitted = 0;
+    let stopped = false;
+    for (const [rawKey, rows] of Object.entries(dup)) {
+      const k = capKey(rawKey);
+      if (k !== rawKey) changed = true;
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (stopped) { dOmitted++; continue; }
+        const value = capWidgetValue(row?.value, perValueCap, totalCap, cap);
+        if (value !== row?.value) changed = true;
+        const entry = { ...row, value };
+        // Keep at least ONE occurrence, then stop once the total would exceed the
+        // budget — the same floor `widgets` keeps. A field that can silently render
+        // empty is the collapsed map's failure wearing a different key.
+        if (Number.isFinite(budget) && dUsed > 0 && dUsed + entrySize(k, entry) > budget) {
+          stopped = true;
+          dOmitted++;
+          changed = true;
+          continue;
+        }
+        if (!kept.has(k)) kept.set(k, []);
+        kept.get(k).push(entry);
+        dUsed += entrySize(k, entry);
+      }
+    }
+    if (dOmitted > 0)
+      kept.set(
+        "…",
+        `${dOmitted} more duplicate widget occurrence(s) cut by the \`max_chars\` budget; ` +
+          raiseOrCeiling("max_chars", totalCap, MAX_CHARS_CEILING),
+      );
+    duplicates = Object.fromEntries(kept);
+  }
+  return changed ? { ...summary, widgets, ...(dup ? { duplicate_widgets: duplicates } : {}) } : summary;
 }
 
 /** Hard-clip an assembled COMPACT (plain-string) line to `maxChars` (#609). The
@@ -262,10 +373,22 @@ export function clipCompactValue(v, n = COMPACT_VALUE_CLIP) {
   return s.length > n ? { text: s.slice(0, n - 1) + "…", clipped: true } : { text: s, clipped: false };
 }
 
-/** #809: the one-line footer for compact rows whose values were clipped. */
-export function compactClipNote(count) {
+/** #809: the one-line footer for compact rows whose values were clipped.
+ *
+ *  #1634: `cap` is the per-value cap ACTUALLY in force. On a PINPOINT read (explicit
+ *  `ids`) it is raised off the survey clip, and then "read fuller values with
+ *  `fields`:"detail"" would be exactly the dead retry #809 exists to remove — detail
+ *  applies the SAME fixed cap. Name the cap that fired, and the lever that would help.
+ *  Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts. */
+export function compactClipNote(count, cap = COMPACT_VALUE_CLIP) {
   if (!count) return "";
-  return `\n(${count} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+  // #1634: the cap is uniform across the row and is only ever the survey clip or the fixed
+  // per-value cap, so the note has exactly two honest forms. An intermediate, budget-derived
+  // cap was tried and removed: it made the note name a number that was in force for no
+  // widget, and called a cut "unraisable" that raising `max_chars` lifted (gate).
+  if (cap <= COMPACT_VALUE_CLIP)
+    return `\n(${count} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+  return `\n(${count} widget value(s) clipped to ${WIDGET_VALUE_CAP} chars — the same fixed per-value cap \`fields\`:"detail" applies, which no parameter raises.)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,13 +456,25 @@ export function outlineDegradeBanner({ level, nodeCount, groupCount, maxChars })
  *
  * "Read FULL values" would over-promise: panel_query_graph's detail projection has its
  * own fixed 2048-char per-widget cap (codex gate). Say "fuller, up to N".
- */
-export function outlineValueClipNote(valueCount, titleCount = 0) {
+ *
+ * #1748: `noteIds` are the NOTE-node ids (Note/MarkdownNote) whose widget values were
+ * among the clips. A bare count cannot tell the reader that one of the clipped values
+ * was on-canvas INSTRUCTIONS (trigger words, download paths) rather than a seed it can
+ * re-query — and the node row's own 60-char clip reads as the whole note. Naming the
+ * ids turns "N values clipped" into "instructions existed, and here is where". The id
+ * list is bounded so a graph dense with notes cannot flood the footer. */
+export function outlineValueClipNote(valueCount, titleCount = 0, noteIds = []) {
   if (!valueCount && !titleCount) return "";
   const parts = [];
   if (valueCount) parts.push(`${valueCount} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars`);
   if (titleCount) parts.push(`${titleCount} title(s) clipped to ${OUTLINE_TITLE_CAP} chars`);
-  return `\n\n(${parts.join(" and ")} — fixed outline caps that \`max_chars\` does not raise. Read fuller values with panel_query_graph {ids:[…], fields:'detail'}, which caps each value at ${WIDGET_VALUE_CAP} chars.)`;
+  let noteClause = "";
+  if (noteIds.length) {
+    const shown = noteIds.slice(0, 20);
+    const more = noteIds.length - shown.length;
+    noteClause = ` The clipped values include on-canvas note text (node id(s): ${shown.join(", ")}${more ? `, +${more} more` : ""}) — notes are where workflow authors put trigger words and usage instructions; read them before prompting.`;
+  }
+  return `\n\n(${parts.join(" and ")} — fixed outline caps that \`max_chars\` does not raise.${noteClause} Read fuller values with panel_query_graph {ids:[…], fields:'detail'}, which caps each value at ${WIDGET_VALUE_CAP} chars.)`;
 }
 
 /** Group/subgraph titles are user-controlled and unbounded. */

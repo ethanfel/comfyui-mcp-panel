@@ -23,9 +23,9 @@
     "name": "既定のエージェントバックエンド",
     "tooltip": "パネルが既定で接続するバックグラウンドエージェントです。Claude は Claude のサブスクリプション、ChatGPT は Codex（ChatGPT）アカウント、Gemini は Google（Gemini）のログインで動作します。パネルのバックエンドと、下のどのグループがランタイムを初期化するかを決めます。モデルピッカーからその場で切り替えることもできますが、その切り替えはセッション限りで、この既定値は変わりません。"
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "起動時に自動接続",
-    "tooltip": "パネルを開いたときに「接続」を押さなくてもエージェントを自動で接続し、ローカルのオーケストレーターを起動します。既定はオフで、その場合オーケストレーターは「接続」を明示的に押したときにだけ起動します。"
+  "comfyui-mcp_autostartMcp": {
+    "name": "MCP を自動起動",
+    "tooltip": "このパネルを開いたとき、MCP がまだ実行されていなければ、明示的にインストールしたコンパニオンランチャーに MCP を実行するターミナルを開くよう依頼します。"
   },
   "comfyui-mcp_language": {
     "name": "パネルの言語",
@@ -47,6 +47,10 @@
     "name": "RunPod / ローカルを表示",
     "tooltip": "ツールバーに RunPod / ローカルホストのボタンを表示します — クラウド GPU の Pod をデプロイ・開始・停止・接続したり、ローカルに戻したりできます。既定はオフで、この設定は接続中のモバイルアプリにも送られます。"
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "チャット内の動画プレビュー",
+    "tooltip": "生成された動画をチャット内でインライン再生します。RAM を節約するにはオフにしてください: 動画は最初のフレームとファイル名を示すプレースホルダーとして表示され、クリックするとライトボックスでフル動画が開きます。変更後に生成された動画に適用されます。すでにチャットにあるカードはプレーヤーを保持します。"
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "ベータ版アプリを入手",
     "tooltip": "ComfyUI MCP モバイルアプリのテスター向けダウンロードです。iOS は Apple TestFlight、Android は Firebase App Distribution からインストールします。どちらもベータ版で、ビルドは頻繁に更新され、このパネルとの再ペアリングが必要になることがあります。"
@@ -65,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "ブリッジ URL（上級）",
-    "tooltip": "パネルのオーケストレーターブリッジの WebSocket URL です — 現在は 1 つのブリッジがすべてのプロバイダーを受け持ちます（既定 ws://127.0.0.1:9180）。オーケストレーターを既定以外のポート（ COMFYUI_MCP_BRIDGE_PORT ）で起動する場合にのみ変更してください。次回の接続時に適用されます。"
+    "tooltip": "パネルのオーケストレーターブリッジの WebSocket URL です — 現在は 1 つのブリッジがすべてのプロバイダーを受け持ちます（既定 ws://127.0.0.1:9199）。オーケストレーターを既定以外のポート（ COMFYUI_MCP_BRIDGE_PORT ）で起動する場合にのみ変更してください。次回の接続時に適用されます。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "エージェントの編集にズーム",
@@ -110,6 +114,10 @@
   "comfyui-mcp_defaultModel_grok": {
     "name": "既定のモデル",
     "tooltip": "Grok のバックグラウンドエージェントで使う既定のモデルです。Grok 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Grok に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "既定のモデル",
+    "tooltip": "Qwen Code のバックグラウンドエージェントで使う既定のモデルです。Qwen Code 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Qwen Code に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
   },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "既定のモデル",
@@ -170,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "既定の推論強度",
     "tooltip": "Grok には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "既定の推論強度",
+    "tooltip": "Qwen Code には推論強度の設定がありません。「Model default」のままにしてください。"
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "既定の推論強度",

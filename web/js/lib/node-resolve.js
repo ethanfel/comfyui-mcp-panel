@@ -28,13 +28,110 @@ export const COMFY_CORE_SENTINEL_TYPES = [
   "SaveImage",
 ];
 
-import { importFailureNote } from "./pack-import-failures.js";
+import { importFailureNote, relevantPackImportFailures } from "./pack-import-failures.js";
 
 /** True when `type` is registered in the live LiteGraph registry object
  *  (LG.registered_node_types). */
 export function isRegisteredNodeType(registry, type) {
   if (!registry || typeof type !== "string") return false;
   return Object.prototype.hasOwnProperty.call(registry, type);
+}
+
+// RFC-4122 UUID — ComfyUI mints these as subgraph *type* ids. Backend class_types
+// are human-readable names; a well-formed UUID is therefore not a missing pack.
+export const SUBGRAPH_UUID_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export function isSubgraphUuidType(type) {
+  return typeof type === "string" && SUBGRAPH_UUID_RE.test(type);
+}
+
+function subgraphRegistryHas(reg, type) {
+  if (!reg || type == null) return false;
+  try {
+    if (typeof reg.has === "function" && reg.has(type)) return true;
+    if (typeof reg.get === "function" && reg.get(type)) return true;
+    if (
+      typeof reg === "object" &&
+      !Array.isArray(reg) &&
+      Object.prototype.hasOwnProperty.call(reg, type)
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Positive proof the live workflow already holds this subgraph definition.
+ *
+ * Prefers the root graph's `subgraphs` registry (uuid → Subgraph Map on real
+ * LiteGraph builds), then walks nested instances. Fail closed on anything
+ * unreadable — a guess here would authorize LiteGraph to mint a placeholder.
+ */
+export function subgraphTypeIsLoaded(rootGraph, type) {
+  if (!isSubgraphUuidType(type) || !rootGraph || typeof rootGraph !== "object") return false;
+  try {
+    if (subgraphRegistryHas(rootGraph.subgraphs, type)) return true;
+    const seen = new WeakSet();
+    const walk = (graph) => {
+      if (!graph || typeof graph !== "object" || seen.has(graph)) return false;
+      seen.add(graph);
+      if (graph.id != null && String(graph.id) === type) return true;
+      if (subgraphRegistryHas(graph.subgraphs, type)) return true;
+      for (const node of graph._nodes ?? graph.nodes ?? []) {
+        if (!node || typeof node !== "object") continue;
+        if (typeof node.type === "string" && node.type === type) return true;
+        const sub = node.subgraph;
+        if (sub && (String(sub.id) === type || walk(sub))) return true;
+      }
+      return false;
+    };
+    return walk(rootGraph);
+  } catch {
+    return false;
+  }
+}
+
+function subgraphDefinitionLoaded(class_type, opts) {
+  if (!opts || typeof opts !== "object") return false;
+  if (typeof opts.isLoadedSubgraphType === "function") {
+    try {
+      return opts.isLoadedSubgraphType(class_type) === true;
+    } catch {
+      return false;
+    }
+  }
+  let root = null;
+  try {
+    root = typeof opts.getRootGraph === "function" ? opts.getRootGraph() : opts.getRootGraph;
+  } catch {
+    root = null;
+  }
+  return subgraphTypeIsLoaded(root, class_type);
+}
+
+/**
+ * The refusal `assertAddNodeResolvableRefreshing` throws for a UUID class_type
+ * that is not both loaded in the live workflow and registered in LiteGraph.
+ * Exported so tests drive this wording rather than restating it.
+ */
+export function subgraphUuidAddRefusal(class_type, { loaded = false, registered = false } = {}) {
+  const what =
+    loaded && !registered
+      ? `This workflow already has that subgraph definition loaded, but this tab has not ` +
+        `registered the class LiteGraph needs to construct a new instance — copy an existing ` +
+        `instance on the canvas rather than adding by type.`
+      : `Subgraph definitions live in the workflow (or the subgraph library), never in ` +
+        `/object_info. Copy an existing instance if one is on the canvas, or list library ` +
+        `blueprints with panel_list_subgraphs and add with panel_add_subgraph.`;
+  return (
+    `Cannot add "${class_type}": it is a subgraph type, not a ComfyUI backend node — ` +
+    `the backend never lists subgraph UUIDs in /object_info. ${what} ` +
+    `Refusing to add rather than let LiteGraph mint an unresolved placeholder node (#1523).`
+  );
 }
 
 /** True once ComfyUI's backend node definitions have been registered (i.e.
@@ -171,6 +268,37 @@ export function isAuthorizedFrontendOnlyType(registry, type, node) {
  * BEFORE the frontend-only exemption. `wasTypeEverDefined` is injected by the panel
  * and itself fails closed while the session baseline is unseeded.
  */
+/**
+ * mcp#2000 — THE FRONTEND-ONLY EXEMPTION AS APPLIED ON THE UNAVAILABLE-/object_info PATH,
+ * in ONE place for all three guards that need it. The clauses are identical to the ones
+ * each guard applies when /object_info WAS fetched, and neither reads the fetched defs:
+ * the ever-seen gate reads the session-history oracle (a timeout leaves it intact) and
+ * isAuthorizedFrontendOnlyType reads the live registry. A frontend-only type is absent
+ * from /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ *
+ * WHY IT SWALLOWS: before mcp#2000 these guards threw their refusal WITHOUT consulting
+ * anything, so nothing on that path could raise. Consulting two predicates first means a
+ * hostile registry (a Proxy whose membership trap throws) or an oracle that raises would
+ * surface a RAW error in place of the worded refusal — the change making something worse
+ * that it did not have to. Measured, not theorised: all three guards leaked
+ * "registry exploded" / "history oracle exploded" before this wrapper existed.
+ * Any doubt returns false, which refuses — the #458 default, and the same idiom this file
+ * already uses for readImportFailures and describeObjectInfoFailure ("a diagnostic that
+ * throws must not replace the refusal it explains").
+ *
+ * One copy, three call sites, deliberately: three inline copies is the #496 drift.
+ */
+function frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined) {
+  try {
+    return (
+      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
+      isAuthorizedFrontendOnlyType(registry, type, node)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function isRemovedBackendType(type, wasTypeEverDefined) {
   return backendHistoryVerdict(type, wasTypeEverDefined) === "removed";
 }
@@ -330,6 +458,11 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   const id = node?.id ?? "(unknown)";
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
+    // mcp#2000 — same exemption, same terms, same reason as the add guard: neither
+    // clause reads `freshDefs`, and for a frontend-only type a successful fetch would
+    // have said nothing about it anyway. Kept in step with the two sibling guards
+    // deliberately — one copy relaxed alone is the #496 drift all over again.
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
         `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
@@ -436,6 +569,12 @@ export function assertAddNodeResolvable(registry, class_type) {
  *      We must NOT fall back to the stale registry: a transient fetch failure would
  *      otherwise authorize a since-removed type (#458/P1-2). Only a caller that
  *      wires NO fresh-oracle at all degrades to the registry-only guard.
+ *      THE ONE EXCEPTION (mcp#2000) is the SAME frontend-only exemption as step 2,
+ *      applied on the same terms: a type absent from the session history oracle
+ *      (which a timeout leaves intact) AND authorized by isAuthorizedFrontendOnlyType
+ *      against the LIVE REGISTRY. Neither clause reads /object_info, and for a
+ *      frontend-only type /object_info is empty by design — so a fetch that did not
+ *      answer withheld nothing, and refusing on it was a false refusal, not a guard.
  *
  *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
  *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
@@ -448,11 +587,20 @@ export function assertAddNodeResolvable(registry, class_type) {
  *                        graph_set_widget. REQUIRED for the frontend-only exemption:
  *                        omit it and NOTHING absent from fresh /object_info is ever
  *                        exempted (fail closed, pre-#496 behaviour).
+ *   getRootGraph       : optional () => the live root graph. #1523 uses it (via
+ *                        subgraphTypeIsLoaded) to recognize a UUID subgraph already
+ *                        loaded in this workflow — those types are never in
+ *                        /object_info, so the backend oracle alone cannot authorize
+ *                        them. Omit it (and isLoadedSubgraphType) and a UUID is
+ *                        still diagnosed as a subgraph rather than a missing pack,
+ *                        but is not addable.
+ *   isLoadedSubgraphType : optional (type) => boolean override for that lookup.
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
   // #775 — `readImportFailures` is injected and awaited ONLY on the refusal path,
   // so a healthy add pays nothing for it.
-  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures } = opts;
+  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures, readNodeMap } =
+    opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
@@ -469,6 +617,38 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       freshDefs = null;
     }
     if (!freshDefs || typeof freshDefs !== "object") {
+      // mcp#2000 — A FETCH THAT DID NOT ANSWER IS NOT EVIDENCE ABOUT A TYPE THE FETCH
+      // COULD NEVER HAVE ANSWERED ABOUT. Failing closed here for EVERY type refused a
+      // MarkdownNote on a healthy live canvas whose /object_info refresh had just timed
+      // out, telling the reporter to "Reconnect ComfyUI" while ComfyUI was answering
+      // fine. object-info-history.js already states this rule for its own latch — "ARM
+      // THIS ONLY ON EVIDENCE, NEVER ON A TIMEOUT… latching on one would turn ordinary
+      // latency into a permanent false refusal of every legitimate add/write" — and this
+      // branch was breaking it.
+      //
+      // The exemption below is EXACTLY the one the fetched-defs path applies a few lines
+      // down, and it is safe here because NOT ONE of its clauses reads `freshDefs`:
+      //   - the #458 ever-seen gate reads the SESSION HISTORY oracle, which survives a
+      //     timeout untouched (recordTypes(null) records nothing, and a timeout must
+      //     never arm loseBaseline) — so the non-forgeable trust root that catches a
+      //     removed pack squatting a reserved name is still fully in force; and
+      //   - isAuthorizedFrontendOnlyType reads the LIVE REGISTRY (membership + reserved
+      //     allowlist + no backend provenance), which is also precisely what
+      //     LG.createNode needs, so an exempted add constructs a REAL node and cannot
+      //     mint the #458 placeholder.
+      // For a genuinely frontend-only type /object_info is empty BY DESIGN, so a
+      // successful fetch would have added no information about it whatsoever. Every
+      // other type — and every doubt, including a pending/unseeded/absent history
+      // oracle — still fails closed on the message below, unchanged.
+      //
+      // Testing `=== "never-seen"` is what makes the ever-seen gate load-bearing here,
+      // and it subsumes the sibling exemption's separate `typeof wasTypeEverDefined ===
+      // "function"` clause: an unwired oracle classifies as "no-oracle", never
+      // "never-seen". Spelling that clause out as well passed every test with it
+      // deleted, so it is left out rather than kept as an untestable reassurance.
+      if (frontendOnlyExemptionApplies(readRegistry(), class_type, undefined, wasTypeEverDefined)) {
+        return;
+      }
       throw new Error(
         `cannot verify node type "${class_type}" against the ComfyUI backend ` +
           `(object_info is unavailable — the backend is unreachable or the fetch failed). ` +
@@ -520,6 +700,56 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       ) {
         return;
       }
+      // #1296 — a type ON the frontend-only allowlist that is absent from the LIVE
+      // REGISTRY is refused correctly, but the generic refusal below misdiagnoses WHY:
+      // "not installed, its pack was removed, or its pack failed to import" sends the
+      // user to reinstall a pack they already have (the reported case: rgthree-comfy
+      // installed and verified, ComfyUI restarted — which does NOT reload the open
+      // tab). A pack's frontend JS is fetched once at PAGE LOAD, so a pack installed
+      // after this tab opened registers nothing here, and no /object_info refresh can
+      // fix that — a frontend-only class never comes from the backend. Nothing the
+      // server reports can confirm or deny a frontend-only type, so name the one
+      // action that changes the outcome: RELOAD the ComfyUI tab. Only the never-seen
+      // verdict may say this — a removed/unseeded/pending history keeps its own
+      // honest message above, and an allowlisted name whose REGISTERED class carries
+      // backend provenance (a name-collision husk) stays on the generic refusal.
+      if (
+        verdict === "never-seen" &&
+        FRONTEND_ONLY_NODE_TYPES.has(class_type) &&
+        !isRegisteredNodeType(readRegistry(), class_type)
+      ) {
+        throw new Error(
+          `Cannot add "${class_type}": it is a frontend-only node type — the ComfyUI backend ` +
+            `never provides it, so its absence from /object_info is expected — but it is NOT ` +
+            `registered in this tab's live node registry. A pack's frontend JS is loaded once ` +
+            `at page load, and restarting the ComfyUI server does NOT reload an already-open ` +
+            `tab, so a pack installed after this tab opened registers nothing here. RELOAD the ` +
+            `ComfyUI tab and retry. If it is still refused after a reload, the pack that provides ` +
+            `it is not installed (or its frontend JS failed to load). Refusing to add rather than ` +
+            `let LiteGraph mint an unresolved placeholder node (#458).`,
+        );
+      }
+      // #1523 — a subgraph UUID is never in /object_info (registerSubgraphNodeDef
+      // synthesizes the class locally from the workflow's definitions). Treating
+      // that absence as "unknown backend node" then appending whichever pack
+      // failed to import (ReActor, on the reporter's canvas) is the misdiagnosis:
+      // no custom-node pack owns a UUID type. Loaded + registered ⇒ addable;
+      // anything else gets subgraph-specific copy/library advice, never a pack
+      // import note. The ever-seen gate above still refuses a type the backend
+      // actually reported earlier this session.
+      if (isSubgraphUuidType(class_type)) {
+        const loaded = subgraphDefinitionLoaded(class_type, opts);
+        const registered = isRegisteredNodeType(readRegistry(), class_type);
+        if (
+          typeof wasTypeEverDefined === "function" &&
+          verdict === "never-seen" &&
+          loaded &&
+          registered
+        ) {
+          return;
+        }
+        throw new Error(subgraphUuidAddRefusal(class_type, { loaded, registered }));
+      }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
       // #741: the pointer must be a tool that searches node CLASSES
@@ -532,10 +762,34 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // are absent from /object_info exactly as if it were gone. Installing it
       // again cannot help. I walked into that dead end myself and filed a wrong
       // diagnosis from it (ComfyUI-LTXVideo, ImportError on a core rename).
+      // #1447 — pass the live map and the requested type so a pack that currently
+      // provides nodes (ReActorFaceSwap just added) is not named as the reason a
+      // different type (VideoToImages) is missing.
+      // #1523 — UUID types never reach here (handled above). Remaining failures
+      // still do not prove ownership of the requested type.
+      // #1544 — naming a failed pack is a CAUSAL claim, and the panel was making it
+      // without evidence: `PreviewVideo` was refused with "coldinfire_fal_privacy
+      // FAILED TO IMPORT" attached. ComfyUI-Manager's node map is the ownership
+      // oracle (`readNodeMap`), and it is read ONLY once there is a surviving
+      // failure to adjudicate — it is a ~1.4 MB payload, and a refusal with no
+      // import failures must not pay for it.
       let failedNote = "";
       if (typeof readImportFailures === "function") {
         try {
-          failedNote = importFailureNote(await readImportFailures());
+          const failed = await readImportFailures();
+          const noteOpts = { forType: class_type, liveDefs: freshDefs };
+          if (
+            typeof readNodeMap === "function" &&
+            relevantPackImportFailures(failed, noteOpts).length > 0
+          ) {
+            try {
+              noteOpts.nodeMap = await readNodeMap();
+            } catch {
+              // Manager unreachable/disabled: ownership stays unestablished, which
+              // the note reports as exactly that rather than guessing a cause.
+            }
+          }
+          failedNote = importFailureNote(failed, noteOpts);
         } catch {
           // A diagnostic that throws must not replace the refusal it explains.
         }
@@ -581,7 +835,9 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * a STALE POSITIVE for an uninstalled pack when the browser tab was never reloaded
  * after a ComfyUI restart. `freshDefs` is the freshly-fetched /object_info map (or
  * null/undefined when the fetch failed). FAILS CLOSED in both directions:
- *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend"; and
+ *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend" — except
+ *     for an authorized frontend-only type, which the fetch could not have spoken to
+ *     either way (mcp#2000); and
  *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
  * Never authorizes from the stale registry. Pure — no side effects — so the caller
  * can run it on the exact target it is about to mutate, before any mutation.
@@ -594,9 +850,11 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * frontend canvas edit and legitimately has no /object_info entry. This does NOT
  * reopen the #458 hole: a REMOVED backend node (whether it keeps a stale-positive
  * class WITH nodeData, or is left as a DEFLESS husk) is NOT on the allowlist and is
- * still refused; and the exemption applies ONLY when object_info was fetched — a
- * genuinely UNVERIFIABLE type (fetch unavailable, null map) always fails closed below,
- * for every type.
+ * still refused. mcp#2000 — the exemption is NO LONGER scoped to "object_info was
+ * fetched": it is applied on the unavailable path too, on identical terms, because
+ * neither of its clauses reads `freshDefs` and a frontend-only type is absent from
+ * /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ * Every OTHER type still fails closed on an unavailable map, exactly as before.
  *
  * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
  * type; `opts.node` is the actual write-target node whose OWN constructor is also
@@ -619,6 +877,12 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     } catch {
       observed = ""; // a diagnostic must never replace the refusal it is describing
     }
+    // mcp#2000 — see assertAddNodeResolvableRefreshing. The exemption is evaluated
+    // BEFORE this refusal on exactly the terms the fetched-defs path below uses, and it
+    // is placed after `describeObjectInfoFailure` deliberately: that oracle only builds
+    // a diagnostic string, so an exempted write costs it nothing that matters and the
+    // refusal it explains still reads identically for every type that is refused.
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
         `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +

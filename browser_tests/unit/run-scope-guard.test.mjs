@@ -180,12 +180,15 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-test("#556 queuePromptScopeArgs: no scope ⇒ [undefined]; scope ⇒ array first, then options object", () => {
+test("#1782 queuePromptScopeArgs: no scope ⇒ [undefined]; 1.49.6 options carry both queue layers", () => {
   assert.deepEqual(queuePromptScopeArgs(undefined), [undefined]);
   assert.deepEqual(queuePromptScopeArgs([]), [undefined]);
   const [first, second] = queuePromptScopeArgs(["76:34"]);
   assert.deepEqual(first, ["76:34"]);
-  assert.deepEqual(second, { queueNodeIds: ["76:34"] });
+  assert.deepEqual(second, {
+    queueNodeIds: ["76:34"],
+    partialExecutionTargets: ["76:34"],
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -204,7 +207,10 @@ test("#630 queuePromptScopeAttempts: both argument shapes are tried BEFORE the b
   const attempts = queuePromptScopeAttempts(["76:34"]);
   assert.equal(attempts.length, 4);
   assert.deepEqual(attempts[0], { arg: ["76:34"], repair: false });
-  assert.deepEqual(attempts[1], { arg: { queueNodeIds: ["76:34"] }, repair: false });
+  assert.deepEqual(attempts[1], {
+    arg: { queueNodeIds: ["76:34"], partialExecutionTargets: ["76:34"] },
+    repair: false,
+  });
   // #752 — the api layer reads a DIFFERENT key than the store does. Verified in
   // a shipped 1.47.12 bundle: the store destructures `queueNodeIds` and calls
   // `api.queuePrompt(e, m, {partialExecutionTargets: n})`, and only that second
@@ -416,6 +422,420 @@ test("#1124 promptContentHash: rgthree's substitution is not drift, but an edit 
     "a sibling input of the seed node is NOT covered by the exclusion",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #1273 — the THIRD volatility mechanism: cg-use-everywhere converts its
+// broadcasts to REAL links inside its own queuePrompt patch, so the stamp's
+// graphToPrompt and the dispatch's serialization of an UNTOUCHED graph differ
+// on exactly the pack's extra.ue_links record. The pair computation itself
+// (including the subgraph routing behind the field report's "103:48 anything"
+// tokens) is pinned in use-everywhere-links.test.mjs; these tests pin the
+// integration: collectVolatileInputs carries the pairs, and the two-channel
+// hash comparison of an untouched UE graph now MATCHES.
+// ---------------------------------------------------------------------------
+
+const ueGraph = () => ({
+  _nodes: [
+    { id: 4, inputs: [], outputs: [{ name: "CLIP", links: [] }] },
+    { id: 22, inputs: [{ name: "clip", link: null }, { name: "text", link: null }] },
+  ],
+  extra: {
+    ue_links: [{ downstream: 22, downstream_slot: 0, upstream: 4, upstream_slot: 0, controller: 48, type: "CLIP" }],
+  },
+});
+
+test("#1273 collectVolatileInputs: a UE broadcast target is volatile, its sibling input is not", () => {
+  const pairs = collectVolatileInputs(ueGraph());
+  assert.ok(pairs.has("22 clip"), "the input the injection will materialise");
+  assert.ok(!pairs.has("22 text"), "everything else keeps full drift coverage");
+  assert.equal(collectVolatileInputs({ _nodes: [], extra: {} }).size, 0,
+    "a graph without a ue_links record is untouched");
+});
+
+test("#1273 promptContentHash: an untouched UE graph stamps EQUAL to its dispatched body — and a real edit still refuses", () => {
+  // The pre-dispatch serialization has NO UE link; the post body carries the
+  // injected one. Before #1273 this pair of hashes always mismatched and every
+  // run-to-node on a UE graph was refused as "the graph CHANGED".
+  const volatileInputs = collectVolatileInputs(ueGraph());
+  const stamped = { "22": { class_type: "CLIPTextEncode", inputs: { text: "a cat" } }, "4": { class_type: "CheckpointLoaderSimple", inputs: {} } };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const dispatched = (inputs) =>
+    JSON.stringify({ prompt: { "22": { class_type: "CLIPTextEncode", inputs }, "4": { class_type: "CheckpointLoaderSimple", inputs: {} } } });
+  assert.equal(
+    promptContentHashFromBody(dispatched({ clip: ["4", 0], text: "a cat" }), volatileInputs),
+    atHash,
+    "UE's queue-time injection is the exclusion's purpose — the scoped run is no longer refused",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(dispatched({ clip: ["4", 0], text: "a dog" }), volatileInputs),
+    atHash,
+    "a mid-window edit to any OTHER input of the same node is still drift",
+  );
+  assert.equal(
+    promptContentHashFromBody(dispatched({ clip: ["5", 0], text: "a cat" }), volatileInputs),
+    atHash,
+    "a mid-window rewiring OF the excluded input itself is indistinguishable from the " +
+      "injection and is TOLERATED — the documented residual, disclosed via volatileInputs",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #2099 — VHS_VideoCombine resolves Comfy save-file date templates in
+// filename_prefix as the prompt is queued. That queue-time clock substitution is
+// not graph drift, but only the exact VHS filename_prefix date-template input is
+// volatile; ordinary prefixes and every other input stay covered.
+// ---------------------------------------------------------------------------
+
+const vhsNode = (id, filenamePrefix, extra = {}) => ({
+  id,
+  type: "VHS_VideoCombine",
+  widgets: [
+    { name: "frame_rate", value: 24 },
+    { name: "filename_prefix", value: filenamePrefix },
+    { name: "format", value: "video/h264-mp4" },
+  ],
+  ...extra,
+});
+
+test("#2099 collectVolatileInputs: only VHS_VideoCombine filename_prefix with a recognized date template is volatile", () => {
+  const root = {
+    _nodes: [
+      vhsNode(223, "video/%date:yyyyMMdd_hhmmss%"),
+      vhsNode(224, "video/fixed_prefix"),
+      vhsNode(225, "video/%not_a_date_template%"),
+      vhsNode(226, "video/%date:folder%"),
+      vhsNode(227, "video/%date:yyyy-MM-ddThh:mm:ss%"),
+      { id: 9, type: "SaveImage", widgets: [{ name: "filename_prefix", value: "%date:yyyyMMdd_hhmmss%" }] },
+      { id: 10, widgets: [], subgraph: { _nodes: [vhsNode(15, "nested/%date:yyyy-MM-dd%")] } },
+    ],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.deepEqual(
+    [...pairs].sort(),
+    ["10:15 filename_prefix", "223 filename_prefix", "227 filename_prefix"],
+    "exact VHS node + exact input + recognized date template; nested execIds are preserved",
+  );
+});
+
+test("#2099 promptContentHash: VHS date-template substitution is stable, ordinary prefixes and sibling edits are still drift", () => {
+  const graph = { _nodes: [vhsNode(223, "video/%date:yyyyMMdd_hhmmss%")] };
+  const volatileInputs = collectVolatileInputs(graph);
+  const stamped = {
+    "223": {
+      class_type: "VHS_VideoCombine",
+      inputs: { images: ["1000", 0], filename_prefix: "video/%date:yyyyMMdd_hhmmss%", frame_rate: 24 },
+    },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const body = (inputs) => JSON.stringify({
+    prompt: {
+      "223": { class_type: "VHS_VideoCombine", inputs },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    },
+  });
+  assert.equal(
+    promptContentHashFromBody(
+      body({ images: ["1000", 0], filename_prefix: "video/20260823_142233", frame_rate: 24 }),
+      volatileInputs,
+    ),
+    atHash,
+    "the queue-time clock substitution is the exclusion's purpose",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(
+      body({ images: ["1000", 0], filename_prefix: "video/20260823_142233", frame_rate: 30 }),
+      volatileInputs,
+    ),
+    atHash,
+    "a sibling input on the same VHS node is still drift-covered",
+  );
+
+  const ordinaryVolatileInputs = collectVolatileInputs({ _nodes: [vhsNode(223, "video/fixed_prefix")] });
+  const ordinaryStamped = {
+    "223": {
+      class_type: "VHS_VideoCombine",
+      inputs: { images: ["1000", 0], filename_prefix: "video/fixed_prefix", frame_rate: 24 },
+    },
+  };
+  assert.equal(ordinaryVolatileInputs.size, 0, "an ordinary VHS prefix excludes nothing");
+  assert.notEqual(
+    promptContentHashFromBody(
+      JSON.stringify({
+        prompt: {
+          "223": {
+            class_type: "VHS_VideoCombine",
+            inputs: { images: ["1000", 0], filename_prefix: "video/changed_prefix", frame_rate: 24 },
+          },
+        },
+      }),
+      ordinaryVolatileInputs,
+    ),
+    promptContentHash(ordinaryStamped, ordinaryVolatileInputs),
+    "ordinary filename_prefix edits remain drift-covered",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #2130 — KJNodes' Ideogram4PromptBuilderKJ derives the executable
+// `elements_data` input from its editor state through a live serializeValue.
+// Only that exact node + field + mechanism is excluded; arbitrary serializers,
+// other widgets, and other node types remain drift-covered.
+// ---------------------------------------------------------------------------
+
+const ideogramBuilderNode = (id, { withSerializer = true, type = "Ideogram4PromptBuilderKJ" } = {}) => ({
+  id,
+  type,
+  widgets: [
+    { name: "elements_data", value: "old regions", ...(withSerializer ? { serializeValue: () => "new regions" } : {}) },
+    { name: "high_level_description", value: "same subject", serializeValue: () => "same subject" },
+  ],
+});
+
+test("#2130 collectVolatileInputs: only the live Ideogram derived elements_data serializer is volatile", () => {
+  const root = {
+    _nodes: [
+      ideogramBuilderNode(14),
+      ideogramBuilderNode(15, { withSerializer: false }),
+      ideogramBuilderNode(16, { type: "OtherPromptBuilder" }),
+      { id: 17, type: "Ideogram4PromptBuilderKJ", widgets: [{ name: "style_palette_data", serializeValue: () => "palette" }] },
+      { id: 18, type: "Ideogram4PromptBuilderKJ", widgets: [{ name: "elements_data", serializeValue: "not callable" }] },
+    ],
+  };
+  assert.deepEqual(
+    [...collectVolatileInputs(root)].sort(),
+    ["14 elements_data"],
+    "the exclusion is keyed by node type, exact field, and callable live serializer",
+  );
+});
+
+test("#2130 promptContentHash: the derived field may settle, but sibling inputs and other nodes still refuse drift", () => {
+  const volatileInputs = collectVolatileInputs({ _nodes: [ideogramBuilderNode(14)] });
+  const stamped = {
+    "14": { class_type: "Ideogram4PromptBuilderKJ", inputs: { elements_data: "old regions", high_level_description: "same subject" } },
+    "9": { class_type: "SaveImage", inputs: { filename_prefix: "same" } },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const body = (builderInputs, filenamePrefix = "same") => JSON.stringify({ prompt: {
+    "14": { class_type: "Ideogram4PromptBuilderKJ", inputs: builderInputs },
+    "9": { class_type: "SaveImage", inputs: { filename_prefix: filenamePrefix } },
+  } });
+  assert.equal(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "same subject" }), volatileInputs),
+    atHash,
+    "the known queue-time derived value no longer false-refuses the scoped run",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "changed subject" }), volatileInputs),
+    atHash,
+    "a sibling user input on the same node remains drift-covered",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "same subject" }, "changed"), volatileInputs),
+    atHash,
+    "an input on another node remains drift-covered",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1331 — the FOURTH volatility mechanism: after reconnect, leftover values of
+// link-driven converted widgets (MiniMax H3 clip/vae/model/length, …) settle
+// between the pre-dispatch stamp and the POST body. The #1050 single retry
+// still races because serializeValue keeps flipping those leftovers. The
+// value that EXECUTES is the incoming link; the leftover is non-semantic.
+// A PURE SOCKET (connected input, no matching widget / no convert-to-input
+// marker) stays hashed — a KSampler.model rewire is still drift.
+// ---------------------------------------------------------------------------
+
+const minimaxH3Node = (id, { leftover = true } = {}) => ({
+  id,
+  type: "MiniMaxH3ReferenceToVideo",
+  widgets: [
+    { name: "clip", value: leftover ? "clip_l.safetensors" : ["4", 0] },
+    { name: "vae", value: leftover ? "ae.safetensors" : ["5", 0] },
+    { name: "length", value: leftover ? 81 : ["9", 0] },
+    { name: "prompt", value: "a cat" },
+  ],
+  inputs: [
+    { name: "clip", link: 11, widget: { name: "clip" } },
+    { name: "vae", link: 12, widget: { name: "vae" } },
+    { name: "length", link: 13, widget: { name: "length" } },
+    { name: "prompt", link: null },
+  ],
+});
+
+const hooklessControl = (value = "randomize") => ({
+  name: "control_after_generate",
+  value,
+  options: {
+    serialize: false,
+    canvasOnly: true,
+    values: ["fixed", "increment", "decrement", "randomize"],
+  },
+});
+
+test("#1331 collectVolatileInputs: a link-driven converted widget is volatile, its unlinked sibling is not", () => {
+  const graph = {
+    _nodes: [
+      minimaxH3Node(1000),
+      { id: 3, widgets: [{ name: "steps", value: 20 }], inputs: [{ name: "model", link: 1 }] },
+    ],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("1000 clip"), "converted clip leftover is the race");
+  assert.ok(pairs.has("1000 vae"), "converted vae leftover is the race");
+  assert.ok(pairs.has("1000 length"), "converted length leftover is the race");
+  assert.ok(!pairs.has("1000 prompt"), "an UNLINKED sibling widget stays drift-covered");
+  assert.ok(!pairs.has("3 model"), "a PURE SOCKET (no matching widget, no convert marker) stays hashed");
+  assert.ok(!pairs.has("3 steps"), "an unlinked widget on another node stays covered");
+});
+
+test("#1331 collectVolatileInputs: a same-name widget + linked input (no input.widget marker) is still the leftover", () => {
+  // Older frontends omit input.widget and just keep the widget next to a
+  // same-named connected input. That is still a converted leftover.
+  const graph = {
+    _nodes: [{
+      id: 110,
+      widgets: [{ name: "clip", value: "clip_l.safetensors" }, { name: "text", value: "hi" }],
+      inputs: [{ name: "clip", link: 7 }, { name: "text", link: null }],
+    }],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("110 clip"));
+  assert.ok(!pairs.has("110 text"));
+});
+
+test("#1331 collectVolatileInputs: the convert-to-input marker counts even when the widget was hidden", () => {
+  // After convert, some builds drop the widget from node.widgets but leave
+  // input.widget.name. graphToPrompt can still emit a leftover under that name
+  // while the frontend settles — exclude the name, not the socket's siblings.
+  const graph = {
+    _nodes: [{
+      id: 1100,
+      widgets: [{ name: "prompt", value: "a cat" }],
+      inputs: [
+        { name: "clip", link: 1, widget: { name: "clip" } },
+        { name: "model", link: 2 },
+      ],
+    }],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("1100 clip"), "hidden converted widget is still the leftover");
+  assert.ok(!pairs.has("1100 model"), "a pure socket on the same node stays hashed");
+  assert.ok(!pairs.has("1100 prompt"), "an unlinked live widget stays covered");
+});
+
+test("#1331 collectVolatileInputs: the link-driven exclusion reaches nested subgraphs with the colon-path execId", () => {
+  const root = {
+    _nodes: [{ id: 10, widgets: [], subgraph: { _nodes: [minimaxH3Node(15)] } }],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("10:15 clip"), "nested leftover pairs line up with the flattened prompt keys");
+  assert.ok(!pairs.has("10:15 prompt"));
+});
+
+test("#1331 collectVolatileInputs: an unlinked converted-shaped widget is NOT volatile — a mid-window edit is still drift", () => {
+  const graph = {
+    _nodes: [{
+      id: 1000,
+      widgets: [{ name: "clip", value: "clip_l.safetensors" }],
+      inputs: [{ name: "clip", link: null, widget: { name: "clip" } }],
+    }],
+  };
+  assert.equal(collectVolatileInputs(graph).size, 0, "no live link ⇒ the widget value is still what executes");
+});
+
+test("#1331 promptContentHash: leftover widget values stamp EQUAL to the dispatched link form — and a real edit still refuses", () => {
+  const volatileInputs = collectVolatileInputs({ _nodes: [minimaxH3Node(1000)] });
+  const stamped = {
+    "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+    "1000": {
+      class_type: "MiniMaxH3ReferenceToVideo",
+      inputs: { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" },
+    },
+    "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const dispatched = (inputs) =>
+    JSON.stringify({
+      prompt: {
+        "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+        "1000": { class_type: "MiniMaxH3ReferenceToVideo", inputs },
+        "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+      },
+    });
+  assert.equal(
+    promptContentHashFromBody(
+      dispatched({ clip: ["4", 0], vae: ["5", 0], length: ["9", 0], prompt: "a cat" }),
+      volatileInputs,
+    ),
+    atHash,
+    "the leftover→link flip is the exclusion's purpose — the scoped run is no longer refused",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(
+      dispatched({ clip: ["4", 0], vae: ["5", 0], length: ["9", 0], prompt: "a dog" }),
+      volatileInputs,
+    ),
+    atHash,
+    "a mid-window edit to any OTHER input of the same node is still drift",
+  );
+  assert.equal(
+    promptContentHashFromBody(
+      dispatched({ clip: ["88", 0], vae: ["5", 0], length: ["9", 0], prompt: "a cat" }),
+      volatileInputs,
+    ),
+    atHash,
+    "a mid-window rewiring OF the excluded leftover itself is the documented residual",
+  );
+});
+
+test("#1331 collectVolatileInputs: hookless control_after_generate (reconnect) excludes the governed seed, not a sibling", () => {
+  // After reconnect the combo is present by OPTION SHAPE before beforeQueued
+  // is re-hung. The #572 hook scan finds nothing; the leftover seed still
+  // randomizes between stamp and dispatch.
+  const control = hooklessControl("randomize");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  for (const w of graph._nodes[0].widgets) {
+    assert.equal(typeof w.beforeQueued, "undefined", `${w.name} carries no beforeQueued`);
+  }
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("16 noise_seed"), "the governed seed is volatile without a hook");
+  assert.ok(pairs.has("16 control_after_generate"), "the carrier's own name is excluded too");
+  assert.ok(!pairs.has("16 steps"), "a sibling stays drift-covered");
+});
+
+test("#1331 collectVolatileInputs: a FIXED hookless control excludes nothing", () => {
+  const control = hooklessControl("fixed");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 16, widgets: [seed, control] }] };
+  assert.equal(collectVolatileInputs(graph).size, 0);
+});
+
+test("#1331 promptContentHash: hookless randomize seed churn is not drift — a sibling edit still is", () => {
+  const control = hooklessControl("randomize");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const volatileInputs = collectVolatileInputs({
+    _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }],
+  });
+  const atHash = promptContentHash(
+    { "16": { class_type: "RandomNoise", inputs: { noise_seed: 111, steps: 20 } } },
+    volatileInputs,
+  );
+  const body = (inputs) => JSON.stringify({ prompt: { "16": { class_type: "RandomNoise", inputs } } });
+  assert.equal(
+    promptContentHashFromBody(body({ noise_seed: 999983, steps: 20 }), volatileInputs),
+    atHash,
+    "reconnect seed churn without a re-hung hook is the exclusion's purpose",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ noise_seed: 999983, steps: 25 }), volatileInputs),
+    atHash,
+    "a genuine mid-window edit to a non-excluded input of the same node refuses",
+  );
+});
+
 
 test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's own input — a seed edit is the documented residual, an edit to any OTHER input of the same node refuses", () => {
   const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
@@ -631,6 +1051,41 @@ test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_
   }
 });
 
+test("#1690: a scoped batch with a blank receipt and a valid receipt is uncertain, not queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const responses = [jsonResponse(200, { prompt_id: "   " }), jsonResponse(200, { prompt_id: "p2" })];
+    let responseIndex = 0;
+    const server = makeServer(() => responses[responseIndex++]);
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number, batch) => {
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ number, targets: ["14"] });
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget,
+      execIds: ["14"],
+      batch: 2,
+      toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(server.calls.length, 2);
+    assert.deepEqual(ids, ["p2"], "the usable receipt remains ledger-eligible");
+    assert.equal(result.verified, 1);
+    assert.equal(result.indeterminate, 1, "the blank receipt consumes an uncertain batch slot");
+    assert.notEqual(result.outcome, "dispatched", "one blank receipt prevents a full-batch claim");
+  } finally {
+    stop();
+  }
+});
+
 test("#556 r6: a GENUINE server rejection still flows through the established #358 rejection channel (not a dispatch failure)", async () => {
   const rejectionBody = { error: { type: "prompt_outputs_failed_validation", message: "bad input" } };
   const spy = makeServer(async () => jsonResponse(400, rejectionBody));
@@ -772,6 +1227,65 @@ test("#572 integration: the scoped-run result SURFACES the drift-uncovered input
       ["3 control_after_generate", "3 seed"],
       "the run reports exactly which inputs were NOT drift-covered for this run",
     );
+  } finally {
+    stop();
+  }
+});
+
+test("#2130 integration: dispatchScopedRun accepts a queue-time Ideogram derived-widget rewrite", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const node = ideogramBuilderNode(14);
+    const elementsWidget = node.widgets.find((widget) => widget.name === "elements_data");
+    const oldRegions = JSON.stringify([{ x: 0, y: 0, w: 0.2, h: 0.2, type: "old" }]);
+    const newRegions = JSON.stringify([{ x: 0.1, y: 0.1, w: 0.3, h: 0.3, type: "new" }]);
+    let serializeCalls = 0;
+    elementsWidget.serializeValue = () => {
+      serializeCalls++;
+      return serializeCalls === 1 ? oldRegions : newRegions;
+    };
+    const graph = { _nodes: [node] };
+    const serializeGraph = () => {
+      const inputs = Object.fromEntries(
+        node.widgets.map((widget) => [
+          widget.name,
+          typeof widget.serializeValue === "function" ? widget.serializeValue() : widget.value,
+        ]),
+      );
+      return {
+        ...OUR_OUTPUT,
+        "14": { class_type: node.type, inputs },
+      };
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.graph = graph;
+    // This mirrors the production boundary: dispatchScopedRun fingerprints the
+    // live graph through graphToPrompt(), then queuePrompt builds the actual
+    // /prompt body from a second graphToPrompt() serialization.
+    app.graphToPrompt = async () => ({ output: serializeGraph(), workflow: {} });
+    app.queuePrompt = async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const queued = await app.graphToPrompt();
+      const body = frontendBody({ output: queued.output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(serializeCalls, 2, "the stamp and queue-time prompt each invoke elements_data.serializeValue");
+    assert.equal(result.outcome, "dispatched", "the derived queue-time rewrite is not mistaken for graph drift");
+    assert.equal(server.calls.length, 1, "the verified scoped prompt reaches ComfyUI once");
+    assert.deepEqual(result.volatileInputs, ["14 elements_data"]);
+    const sent = JSON.parse(server.calls[0].options.body);
+    assert.equal(sent.prompt["14"].inputs.elements_data, newRegions, "the second serializer result reached /prompt");
+    assert.equal(sent.prompt["14"].inputs.high_level_description, "same subject", "ordinary widget input is serialized too");
+    assert.deepEqual(sent.partial_execution_targets, ["14"]);
   } finally {
     stop();
   }
@@ -1277,7 +1791,7 @@ test("#630 gate r8 P1: an INDETERMINATE dispatch omits `queued` — neither true
   // Bound the slice to THIS branch's return, or it runs on into the
   // nothing-dispatched `queued: false` below and the assertion means nothing.
   const indetBlock = block.slice(indetStart, block.indexOf("}; }", indetStart) + 4);
-  assert.ok(indetBlock.length > 100 && indetBlock.length < 900, "the branch was isolated, not the whole tail");
+  assert.ok(indetBlock.length > 100 && indetBlock.length < 1400, "the branch was isolated, not the whole tail");
   assert.doesNotMatch(indetBlock, /queued: false/,
     "a definite negative about a request whose fate we say we cannot determine");
   assert.match(indetBlock, /queued_unknown: true/);
@@ -1488,7 +2002,7 @@ test("#630 gate r5 P1: graph_run discloses a PARTIAL batch's queued work instead
   const start = source.indexOf("if (runScopeResult && runScopeResult.outcome !== \"dispatched\")");
   assert.ok(start > 0);
   const block = source.slice(start, start + 4600).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
-  assert.match(block, /if \(runScopeResult\.verified > 0\)/, "the partial case is distinguished from a total failure");
+  assert.match(block, /if \(runScopeResult\.verified > 0 && unresolved === 0\)/, "only a fully verified partial is reported queued");
   assert.match(block, /partially_queued: true/);
   assert.match(block, /queued_prompt_ids: queuedPromptIds\.slice\(\)/, "the caller can TRACK what is already running");
   assert.match(block, /Re-run only the remaining/, "and is told not to re-run the whole batch");
@@ -1593,18 +2107,22 @@ test("#630 gate r6: graph_run never states a remainder it cannot count, and neve
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
   const start = source.indexOf('if (runScopeResult && runScopeResult.outcome !== "dispatched")');
   assert.ok(start > 0);
-  const block = source.slice(start, start + 4200).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  const block = source.slice(start, start + 5600).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
   // A partial no longer asserts "not queued" for prompts that are executing.
   assert.match(block, /queued: true, complete: false, partially_queued: true/,
     "a partial batch is queued-but-incomplete, never a flat failure");
   assert.match(block, /incomplete_reason: runScopeResult\.error/,
     "and its reason does not masquerade as an error about work that did happen");
   // The remainder is only named when it is actually knowable.
-  assert.match(block, /const unknown = runScopeResult\.indeterminate > 0;/);
-  // …and that flag must actually SELECT the guidance. Asserting only that both
-  // strings exist would pass a version that always names a remainder.
-  assert.match(block, /retry_guidance: unknown \?/,
-    "the indeterminate flag gates which guidance is given, it is not merely computed");
+  assert.match(block, /const unresolved = \(runScopeResult\.indeterminate \?\? 0\) \+ \(runScopeResult\.inFlight \?\? 0\);/);
+  // …and that count must actually SELECT the uncertain result. Asserting only
+  // that both strings exist would pass a version that still reports queued:true.
+  assert.match(block, /if \(runScopeResult\.verified > 0 && unresolved === 0\)/,
+    "unresolved receipts veto the partial queued:true result");
+  assert.match(block, /if \(unresolved > 0\)/,
+    "the unresolved count selects the queued_unknown result");
+  assert.match(block, /queued_count: runScopeResult\.verified/,
+    "known prompt ids remain disclosed as partial evidence");
   assert.match(block, /the remaining count cannot be stated from here without risking a duplicate render/);
   assert.match(block, /Check the ComfyUI queue before re-running anything/);
   // Zero verified + an indeterminate dispatch is still not "nothing ran".
@@ -2234,6 +2752,237 @@ test("#1124 integration: the exclusion is ONE input — an armed rgthree Seed do
       // the refusal names the REAL change instead of the red herring the reporter
       // was handed.
       assert.doesNotMatch(result.error, /47 seed/, `${label}: the substituted seed is no longer blamed`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #2099 integration — VHS_VideoCombine's filename_prefix date-template
+// substitution is driven through dispatchScopedRun, while another changed input
+// in the same queued body still trips the graph-drift refusal.
+// ---------------------------------------------------------------------------
+
+const VHS_STAMP = {
+  "1000": { class_type: "VAEDecode", inputs: { samples: ["4", 0] } },
+  "223": {
+    class_type: "VHS_VideoCombine",
+    inputs: { images: ["1000", 0], filename_prefix: "video/%date:yyyyMMdd_hhmmss%", frame_rate: 24 },
+  },
+};
+
+function makeVhsDateFrontend({ apiTarget, alsoEdit = null } = {}) {
+  const app = {
+    queueItems: [],
+    posted: [],
+    graph: { _nodes: [vhsNode(223, "video/%date:yyyyMMdd_hhmmss%")] },
+    graphToPrompt: async () => ({ output: structuredClone(VHS_STAMP), workflow: {} }),
+    queuePrompt: async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const output = structuredClone(VHS_STAMP);
+      output["223"].inputs.filename_prefix = "video/20260823_142233";
+      if (alsoEdit) alsoEdit(output);
+      const body = frontendBody({ output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi(...promptPost(body));
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#2099 integration: VHS_VideoCombine date-template filename_prefix substitution is OUR dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeVhsDateFrontend({ apiTarget });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "dispatched", "the date substitution is not treated as graph drift");
+    assert.equal(server.calls.length, 1, "the scoped prompt reached ComfyUI");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["223"]);
+    assert.deepEqual(result.volatileInputs, ["223 filename_prefix"], "the coverage gap is disclosed");
+  } finally {
+    stop();
+  }
+});
+
+test("#2099 integration: VHS date-template exclusion does NOT let real edits elsewhere ride along", async () => {
+  const stop = keepAlive();
+  try {
+    for (const [label, edit, token] of [
+      ["a sibling VHS input", (output) => { output["223"].inputs.frame_rate = 30; }, /223 frame_rate/],
+      ["an upstream node input", (output) => { output["1000"].inputs.samples = ["5", 0]; }, /1000 samples/],
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeVhsDateFrontend({ apiTarget, alsoEdit: edit });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", `${label} edit is still drift`);
+      assert.match(result.error, /graph CHANGED/i);
+      assert.match(result.error, token);
+      assert.doesNotMatch(result.error, /223 filename_prefix/, "the volatile date template is not blamed");
+      assert.equal(server.calls.length, 0, `${label}: the edited workflow never left the tab`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #1331 integration — the reporter's sequence, driven through dispatchScopedRun
+// (the SAME orchestration graph_run / panel_run runs).
+//
+// After reconnect a MiniMax H3 node still has leftover clip/vae/length widget
+// values; the live inputs are already linked. The stamp serializes the leftovers;
+// the deferred POST serializes the incoming links (or later leftovers). Before
+// #1331 that pair always mismatched and the #1050 retry failed identically.
+// ---------------------------------------------------------------------------
+
+const MINIMAX_STAMP = {
+  "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+  "5": { class_type: "VAELoader", inputs: { vae_name: "ae.safetensors" } },
+  "1000": {
+    class_type: "MiniMaxH3ReferenceToVideo",
+    inputs: { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" },
+  },
+  "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+};
+
+function makeMinimaxReconnectFrontend({ apiTarget, alsoEdit = null } = {}) {
+  const app = {
+    queueItems: [],
+    posted: [],
+    graph: { _nodes: [minimaxH3Node(1000), { id: 223, widgets: [] }] },
+    graphToPrompt: async () => ({ output: structuredClone(MINIMAX_STAMP), workflow: {} }),
+    queuePrompt: async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const output = structuredClone(MINIMAX_STAMP);
+      // The reconnect race: dispatch serializes the incoming links, not the leftovers.
+      output["1000"].inputs.clip = ["4", 0];
+      output["1000"].inputs.vae = ["5", 0];
+      output["1000"].inputs.length = ["9", 0];
+      if (alsoEdit) alsoEdit(output);
+      const body = frontendBody({ output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi(...promptPost(body));
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#1331 integration: leftover link-driven clip/vae/length after reconnect is OUR dispatch — the scoped run reaches ComfyUI instead of racing the stamp", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeMinimaxReconnectFrontend({ apiTarget });
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223,
+      verifyTimeoutMs: 500,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched", "the #556 graph-stamp refusal is gone");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["srv-1"]);
+    assert.equal(server.calls.length, 1, "the scoped prompt actually reached ComfyUI");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["223"]);
+    assert.deepEqual(
+      result.volatileInputs,
+      ["1000 clip", "1000 length", "1000 vae"],
+      "the gap is DISCLOSED, never silent: graph_run turns this into drift_coverage",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#1331 integration: the leftover exclusion does NOT let a real edit ride along", async () => {
+  const stop = keepAlive();
+  try {
+    for (const [label, edit] of [
+      ["an unlinked sibling widget", (o) => { o["1000"].inputs.prompt = "a dog"; }],
+      ["a pure-socket rewire elsewhere", (o) => { o["223"].inputs.images = ["5", 0]; }],
+      ["a node added", (o) => { o["77"] = { class_type: "SaveImage", inputs: {} }; }],
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeMinimaxReconnectFrontend({ apiTarget, alsoEdit: edit });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", `${label} is still drift`);
+      assert.match(result.error, /graph CHANGED/i, label);
+      assert.equal(server.calls.length, 0, `${label}: the edited workflow never left the tab`);
+      assert.doesNotMatch(result.error, /1000 clip/, `${label}: the leftover is no longer blamed`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#1331 integration: hookless RandomNoise seed churn after reconnect is OUR dispatch, a sibling edit is not", async () => {
+  const stop = keepAlive();
+  try {
+    const control = hooklessControl("randomize");
+    const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+    const stamp = {
+      "16": { class_type: "RandomNoise", inputs: { noise_seed: 111, steps: 20 } },
+      "223": { class_type: "VHS_VideoCombine", inputs: { images: ["16", 0] } },
+    };
+    {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = {
+        graph: { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] },
+        graphToPrompt: async () => ({ output: structuredClone(stamp), workflow: {} }),
+        queuePrompt: async (number, _batch, arg) => {
+          const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+          const output = structuredClone(stamp);
+          output["16"].inputs.noise_seed = 999983;
+          await apiTarget.fetchApi(...promptPost(frontendBody({
+            output, number, targets: targets?.length ? targets : null,
+          })));
+          return true;
+        },
+      };
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "dispatched", "hookless seed churn is not a user edit");
+      assert.equal(server.calls.length, 1, "the scoped prompt reached ComfyUI");
+      assert.ok(result.volatileInputs.includes("16 noise_seed"));
+    }
+    {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = {
+        graph: { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] },
+        graphToPrompt: async () => ({ output: structuredClone(stamp), workflow: {} }),
+        queuePrompt: async (number, _batch, arg) => {
+          const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+          const output = structuredClone(stamp);
+          output["16"].inputs.noise_seed = 999983;
+          output["16"].inputs.steps = 25;
+          await apiTarget.fetchApi(...promptPost(frontendBody({
+            output, number, targets: targets?.length ? targets : null,
+          })));
+          return true;
+        },
+      };
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", "a sibling edit is still drift");
+      assert.match(result.error, /16 steps/);
+      assert.equal(server.calls.length, 0);
     }
   } finally {
     stop();
@@ -2989,7 +3738,7 @@ test("#752 WIRING: the graph_run note actually PRINTS the observed body keys", (
   );
 });
 
-test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, not by body repair", async () => {
+test("#752/#1782 an API-forwarding queue wrapper receives partialExecutionTargets before body repair", async () => {
   // Two field reports (frontend 1.45.21) queued correctly but via
   // `scope_applied_by: "request_body_repair"` — the fallback carrying the whole
   // feature. Read out of a shipped 1.47.12 bundle, the reason is that the
@@ -2999,7 +3748,8 @@ test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, n
   //   api:   ...n?.partialExecutionTargets && {partial_execution_targets: ...}
   //
   // so a build whose app.queuePrompt forwards straight to the api layer ignored
-  // both shapes the panel sent.
+  // both shapes the panel sent. #1782 extends the options attempt with both
+  // keys, so the same call now serves that wrapper without reaching repair.
   const stop = keepAlive()
   try {
   const server = makeServer()
@@ -3010,11 +3760,11 @@ test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, n
   assert.equal(result.outcome, "dispatched")
   assert.equal(result.scopeAppliedBy, "frontend", "the scope reached the body through app.queuePrompt, not the repair")
   assert.ok(!result.repaired, "the body-repair fallback must not be needed for this build")
-  // Shapes 1 and 2 are dropped by this build; the third one lands.
-  assert.equal(app.posted.length, 3, "array, queueNodeIds, then the partialExecutionTargets shape")
+  // The positional array is dropped by this wrapper; the dual-key options
+  // object lands before the standalone API compatibility attempt.
+  assert.equal(app.posted.length, 2, "array, then the dual-key 1.49.6 options shape")
   assert.equal(app.posted[0].partial_execution_targets, undefined)
-  assert.equal(app.posted[1].partial_execution_targets, undefined)
-  assert.deepEqual(app.posted[2].partial_execution_targets, ["14"])
+  assert.deepEqual(app.posted[1].partial_execution_targets, ["14"])
   // Exactly one request reaches ComfyUI, carrying exactly node 14's branch.
   assert.equal(server.calls.length, 1, "the two dropped attempts were blocked, not forwarded")
   assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"])
@@ -3022,3 +3772,344 @@ test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, n
     stop()
   }
 })
+
+test("#1782 frontend 1.49.6 shapes reach /prompt natively and dropped wrappers still use repair", async () => {
+  const stop = keepAlive();
+  try {
+    for (const [label, shape] of [["positional array", "positional"], ["QueuePromptOptions", "shimless"]]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeFrontend({ shape, apiTarget });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      });
+      assert.equal(result.outcome, "dispatched", `${label}: dispatch succeeds`);
+      assert.equal(result.scopeAppliedBy, "frontend", `${label}: native frontend delivery`);
+      assert.equal(result.repaired, 0, `${label}: body repair is not needed`);
+      assert.equal(server.calls.length, 1, `${label}: exactly one request reaches ComfyUI`);
+      assert.deepEqual(
+        JSON.parse(server.calls[0].options.body).partial_execution_targets,
+        ["14"],
+        `${label}: only the requested execution target is sent`,
+      );
+    }
+
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+    });
+    assert.equal(result.outcome, "dispatched", "a dropping wrapper remains safe and useful");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(result.repaired, 1);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1871 — a run-to-node refused over a node on ANOTHER branch.
+//
+// ComfyUI's validate_prompt checks that every node in the POSTED prompt resolves
+// to an installed class before it narrows execution to partial_execution_targets
+// (0.33.2 execution.py: the two early returns come three lines above the
+// `x in partial_execution_list` test). So the reporter's Topaz nodes 56/57 — not
+// upstream of the node 43 they asked for, and never going to execute — refused the
+// whole run.
+//
+// These drive the REAL orchestration: dispatchScopedRun through a mock frontend and
+// a server double that answers exactly as ComfyUI 0.33.2 does.
+// ---------------------------------------------------------------------------
+
+// One checkpoint, two independent output branches. 43 is the branch asked for.
+const TWO_BRANCH_OUTPUT = {
+  "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sd.safetensors" } },
+  "3": { class_type: "KSampler", inputs: { model: ["1", 0], seed: 42 } },
+  "40": { class_type: "VAEDecode", inputs: { samples: ["3", 0], vae: ["1", 2] } },
+  "43": { class_type: "SaveImage", inputs: { images: ["40", 0] } },
+  "56": { class_type: "TopazUpscale", inputs: { image: ["40", 0] } },
+  "57": { class_type: "SaveImage", inputs: { images: ["56", 0] } },
+};
+
+// ComfyUI's own rejection shape for a class it cannot resolve (execution.py 0.33.2).
+const missingNodeRejection = (nodeId, classType) => ({
+  error: {
+    type: "missing_node_type",
+    message: `Node '${classType}' not found. The custom node may not be installed.`,
+    details: `Node ID '#${nodeId}'`,
+    extra_info: { node_id: String(nodeId), class_type: classType, node_title: classType },
+  },
+  node_errors: {},
+});
+
+test("#1871 integration: ComfyUI refuses over an out-of-scope node ⇒ ONE pruned re-post queues the requested branch", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      // First post: the whole prompt, refused over node 56 — exactly the report.
+      if (n === 1) return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+      return jsonResponse(200, { prompt_id: "srv-pruned" });
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const ids = [];
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onPromptId: (p) => ids.push(p),
+      onRejection: (r) => rejections.push(r),
+    });
+
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["srv-pruned"]);
+    // The refusal that queued nothing must NOT be reported as this run's outcome —
+    // graph_run turns a captured rejection into a failure, and the run succeeded.
+    assert.deepEqual(rejections, [], "the superseded refusal is not surfaced as the run's verdict");
+
+    assert.equal(server.calls.length, 2, "exactly one extra post — never a loop");
+    const first = JSON.parse(server.calls[0].options.body);
+    const second = JSON.parse(server.calls[1].options.body);
+    assert.deepEqual(Object.keys(first.prompt).sort(), ["1", "3", "40", "43", "56", "57"]);
+    assert.deepEqual(
+      Object.keys(second.prompt).sort(),
+      ["1", "3", "40", "43"],
+      "the second post carries the backward closure of node 43 and nothing else",
+    );
+    assert.deepEqual(second.partial_execution_targets, ["43"], "the scope still travels");
+    assert.equal(second.number, result.queueMark, "the pruned post still carries THIS run's identity");
+
+    // DISCLOSED, not silent: the caller is told their ComfyUI refused the first post.
+    assert.deepEqual(result.prunedRetry.removed.sort(), ["56", "57"]);
+    assert.equal(result.prunedRetry.namedNode, "56");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: a missing node INSIDE the requested branch is reported, not retried", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer(async () => jsonResponse(400, missingNodeRejection(40, "VAEDecode")));
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onRejection: (r) => rejections.push(r),
+    });
+    assert.equal(server.calls.length, 1, "pruning cannot fix it, so nothing is re-posted");
+    assert.equal(result.prunedRetry, null);
+    assert.equal(rejections.length, 1);
+    assert.equal(rejections[0].error.extra_info.node_id, "40", "the caller gets the answer that matters");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: a run ComfyUI ACCEPTS is untouched — one post, no prune, even with a prunable other branch", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43 });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(server.calls.length, 1, "the happy path never pays a second round trip");
+    assert.equal(result.prunedRetry, null);
+    // The prompt ComfyUI received is the one the frontend built — the other branch is
+    // still in it, so its cached outputs are not evicted by this run (execution.py
+    // set_prompt(prompt.keys()) + clean_unused).
+    assert.deepEqual(Object.keys(JSON.parse(server.calls[0].options.body).prompt).sort(), [
+      "1", "3", "40", "43", "56", "57",
+    ]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: when the pruned post is ALSO refused, the SECOND rejection is the one reported", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      if (n === 1) return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+      return jsonResponse(400, missingNodeRejection(3, "KSampler"));
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onRejection: (r) => rejections.push(r),
+    });
+    assert.equal(server.calls.length, 2);
+    assert.equal(result.verified, 0);
+    assert.equal(rejections.length, 1, "one verdict, not two");
+    assert.equal(
+      rejections[0].error.extra_info.node_id,
+      "3",
+      "the reported blocker is the one inside the requested branch",
+    );
+    assert.equal(result.prunedRetry.namedNode, "56", "the superseded refusal is still disclosed");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: an UNSCOPED run is never pruned — the caller asked for the whole graph", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    // The unscoped path uses the historical capture wrap, which has no scope and no
+    // prune: a full run that names a missing node is a real failure of what was asked.
+    const rejections = [];
+    apiTarget.fetchApi = createRunFetchInterceptor({
+      origFetchApi: server,
+      onRejection: (r) => rejections.push(r),
+    });
+    await app.queuePrompt(0, 1, undefined);
+    assert.equal(server.calls.length, 1);
+    assert.equal(rejections.length, 1);
+    assert.equal(n, 1);
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 WIRING: graph_run actually RENDERS the pruned-retry disclosure into the run result", () => {
+  // The guard can record the retry perfectly and the caller still never hear about
+  // it — a one-line assignment in the reply builder is exactly the kind of install
+  // a lib-level test cannot see. So this asserts on the call site itself.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  assert.match(
+    source,
+    /import \{ prunedRetryNote \} from "\.\/lib\/partial-run-prune\.js";/,
+    "the panel imports the note builder",
+  );
+  const start = source.indexOf("runScopeResult?.prunedRetry");
+  assert.ok(start > 0, "the reply builder reads the recorded retry");
+  const raw = source.slice(start, source.indexOf("\n    }", start));
+  assert.match(raw, /accept\.excluded_nodes_omitted/, "the omitted node ids reach the result");
+  assert.match(raw, /accept\.excluded_nodes_note = prunedRetryNote\(/, "and the sentence is built from them");
+  assert.match(raw, /toNodeId: to_node_id/, "the note names the node the caller asked for");
+  assert.match(raw, /namedNode: pr\.namedNode/, "and the node ComfyUI refused");
+  // codex gate r2, P1 — the note says the pruned prompt is the one ComfyUI ACCEPTED.
+  // A retry that was itself refused must never reach it, and that must be true of
+  // this line rather than of three early returns further up.
+  assert.match(
+    source.slice(start - 200, start + 120),
+    /runScopeResult\.verified > 0/,
+    "the acceptance claim is gated on a post ComfyUI actually accepted",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1504 — node_errors on an ACCEPTED (200) reply
+// ---------------------------------------------------------------------------
+//
+// ComfyUI validates each output independently. When some fail but at least one
+// survives, server.py queues the prompt and answers **200** with `prompt_id` AND
+// the `node_errors` for the outputs it dropped. Those errors are not a refusal,
+// and the capture layer is the only place that can still tell the difference:
+// the frontend records a 200 reply node_errors onto app.lastNodeErrors exactly
+// like a rejection, so by the time graph_run reads that field the distinction is
+// gone. These pin that the 200 body is read for BOTH facts, on BOTH dispatch
+// paths, and that a rejection is still never manufactured from a 200.
+
+const PARTIAL_NODE_ERRORS = {
+  36: {
+    class_type: "VAEDecode",
+    dependent_outputs: [],
+    errors: [{ type: "required_input_missing", message: "Required input is missing", details: "samples" }],
+  },
+};
+
+test("#1504 unscoped interceptor: a 200 with node_errors yields prompt_id + ACCEPTED drops, never a rejection", async () => {
+  const spy = makeServer(async () =>
+    jsonResponse(200, { prompt_id: "p-partial", number: 1, node_errors: PARTIAL_NODE_ERRORS }),
+  );
+  let rejection = null;
+  const ids = [];
+  const dropped = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: spy,
+    onRejection: (r) => (rejection = r),
+    onPromptId: (p) => ids.push(p),
+    onAcceptedNodeErrors: (ne) => dropped.push(ne),
+  });
+  await intercepted(...promptPost({ prompt: {} }));
+  assert.equal(rejection, null, "a 200 is an acceptance — the rejection channel must stay empty");
+  assert.deepEqual(ids, ["p-partial"], "the minted id is the receipt that this prompt IS queued");
+  assert.deepEqual(dropped, [PARTIAL_NODE_ERRORS], "the dropped outputs come from the 200 body");
+});
+
+test("#1504 unscoped interceptor: a clean 200 reports NO drops", async () => {
+  // Empty / absent / non-object node_errors must never fire the partial disclosure.
+  for (const node_errors of [undefined, null, {}, [], "no"]) {
+    const dropped = [];
+    const intercepted = createRunFetchInterceptor({
+      origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p1", node_errors })),
+      onAcceptedNodeErrors: (ne) => dropped.push(ne),
+    });
+    await intercepted(...promptPost({ prompt: {} }));
+    assert.deepEqual(dropped, [], `node_errors=${JSON.stringify(node_errors)} is not a drop`);
+  }
+});
+
+test("#1504 interceptor: a 400 rejection body is NOT reported as accepted drops", async () => {
+  // The #358 channel is unchanged: a refusal mints nothing, so nothing may reach
+  // the accepted-drops channel or the caller would be told a refused prompt is running.
+  const dropped = [];
+  let rejection = null;
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(400, { error: null, node_errors: PARTIAL_NODE_ERRORS })),
+    onRejection: (r) => (rejection = r),
+    onAcceptedNodeErrors: (ne) => dropped.push(ne),
+  });
+  await intercepted(...promptPost({ prompt: {} }));
+  assert.deepEqual(dropped, [], "a non-200 never produces accepted drops");
+  assert.deepEqual(rejection.node_errors, PARTIAL_NODE_ERRORS, "it stays a rejection");
+});
+
+test("#1504 integration: a SCOPED run reports the outputs ComfyUI dropped from the prompt it queued", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = {
+      fetchApi: makeServer(async () =>
+        jsonResponse(200, { prompt_id: "p-scoped", number: 1, node_errors: PARTIAL_NODE_ERRORS }),
+      ),
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    const ids = [];
+    const dropped = [];
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+      onAcceptedNodeErrors: (ne) => dropped.push(ne),
+    });
+    assert.equal(result.outcome, "dispatched", "a partial-validation 200 is still a real dispatch");
+    assert.equal(result.verified, 1, "it counts as VERIFIED: ComfyUI accepted and is running it");
+    assert.deepEqual(ids, ["p-scoped"]);
+    assert.deepEqual(dropped, [PARTIAL_NODE_ERRORS]);
+  } finally {
+    stop();
+  }
+});

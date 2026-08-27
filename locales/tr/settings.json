@@ -23,9 +23,9 @@
     "name": "Varsayılan ajan arka ucu",
     "tooltip": "Panelin varsayılan olarak hangi arka plan ajanına bağlanacağı. Claude, Claude aboneliğinizle çalışır; ChatGPT, Codex (ChatGPT) hesabınızla; Gemini, Google (Gemini) girişinizle. Panelin arka ucunu belirler (ve aşağıdaki hangi grubun çalışma zamanını belirleyeceğini); model seçiciden anlık olarak yine de geçiş yapabilirsiniz (anlık geçiş yalnızca o oturum içindir ve bu varsayılanı DEĞİŞTİRMEZ)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Açılışta otomatik bağlan",
-    "tooltip": "Panel açıldığında ajanı (yerel orkestratörü başlatarak) Bağlan'a tıklamadan otomatik bağlar. Varsayılan olarak kapalı — aksi hâlde orkestratör yalnızca açık bir Bağlan tıklamasıyla başlatılır."
+  "comfyui-mcp_autostartMcp": {
+    "name": "MCP'yi otomatik başlat",
+    "tooltip": "Bu panel açıldığında MCP çalışmıyorsa, açıkça kurulmuş yardımcı başlatıcıdan MCP'yi çalıştıran bir terminal açmasını ister."
   },
   "comfyui-mcp_language": {
     "name": "Panel dili",
@@ -47,6 +47,10 @@
     "name": "RunPod / Yerel'i göster",
     "tooltip": "Araç çubuğunda RunPod / Yerel sunucu düğmesini gösterir — bulut GPU podu oluştur/başlat/durdur/bağlan ya da yerele geri dön. Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "Sohbette video önizlemeleri",
+    "tooltip": "Oluşturulan videoları sohbet içinde oynat. RAM'den tasarruf etmek için kapat: video, ilk karesi ve dosya adını gösteren bir yer tutucu olarak görünür; tıklamak videonun tamamını ışık kutusunda açar. Değişiklikten sonra oluşturulan videolar için geçerlidir; sohbette zaten bulunan kartlar oynatıcılarını korur."
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Beta uygulamayı edinin",
     "tooltip": "ComfyUI MCP mobil uygulamasının test sürümü indirmeleri. iOS, Apple TestFlight üzerinden; Android, Firebase App Distribution üzerinden kurulur. İki kanal da beta: sürümler sık güncellenir ve bu panelle yeniden eşleştirme gerekebilir."
@@ -65,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "Köprü adresi (gelişmiş)",
-    "tooltip": "Panel orkestratör köprüsünün WebSocket adresi — artık TEK bir köprü her sağlayıcıya hizmet ediyor (varsayılan ws://127.0.0.1:9180). Bunu yalnızca orkestratörü varsayılan olmayan bir bağlantı noktasında başlatıyorsanız değiştirin (COMFYUI_MCP_BRIDGE_PORT). Bir sonraki Bağlan işleminde geçerli olur."
+    "tooltip": "Panel orkestratör köprüsünün WebSocket adresi — artık TEK bir köprü her sağlayıcıya hizmet ediyor (varsayılan ws://127.0.0.1:9199). Bunu yalnızca orkestratörü varsayılan olmayan bir bağlantı noktasında başlatıyorsanız değiştirin (COMFYUI_MCP_BRIDGE_PORT). Bir sonraki Bağlan işleminde geçerli olur."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Ajan düzenlemelerine yakınlaş",
@@ -110,6 +114,10 @@
   "comfyui-mcp_defaultModel_grok": {
     "name": "Varsayılan model",
     "tooltip": "Grok arka plan ajanı için varsayılan model; Grok için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Grok'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Varsayılan model",
+    "tooltip": "Qwen Code arka plan ajanı için varsayılan model; Qwen Code için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Qwen Code'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
   },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Varsayılan model",
@@ -170,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Varsayılan akıl yürütme çabası",
     "tooltip": "Grok akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Qwen Code akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Varsayılan akıl yürütme çabası",

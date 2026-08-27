@@ -6,6 +6,1006 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.113] - 2026-08-27
+
+### Fixed
+- reach WebSocket writes by name, clearing the last rule -> 0 findings (#1924)
+- reach litegraph slot wiring by name, clearing $socket3 (#1923)
+- capture the original before forking, instead of binding it (#1921)
+- read the probe socket through a buffered wrapper too, 3 findings -> 2 (#1918)
+- actually run the network-rule replica in CI, as a ratchet (#1917)
+- the parity replica missed reads - $socket_stage_recv matches .recv( too (#1916)
+- preserve node search cancellation
+- bound node search replies (#1908)
+- cut the registry network findings from six files to two (#1909)
+- reject stale canvas capture after tab switch
+
+### Changed
+
+
+## [0.15.112] - 2026-08-27
+
+### Fixed
+- bound panel_search_nodes Manager replies and preserved caller cancellation (#1908, #1912)
+
+## [0.15.111] - 2026-08-27
+
+### Fixed
+- cut the registry network findings from six files to two (#1909)
+- reject stale canvas capture after tab switch
+
+
+## [0.15.110] - 2026-08-27
+
+### Fixed
+- gate releases on rendered changelog version (#1902)
+
+### Changed
+- Fix workflow open normalization race (#1898) (#1904)
+
+
+## [0.15.109] - 2026-08-26
+
+### Fixed
+- verify the rendered changelog artifact stays synchronized with the source (#1891, #1900)
+
+## [0.15.108] - 2026-08-26
+
+### Fixed
+- reconcile generated changelog sections and release-history guards (#1891, #1894)
+
+## [0.15.107] - 2026-08-26
+
+### Fixed
+- de-duplicate the 0.15.106 changelog section (#1890)
+
+
+## [0.15.106] - 2026-08-26
+
+### Fixed
+- a release tag proves the tagged tree is the version it claims, and that nothing shipped untagged (#1885)
+- the tag guard fails closed on an unreadable commit, and checks its own tag target (#1887)
+- de-duplicate the 0.15.105 changelog section (#1884)
+
+### Changed
+- 0.15.105 does not contain the release tag guard, so its entry moved to Unreleased (#1888)
+
+## [0.15.105] - 2026-08-26
+
+### Fixed
+- scrolling up during a streaming turn no longer snaps back to the bottom (#1879)
+- graph_connect reports live dynamic slot rewrites and safely bounds hostile disclosure values (#1876)
+- the pruned-retry disclosure says why the first post is not pre-pruned (#1881)
+- normalise CRLF in the scope-fence source pins so they run on Windows (#1880)
+- preserve unsaved workflow identity across proxy reads (#1790) (#1875)
+
+## [0.15.104] - 2026-08-26
+
+### Fixed
+- a save that named nothing is never told to "choose a different name" (#1866)
+
+### Changed
+- local YARA parity replica, and defuse the changelog's own network tokens (#1874)
+- drive the receipt-less completion end to end, through the real delivery boundary (#1872)
+
+
+## [0.15.103] - 2026-08-26
+
+### Fixed
+- stop tripping the registry network rule on Function.prototype.bind (#1867)
+- drop the vendored @a2ui/lit bundle and render leaves natively (#1865)
+- partially_queued early returns include seed-repetition warning (#1857)
+
+### Changed
+- add behavioural test for repeating_controls_note attachment (#1862)
+
+
+## [0.15.102] - 2026-08-26
+
+### Fixed
+- a connect that renames its target says so, instead of leaving the caller a stale title (#1856)
+
+
+## [0.15.101] - 2026-08-26
+
+### Fixed
+- atomically fence promoted widget receiver scope (#2314) (#1831)
+- bound the pre-receipt completion replay so it cannot storm the agent (#1850)
+
+
+## [0.15.100] - 2026-08-26
+
+### Fixed
+- preserve chat autoscroll through browser scroll anchoring and interactive-card reveals (#1841)
+- cache-bust inline previews when ComfyUI reuses an output filename (#1834)
+- keep completion identity safe across reroutes, reloads, repeated registration, and id-less receipts (#1837, #1839, #1845)
+
+## [0.15.99] - 2026-08-26
+
+### Fixed
+- make recovered-completion reload refusals visible to the agent (#1830)
+
+## [0.15.98] - 2026-08-26
+
+### Fixed
+- preserve panel_run completion receipts across delayed prompts, teardown, and restart (#1824)
+
+## [0.15.97] - 2026-08-26
+
+### Fixed
+- the start command leads the setup card instead of trailing it (#1822)
+- the provider setup card scrolls instead of clipping its own tail (#1821)
+- the version gate compares an independent witness, and unsticks 0.15.85 (#1825)
+
+
+## [0.15.96] - 2026-08-25
+
+### Fixed
+- keep the selected provider visible and preselected when host availability is incomplete (#1818)
+
+## [0.15.95] - 2026-08-25
+
+### Fixed
+- support safely validated workflow-library subfolders for panel saves (#1794)
+
+## [0.15.94] - 2026-08-25
+
+### Fixed
+- fail closed when workflow-open binding settles or reconnect proofs become stale during concurrent tab operations (#887)
+
+## [0.15.93] - 2026-08-25
+
+### Fixed
+- add an authenticated fixed-operation ComfyUI read relay for history, system stats, and logs (#2283)
+
+## [0.15.92] - 2026-08-25
+
+### Fixed
+- preserve the live Grok turn across dedicated workflow-tab creation and distinguish tab swaps from real ComfyUI restarts (#1810)
+
+## [0.15.91] - 2026-08-25
+
+### Fixed
+- label cache-assisted completion durations as workflow time, not render time (#1805)
+
+## [0.15.90] - 2026-08-25
+
+### Fixed
+- contain long chat transcripts without losing scroll-to-bottom behavior (#1801)
+- retry guarded root-identity healing after workflow switches (#1854)
+
+## [0.15.89] - 2026-08-25
+
+### Fixed
+- rebind active and graph state after refusing to close an unsaved workflow (#1795)
+
+## [0.15.88] - 2026-08-25
+
+### Fixed
+- recover graph tools after restart reconnect without a hard refresh (#1790)
+
+## [0.15.87] - 2026-08-25
+
+### Fixed
+- rebuild fresh SaveVideo dynamic widgets and clear stale widget state (#2254)
+
+## [0.15.86] - 2026-08-25
+
+### Fixed
+- gate workflow targeting on current reconnect binding proof (#1785)
+
+## [0.15.85] - 2026-08-25
+
+### Fixed
+- fence scoped schema evidence (#2249)
+- retain usable schema across refresh failures (#2249)
+
+
+## [0.15.84] - 2026-08-25
+
+### Fixed
+- carry both frontend scope option keys (#1782)
+- classify empty completion results (#1781)
+- diagnose completion delivery outcomes (#1781)
+
+
+## [0.15.83] - 2026-08-25
+
+### Fixed
+- classify empty completion results (#1781)
+- diagnose completion delivery outcomes (#1781)
+
+
+## [0.15.82] - 2026-08-25
+
+### Fixed
+- describe graph_get_virtual_types activity results (#1776)
+
+## [0.15.81] - 2026-08-25
+
+### Fixed
+- defer safe widget edits until queue idle (#1716)
+
+
+## [0.15.80] - 2026-08-25
+
+### Fixed
+- preserve VideoTileLivePlanner ROI on copy (#1761)
+- reset Save-As source after workflow load (#1762)
+- preserve restart confirmation answers (#1764)
+- resolve panel_set_widget against live node list (#1759)
+- explain workflow save transport failures (#1757)
+
+
+## [0.15.79] - 2026-08-25
+
+### Fixed
+- Render orphan-link repairs with a meaningful activity warning instead of an undefined disconnect summary (#1750)
+
+## [0.15.78] - 2026-08-24
+
+### Fixed
+- Join in-flight panel refreshes through download completion handoff instead of returning `refresh_still_running` (#1758)
+
+## [0.15.77] - 2026-08-25
+
+### Fixed
+- Recover panel refreshes after concurrent download completions and coalesced trailing refreshes (#1736)
+
+## [0.15.76] - 2026-08-24
+
+### Fixed
+- Preserve Save-As canvas identity through partial restores, tab switches, overlap, and failure cleanup (#939)
+- Scale object-info schema probes for remote ComfyUI origins while preserving bounded fail-closed writes (#1734)
+- Recover accessor-backed Impact BooleanWidget writes without masking same-message setter failures (#1735)
+
+## [0.15.75] - 2026-08-24
+
+### Fixed
+- Keep Panel run receipts route-bound and exactly-once across reconnects, remounts, and late queue delivery (#1728)
+- Redact credential-like values through graph outlines and subgraph provenance, including shared aliases (#1729)
+- Refresh live asset membership before API-upload missing-asset validation (#1733)
+
+## [0.15.74] - 2026-08-24
+
+### Fixed
+- Preserve refresh successor verdicts after reconnect so early results cannot report stale success (#1725)
+
+## [0.15.73] - 2026-08-24
+
+### Fixed
+- Tolerate live Ideogram derived-widget serializer churn while preserving unrelated drift checks (#2130)
+
+## [0.15.72] - 2026-08-24
+
+### Fixed
+- Isolate storyboard posters per render to prevent stale same-filename results (#1718)
+
+## [0.15.71] - 2026-08-24
+
+### Added
+- add authenticated fetch_image bridge command (#1730)
+
+
+## [0.15.70] - 2026-08-24
+
+### Fixed
+- deep-freeze all object info cache reads (#1709)
+- preserve refreshed whole schema after add (#1709)
+- replace stale whole schema authority (#1709)
+- retire whole schema authority on class reads (#1709)
+- reuse verified add-node schema (#1709)
+
+
+## [0.15.69] - 2026-08-24
+
+### Fixed
+- name remote combo refusal provenance
+
+
+## [0.15.68] - 2026-08-24
+
+### Fixed
+- roll back Fast Bypasser linked modes (#2146)
+
+
+## [0.15.67] - 2026-08-24
+
+### Fixed
+- panel_refresh_nodes now follows chained forced refresh successors and never reports premature success while a later refresh is still running (#1695)
+- late combo refresh mutations remain fenced and combo trust stays fail-closed across reconnect refreshes (#1695)
+
+
+## [0.15.66] - 2026-08-23
+
+### Fixed
+- disclose rgthree lora row creation route (#1694)
+- fail closed on incomplete live scans (#1691)
+- bound live error lookups (#1691)
+- preserve refusal precedence for mixed receipts (#1690)
+- make incomplete run receipts uncertain (#1690)
+- refuse id-less run acknowledgements (#1690)
+- reject ambiguous inner error ids
+- reject foreign scoped execution errors
+- preserve scoped execution errors
+
+### Changed
+- release-0.15.62 (#1704)
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.65] - 2026-08-23
+
+### Fixed
+- fail closed on incomplete live scans (#1691)
+- bound live error lookups (#1691)
+- preserve refusal precedence for mixed receipts (#1690)
+- make incomplete run receipts uncertain (#1690)
+- refuse id-less run acknowledgements (#1690)
+- reject ambiguous inner error ids
+- reject foreign scoped execution errors
+- preserve scoped execution errors
+
+### Changed
+- release-0.15.62 (#1704)
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.64] - 2026-08-23
+
+### Fixed
+- preserve refusal precedence for mixed receipts (#1690)
+- make incomplete run receipts uncertain (#1690)
+- refuse id-less run acknowledgements (#1690)
+- reject ambiguous inner error ids
+- reject foreign scoped execution errors
+- preserve scoped execution errors
+
+### Changed
+- release-0.15.62 (#1704)
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.63] - 2026-08-23
+
+### Fixed
+- reject ambiguous inner error ids
+- reject foreign scoped execution errors
+- preserve scoped execution errors
+
+### Changed
+- release-0.15.62 (#1704)
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.62] - 2026-08-23
+
+### Changed
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.61] - 2026-08-23
+
+### Changed
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.60] - 2026-08-23
+
+### Changed
+- fix/1680 refresh completion handle (#1699)
+
+
+## [0.15.59] - 2026-08-23
+
+### Fixed
+- refuse derived MiniMaxH3Director prompt writes (#1697)
+
+
+## [0.15.58] - 2026-08-23
+
+### Fixed
+- reject replaced panel targets
+- advertise expected node type fence
+- enforce expected target type at write boundary
+
+
+## [0.15.57] - 2026-08-23
+
+### Fixed
+- panel_find_nodes now matches raw quoted substrings in STRING widget values (#1678)
+
+
+## [0.15.56] - 2026-08-23
+
+### Fixed
+- refuse arbitrary Git URLs on Manager v4 before queueing (#1539)
+
+
+## [0.15.55] - 2026-08-23
+
+### Fixed
+- treat VHS date prefixes as queue-time volatile
+
+
+## [0.15.54] - 2026-08-23
+
+### Fixed
+- recover link-disconnect restore crashes
+
+
+## [0.15.53] - 2026-08-23
+
+### Fixed
+- normalize app mode canvas metadata
+
+
+## [0.15.52] - 2026-08-23
+
+### Fixed
+- preserve graph serializer failures (#1669)
+
+
+## [0.15.51] - 2026-08-23
+
+### Fixed
+- skip frontend-authored CustomCombo availability
+
+
+## [0.15.50] - 2026-08-23
+
+### Fixed
+- verify region palettes
+- respect import authority and rollback
+- handle empty editor and palette state
+- rehydrate Ideogram region editor writes
+
+
+## [0.15.49] - 2026-08-23
+
+### Fixed
+- make path fallback explicit
+- prefer live ComfyUI base path
+
+
+## [0.15.48] - 2026-08-22
+
+### Fixed
+- reject empty object info maps
+- reject malformed object info fallback
+- harden fallback pack map keys
+- panel_list_nodes returns an inspectable fallback when Manager is unreachable
+
+
+## [0.15.47] - 2026-08-22
+
+### Changed
+- fix-late-workflow-save-receipts (#1657)
+
+
+## [0.15.46] - 2026-08-22
+
+### Fixed
+- first open of the active workflow after restart succeeds (#1643)
+
+
+## [0.15.45] - 2026-08-22
+
+### Fixed
+- outline reporting root after reconnect lets enter_subgraph use the root (#1639)
+
+
+## [0.15.44] - 2026-08-22
+
+### Fixed
+- after a reconnect, a graph outline that reports viewing.scope root makes the immediately following enter/mutation use root, instead of rejecting a root node as "currently inside a subgraph" (#1636)
+- panel_set_widget no longer re-waits on silent `api.getNodeDefs()` / `GET /object_info` probes when a same-connection schema snapshot is already held (#1582)
+
+### Fixed
+- installed nested models on Windows are not reported missing (#1637)
+- panel_set_widget no longer re-waits on silent schema probes (#1638)
+
+
+## [0.15.43] - 2026-08-22
+
+### Fixed
+- panel_new_workflow no longer claims a blank tab while the previous graph is still on the canvas (#1632)
+
+
+## [0.15.42] - 2026-08-22
+
+### Fixed
+- a restart confirmation card is brought on screen instead of timing out unseen: the Agent tab opens, stick-to-bottom is forced, and the card scrolls immediately rather than waiting on an rAF a backgrounded tab will never fire (#1625)
+- resolve Manager installed directory IDs before update
+
+
+## [0.15.41] - 2026-08-22
+
+### Fixed
+- fail honestly when remote /view is unavailable (#1623)
+
+
+## [0.15.40] - 2026-08-22
+
+### Fixed
+- panel_open_workflow keeps authored node size/order and leaves a clean tab unmodified (#1621)
+- replay remote PreviewImage completion (#1624)
+
+## [0.15.39] - 2026-08-22
+
+### Fixed
+- deliberate-sweep runs retain their prompt and SaveImage filename widgets when the frontend queue is already busy (#1588)
+
+
+## [0.15.38] - 2026-08-22
+
+### Fixed
+- panel_open_workflow no longer reports unknown content when only randomMin/randomMax normalize (#1613)
+- a finished stills render notifies the agent before the orchestrator fallback (#1612)
+- trust live VIDEO producers for add-node socket proof
+
+## [0.15.37] - 2026-08-22
+
+### Fixed
+- opening an already-open saved workflow publishes the live fence uuid, so the next graph read is not refused as a stale instance (#1581)
+- `panel_add_node` accepts a core VIDEO socket when a live canvas producer exposes VIDEO, even if the full `/object_info` read times out (#1589)
+
+- opening a saved workflow leaves graph tools on that canvas
+- report the tab re-list from the open LIST, and hold the fence across the load
+- the adopt arm requires the same workflow FILE, not just a matching selector
+- reopening a closed tab loads the workflow the store's early return skipped
+
+## [0.15.36] - 2026-08-22
+
+### Fixed
+- the Agent tab appears in the sidebar after a clean load (#1609)
+- a save whose only drift is node geometry is no longer refused (#1606)
+- accept wildcard producers for custom sockets (#1584) (#1603)
+
+
+## [0.15.35] - 2026-08-21
+
+### Fixed
+- the pack no longer treats any TCP listener on the bridge port as a running orchestrator (Logitech G HUB's `lghub_agent` sits on 9180); identity is a hello/models handshake, the default is 9199 with 9180 as a legacy fallback, `/status` and Connect try 9180 before spawning a 9199 orchestrator, and a live 9180 session is not stranded across a panel update (#1596 / mcp#2030)
+- shorten silent schema probe with current snapshot
+- upgrade queued refresh handoff
+- answer refresh before synchronous reapply
+- graph audits no longer report stale output links or contradictory downstream consumers (#1590)
+
+## [0.15.34] - 2026-08-21
+
+### Fixed
+- close wrapped secret and version regressions
+- the proxy attribution needs a body that NAMES a responder
+
+## [0.15.33] - 2026-08-21
+
+### Fixed
+- free_vram classifies what answered instead of pasting the proxy's error page (#1591)
+- a frontend-only node stays addable when the object_info fetch does not answer (#1586)
+- a benign load-time rewrite INSIDE a subgraph definition stops refusing the open (#1578)
+- a subgraph node's rebuilt widget list is compared by MEMBERSHIP, not by array identity (#1577)
+- a scoped batch drives ComfyUI's own control hooks, so batch_count means N renders (#1576)
+- the video completion stops waiting on work the agent never sees (#1579)
+- the live availability scan reads V2/V3 combos, not just the V1 shape (#1568)
+- a save whose tracker snapshot is behind the canvas is refused, not reported as success (#1567)
+- three refusal/comment inaccuracies from #1561 now state what the code observed (#1574)
+- graph_run answers inside the window its reply is relayed in (#1570)
+- recognise ComfyUI's file_upload flag so Load3D model inputs get upload handling (#1571)
+- panel_refresh_nodes spends the window it holds, and stops blaming a server it never saw fail (#1566)
+- a type-scoped /object_info answers the fence when the whole map never lands (#1561)
+
+## [0.15.32] - 2026-08-21
+
+### Fixed
+- Prompt Builder prompt_text writes keep builder_state in the same step (#1551)
+- serverDeclaresEmptyComboOptions reads the V2 combo shape (#1552)
+- a FLOAT widget's quantization is explained by the grid the frontend actually ran (#1550)
+
+
+## [0.15.31] - 2026-08-20
+
+### Fixed
+- loading a saved workflow no longer resets a subgraph host's prompt, dimensions, length, and selectors to definition defaults (#874)
+- panel_add_node names a failed custom-node pack as the reason a type is missing only when ComfyUI-Manager's node map says that pack provides it; an unproven failure is reported as a separate issue rather than the cause (#1544)
+
+### Fixed
+- saved subgraph host widgets survive panel_load_workflow (#1547)
+- name a failed pack as the cause only when Manager's node map proves it owns the type (#1545)
+
+
+## [0.15.30] - 2026-08-20
+
+### Fixed
+- the default saveWorkflow test double writes the tab's own path (#1542)
+
+
+## [0.15.29] - 2026-08-20
+
+### Fixed
+- a no-name save of a .app.json workflow writes that file, not a plain .json fork (#1538)
+- a long timestamp-less transcript keeps the order it was written in (#1536 / #1539)
+
+
+## [0.15.28] - 2026-08-20
+
+### Fixed
+- panel_set_widget retains VHS_LoadVideo custom dimensions (#1534)
+
+
+## [0.15.27] - 2026-08-20
+
+### Fixed
+- the archive import carried the same broken tiebreak (#1531)
+- a timestamp-less transcript keeps the order it was written in (#1530)
+- the slot snapshot is instrumentation, not a precondition for firing the hook
+- a programmatic widget write announces itself to the node, not just to the widget
+
+
+## [0.15.26] - 2026-08-20
+
+### Fixed
+- `panel_add_node` of a subgraph UUID already loaded in the live workflow no longer rejects it as an unknown backend node or names an unrelated failed pack (#1523)
+- a run ComfyUI accepted while dropping some outputs is reported as queued, with the dropped outputs named, instead of as a refusal (#1504)
+- `panel_list_nodes` with `search` (or `query`) filters the installed-pack list instead of returning every pack (#1496)
+- a run-to-node no longer has its own branch vetoed by an uninstalled pack on a branch it excluded (mcp#1871)
+- the panel's own pre-flight stops refusing before ComfyUI is asked, so that recovery can run (mcp#1871)
+- a group is built from the same footprint its members are judged by, so requested collapsed nodes are included (mcp#1877)
+- a locator that could not look no longer reports the node as being from another workflow (#1501)
+- a refusal claims nothing about a final size it never read (#1872)
+
+## [0.15.25] - 2026-08-20
+
+### Fixed
+- a title-only edit is judged against the node's own snapshot, not a size range (#1509)
+- a later phase must not speak for a run that obtained no /object_info (#1508)
+
+### Changed
+- EXECUTE the rider, so its workflow-key gate can be watched to fail (#1505)
+
+
+## [0.15.24] - 2026-08-20
+
+### Fixed
+- the node-def refresh asks the raw /object_info route when the frontend client does not answer (#1502)
+- a graph read dates itself against the manual-change block it contradicts (#1503)
+- an instance-scoped promoted write discloses the inner callback it did not invoke (#1500)
+- the "you are inside a subgraph" remedy is now checked, not assumed (#1499)
+
+
+## [0.15.23] - 2026-08-20
+
+### Fixed
+- adopt a loopback bridge URL the orchestrator advertises, not just a tunnel one (#1487)
+
+
+## [0.15.22] - 2026-08-20
+
+### Fixed
+- a Manager install queue that stays `in_progress` with no count change is reported as a silent stall, not as progress: `panel_node_queue_status` still attaches Manager's real counts, names any in-progress pack, and after two minutes of the same fingerprint tells you to verify with `panel_list_nodes` instead of waiting forever (#1480)
+
+### Fixed
+- a silent Manager in_progress is named as a stall, not as progress (#1483)
+
+
+## [0.15.21] - 2026-08-20
+
+### Fixed
+- the video card mounts, reserves its real space, and pauses before it unmounts (#1481)
+- a tab switch no longer leaves graph reads refused on a stale root identity (#1478)
+- a schema read that timed out is UNKNOWN, not proof that nothing outputs the type (#1479)
+
+
+## [0.15.20] - 2026-08-20
+
+### Fixed
+- a subgraph conversion that THROWS says whether the graph changed (#1466)
+
+### Changed
+- bump @types/node from 22.20.0 to 26.2.0 (#1471)
+
+
+## [0.15.19] - 2026-08-20
+
+### Changed
+- bump the npm-minor-patch group with 2 updates (#1469)
+- bump the actions-all group with 3 updates (#1468)
+
+
+## [0.15.18] - 2026-08-20
+
+### Fixed
+- pasting a prompt copied out of a document no longer drops every character: a clipboard carrying both a file and text (which is what Word, Outlook, Excel and most web pages produce on Windows) had its text discarded by the file branch, silently and with no placeholder (#1467)
+- a message referencing an attachment whose content is no longer loaded now says so, instead of sending a message that only looks complete (#1467)
+
+## [0.15.17] - 2026-08-20
+
+### Fixed
+- key the requested name and the canvas name with the operation each needs (#1462)
+
+### Changed
+- watch dependencies for advisories, weekly and grouped (#1464)
+
+
+## [0.15.16] - 2026-08-20
+
+### Fixed
+- adding an unknown node type no longer reports an unrelated ReActor import failure when that pack currently provides other live types (#1447)
+- the save-timeout reply no longer claims the canvas is not the save's destination when it is: the requested name and the frontend's derived filename are now compared after the same normalization, so `workflow_save_as({name:"Foo.json"})` keeps reporting `modified:true` instead of withholding it (#1458)
+
+## [0.15.15] - 2026-08-20
+
+### Fixed
+- entering a copied subgraph, editing its inner graph, and exiting no longer clears promoted widget values on the parent instances (artokun/comfyui-mcp#1827)
+
+### Fixed
+- the save timeout reports what it observed, never that the write landed (#1456)
+- promoted parent widget values survive inner subgraph edits (#1454)
+
+
+## [0.15.14] - 2026-08-19
+
+### Added
+- `graph_unexpose_subgraph_input` / `graph_unexpose_subgraph_output` remove a subgraph boundary slot by name — the inverse of the expose pair; dropped interior/host wires are counted and reported (artokun/comfyui-mcp#1294)
+
+### Fixed
+- `panel_get_errors` no longer flags a pasted LoadImage file like `pasted/image (992).png` as missing when the file is on disk and `/view` serves it (#1357)
+
+### Added
+- a supported way to remove a subgraph boundary slot (artokun/comfyui-mcp#1294) (#1437)
+
+### Fixed
+- a pasted LoadImage file with spaces is no longer flagged missing (#1440)
+- panel_save_workflow replies when the save hangs instead of claiming the tab is frozen (#1439)
+
+
+## [0.15.13] - 2026-08-19
+
+### Fixed
+- `panel_get_errors` no longer joins a previous workflow's runtime failure onto a current node that only shares the same id — correlation now requires matching node type as well (#1448)
+
+### Fixed
+- panel_get_errors no longer attaches a stale execution error to a reused node id (#1451)
+
+
+## [0.15.12] - 2026-08-19
+
+### Fixed
+- graph mutations notify the visible canvas (and bump the frontend layout revision) so a successful edit/remove actually appears, not only in panel_graph_outline (#1443)
+
+### Fixed
+- editing a node keeps compact geometry instead of inflating it (#1446)
+- graph edits appear on the canvas, not only in the outline (#1445)
+
+
+## [0.15.11] - 2026-08-19
+
+### Added
+- Qwen Code as a selectable Agent Panel provider (#1438)
+- graph_get_virtual_types — serve the frontend's proven virtual-node registry (artokun/comfyui-mcp#1400) (#1441)
+
+
+## [0.15.10] - 2026-08-19
+
+### Added
+- `graph_get_virtual_types` bridge command reports the node types this page's LiteGraph registry proves frontend-virtual (`isVirtualNode === true` on a probe instance of the registered class — KJNodes' Get/Set bus, rgthree's Label / Fast Groups toggles, and any pack that sets the same flag), so the orchestrator's headless `check_runtime` can consult the authority instead of a name list (comfyui-mcp#1400)
+- `graph_configure_app_mode` sets ComfyUI App Mode inputs, outputs, and default mode on the live canvas without clobbering `extra.comfyui_mcp` (#1429)
+- `graph_save_subgraph` can replace a user-published blueprint in place with `overwrite:true` — no Save dialog, bundled/global blueprints stay protected (#1122)
+- `panel_remove_node` accepts `node_ids` and removes every listed node in one undo step — one Ctrl+Z restores them all, and a single reply names what left and what did not (#841)
+
+### Added
+- panel_remove_node takes node_ids as one undo step (#1431)
+- set ComfyUI App Mode inputs, outputs, and default mode on the live canvas (#1433)
+- replace a published subgraph blueprint with overwrite:true (#1432)
+
+### Fixed
+- outline clip footer names note nodes whose text was clipped (#1435)
+
+
+## [0.15.9] - 2026-08-19
+
+### Fixed
+- `panel_open_workflow` reports the fence uuid from the same active-workflow observation as the binding fields beside it, instead of a second live read that could disagree (#1014)
+
+### Fixed
+- an open reply reports one identity observation, not two (#1428)
+- a promoted-widget write lands in the instance that was addressed, not the shared subgraph definition (#1427)
+
+## [0.15.8] - 2026-08-19
+
+### Fixed
+- stale-combo refusal tells the truth about the refresh, and the /view probe is bounded (#1425)
+- lightbox stage and collapsed cards honor the same honest failure state (#1424)
+
+
+## [0.15.7] - 2026-08-19
+
+### Fixed
+- `panel_refresh_nodes` no longer times out with no acknowledgement when a node-def refresh is already running: of the six commands relayed in the orchestrator's 30 s window only `graph_add_node` and `nodes_install` held a command budget, and `refresh_nodes` — whose whole body IS a wait on the node-def refresh — did not, so a forced call waited unbounded on the in-flight run AND on its own trailing run — past the window, so the reply the panel's bounds exist to produce never left the tab and the user got `did not reply … the ComfyUI tab may be backgrounded or frozen` about a healthy, idle tab. It now bounds that wait at 25 s (the same budget `graph_add_node` and `nodes_install` hold against the same window) and answers `refreshed:false` with `reason:"refresh_still_running"` and a retry that works — the abandoned run is not cancelled, so it is still registering the definitions the call asked for (#1404)
+
+### Fixed
+- graph_set_widget stale-combo recovery takes the command budget (#1416)
+- refresh_nodes takes a command budget, so a contended refresh replies instead of timing out (#1409)
+- A2UI card buttons send a user message when clicked (#1410)
+- sanitize invalid properties.aux_id on node add/paste so one node can no longer poison every save/load (#1412)
+
+
+## [0.15.6] - 2026-08-19
+
+### Fixed
+- `panel_query_graph` (fields:'detail') no longer last-wins-collapses widgets that share a name: when a name repeats (rgthree Fast Groups toggle rows), every occurrence is listed so a duplicate or orphaned row is visible (#1402) (#1406)
+- `duplicate_widgets` (the #1402 duplicate-widget report) no longer throws the whole detail read away on a widget named `__proto__`/`constructor`/`toString` — occurrences are accumulated prototype-safely — and is now bounded by the same `max_chars` budget as `widgets` (dropped occurrences are announced with the lever that lifts them, never silently lost), so a many-group Fast Groups Bypasser cannot push the detail line into a whole-row stub. `panel_graph_outline` also labels each same-named row from the widget itself rather than a last-wins name-keyed map, so two different group toggles are no longer both annotated with the last row's label (#1402) (#1405)
+
+## [0.15.5] - 2026-08-19
+
+### Added
+- converting a video-gen workflow to an app exposes LTX 2.3/Director, Wan, Bernini, Hunyuan and Easy-Use Media generation parameters, treats LoadVideo/VHS/easy loadVideo as video inputs, and collects SaveVideo/VHS_VideoCombine/easy saveVideo as video outputs (including ComfyUI history `videos[]`) instead of classifying them as stills (#428)
+- `/record-skill` snapshots the open graph as a reusable skill file (`skills/<name>/SKILL.md`) so the agent can rebuild it (#350)
+
+### Fixed
+- `workflow_open` no longer reports a false content mismatch on `definitions` when the frontend renumbered subgraph NODE ids during the load: the relabeling is proven (same nodes in the same order, links and promoted widgets patched through one injective map) rather than tolerated, and it still refuses when a root node promotes a widget from a node the relabeling touched (artokun/comfyui-mcp#1706)
+- a panel tab whose bridge ROUTE went stale re-advertises itself instead of waiting for a browser refresh: the 600 ms workflow poll now watches the route the orchestrator keys its tab registry on, not only the workflow-instance fence identity, so a re-hello that did not land after a switch, a first save or a rename is retried (bounded) rather than leaving every graph call addressed at a tab id nothing answers to (#1389)
+
+### Added
+- converting a video-gen workflow to an app exposes LTX/Wan/Bernini/Hunyuan params and video I/O (#1397)
+- /record-skill saves the open graph as a reusable skill (#1398)
+
+### Fixed
+- sweep a stolen preview by which node emitted, not by what its type could show (#1392)
+- a re-pended run completion re-arms the reconcile sweep (#1403)
+- a back-to-back graph command flushes the pending tracker snapshot before the fence (#1400)
+- the missing-node COUNT is filtered with the names it was counting (#1396)
+- graph_add_node still replies when its own refresh run would miss the window (#1399)
+- the promoted-widget guard reads every dialect of an id that MOVED, not one spelling (#1395)
+- the coalescer-join pin is checked at EVERY call site, not once over the body (#1393)
+- a stale ROUTE re-advertises itself, like a stale fence identity already does (#1391)
+- a subgraph node-id renumber is a relabeling the panel can PROVE, not lost content (#1388)
+- video previews can be disabled — placeholder keeps first frame, filename and lightbox access (#1386)
+- refuse workflow names with path separators instead of silently nesting (#1384)
+- a nested composite field inside a JSON widget validates against its own value's shape (#1382)
+- the load watch reports whether it was ENTERED, not just installed (#1387)
+
+
+## [0.15.4] - 2026-08-19
+
+### Fixed
+- a combo that cannot list its files is no authority on whether a file exists: an unreadable listing no longer reads as an empty one (#1357)
+- an abandoned combo refresh is reported as a missing confirmation rather than silently trusted: V2 and dynamic combo specs are rebuilt too, and a spec the panel cannot derive marks the run uncovered instead of suppressing a real missing-asset warning (#1193)
+- a caller-supplied link-exclusion Set is normalised instead of trusted, so a raw-number Set cannot silently lose the exclusion and credit a pre-existing link to the current call (#1272)
+- `panel_auto_layout` apply inside a subgraph no longer escapes to and rearranges the root graph (#1328)
+- `panel_get_errors` no longer keeps load-time missing-node-type errors after a ComfyUI restart that registered those classes — leftover placeholders are reported as needing a save+reopen, not as still-uninstalled types (#1332)
+- agent-directed instruction blocks (LIVE-CANVAS TOOLS, MANUAL CANVAS CHANGES, query-graph budget accounting) stay in the agent's context and no longer render in the user's chat (#1310)
+- graph mutations no longer stay stuck in `[backend-reconnecting]` after a long Wan render: a busy `/prompt` poll is not a down socket, and binding status now distinguishes a readable canvas from a backend that is actually reconnecting (#1325)
+- panel_update_node surfaces the Manager update traceback instead of hiding it behind a generic "check the server log" error (#1320)
+- dictation listens for the spoken language when the panel UI is the English catalog floor — a German (or other unshipped) speaker no longer gets an English recognizer (#1329)
+- panel_set_widget can author an LTXDirector timeline from the serialized widgets when the live timeline editor is not initialized (#1308)
+- live-sync no longer reports notified unless the active canvas actually holds the saved workflow (#1299)
+- `panel_edit_group({bounds})` writes the group box only — contained nodes stay at their canvas coordinates (#1306)
+- an already-full origin can save workflow drafts again after the chat-history quota fix (#1305)
+- a group that encloses rgthree Label nodes now moves, instead of being refused because those nodes' visual bounds are not the panel's generic footprint — the same nodes already moved fine one-by-one with panel_edit_node (#1300)
+- a subgraph preview widget is promoted through the frontend's previewExposure store, and a failed link-only promote no longer hides behind a missing promotion store (#1271)
+
+### Fixed
+- author an LTXDirector timeline without a live editor (#1371)
+- leftover link-driven widgets are not graph drift after reconnect (#1379)
+- a connect that THROWS is judged on the link the live graph shows, not on the exception (#1352)
+- dictation listens for the spoken language, not the English UI floor (#1375)
+- a widget write is verified against the node property litegraph binds it to, and says UNKNOWN when it cannot be (#1363)
+- a load the panel WATCHED run to completion is not a content mismatch (#1358)
+- live_sync reports notified only when the active canvas applied (#1372)
+- a Save-As acknowledges the CAPTURE it observed, not the openWorkflow it called (#1359)
+- panel_edit_group bounds writes the box only (#1369)
+- a frontend VIRTUAL node is not a missing one — the derivable signal, at three call sites (#1353)
+- the FIFTH wait in graph_add_node draws from the command budget too (#1349)
+- reclaim an already-full origin so ComfyUI can save drafts (#1367)
+- keep execution image previews on the node that emitted them (#1361)
+- a frontend-only add_node refusal names the unloaded pack JS, not a missing install (#1366)
+- missing-node mutation errors name the current live ids (#1365)
+- a group containing rgthree Label nodes moves instead of being refused (#1364)
+- a dynamically added node survives workflow switch + reconnect (#1362)
+- promote preview widgets through previewExposure (#1360)
+- copy/paste keeps groups and branch positions (#1356)
+- video preview uses the source duration, not a truncated default (#1355)
+- graph_add_node gets ONE budget, so its bounds stop adding up (#1342)
+- the fixed-seed ARRAY and its SENTENCE come from one predicate (#1350)
+- a ComfyUI restart the bridge SURVIVES re-advertises the tab route (#1347)
+- a slow-but-healthy fetch no longer starves the combo refresh of its budget (#1346)
+- the outline resolves a link's live target slot through the backlink — a stale target_slot renders nothing instead of fabricating connectivity (#1340)
+- a proven read keeps its stale-tag bypass through the executor's own fence re-assert (#1345)
+- an untagged canvas is no longer captured into the target tab's state on a switch (#1344)
+- a rename is announced as a rename, not a workflow switch (#1343)
+- the post-open frame wait is bounded — a starved rAF no longer latches the switch fence (#1341)
+
+
+## [0.15.3] - 2026-08-19
+
+### Fixed
+- a second panel bundle in the page stands down instead of fighting for the tab (#1269)
+- one node's configure throw no longer aborts the rest of a graph load (#1260)
+- a grounding auto-persist keeps the workflow's identity across its object swap (#1263)
+- a cg-use-everywhere graph's broadcast targets are queue-time volatile, so run-to-node's graph stamp matches on an untouched canvas (#1273)
+- panel_add_node refreshes a drifted node schema itself, then re-checks — the refusal is what survives (#1242)
+
+
+## [0.15.2] - 2026-08-18
+
+### Fixed
+- a virtual PrimitiveNode feeding a subgraph input is reported as the non-source it is (#1181)
+- a structural hand edit inside the tracker's capture lag no longer refuses the workflow's own canvas (#1187)
+- an open refused on a properties difference names the keys that differ (#886)
+- a first save publishes the identity it produced even when the swap carry fails safe (#978)
+- a widget callback's throw now names the file it surfaced from, origin scrubbed (#976)
+
+
+## [0.15.1] - 2026-08-18
+
+### Added
+- send this version's changelog to the Comfy Registry — every release has shipped blank (#810)
+
+### Fixed
+- the shadow sheds version payloads canonical holds, so the byte bound holds (#1318)
+- a backend restart under a live tab re-probes the pack version and self-heals (#1317)
+- panel_refresh_nodes can no longer report success over a pruned live canvas (#1316)
+- a stale-canvas tab can no longer persist its foreign graph over another workflow's file (#1315)
+- unpack_subgraph verifies external links survived and refuses loudly when any were dropped (#1314)
+- panel_set_widget refreshes a node's dynamic input slots after the write (#1313)
+- a same-node connect refusal is reported as LiteGraph's loopback guard, not a false type mismatch (#1311)
+
+
+## [0.15.0] - 2026-08-17
+
+### Added
+- opening the panel can now START the local MCP orchestrator for you, with a chooser for the LLM provider. The companion launcher binds loopback-only behind a 32-byte token; the pack proxies it so the token never reaches the browser, and the proxy refuses a declared Origin that is not the Host the browser addressed — a plain cross-tab form post can no longer start the process on your behalf (#1243)
+- `panel_set_widget` can CREATE an rgthree `lora_N` slot: writing `lora_1` on a fresh node mints the row instead of being refused for a widget only the node's DOM-only "Add Lora" button could bring into existence. Keyed on node type, the `lora_<n>` name shape and a lora-slot-shaped value, so an ordinary typo cannot reach it (#757)
+
+### Fixed
+- a voice-dictation error now names the cause and the way out, not just the Web Speech code (#1288)
+- dictation listens in the panel's language, not the browser's (#1289)
+- the desktop app disables dictation with the reason, instead of failing on every click (#1290)
+- a search limit above the cap is disclosed as limit_cap, not silently honored (#1287)
+
+
+## [0.14.44] - 2026-08-16
+
+### Fixed
+- a node read by id returns its full widget value, not a survey clip (#1634)
+- a drifted graph fence is refreshed before the next call, not after it refuses (#1209)
+- the Settings path no longer leaves the saved default naming a backend it never reached (#1198)
+- a wedged orchestrator's death is recorded where the panel concludes it (#1168)
+- an open where only presentation moved is not a failure (#1623)
+- a subgraph conversion that broke the graph stops reporting success (#1571)
+- a Manager that CANNOT report a failure stops reading as one reporting none (#1606)
+- a subgraph is not a second unexplained difference, and the reassurance's own predicate reads the UNEXPLAINED surfaces too (#1588)
+- graph mutations no longer lose the tab route after creating a workflow (#1095)
+- a combo write is decided by whether the panel could READ the option list (#1126)
+- a completion recovered from history reports when it RENDERED, not when it was replayed (#1199)
+- a multi-word panel_search_nodes query finds the pack it names (#1088)
+- a Manager task that terminally errored is not a queued install (#1539)
+- a widget the node computes from its own editor is not writable (#1569)
+
+
 ## [0.14.43] - 2026-08-15
 
 ### Fixed
@@ -3832,12 +4832,31 @@ _No user-facing changes._
 
 ## [0.4.1] - 2026-06-26
 
+Start the agent with a **Connect** button instead of auto-spawning it on load.
+The Comfy Registry's security scanner flagged 0.4.0 because the pack launched a
+subprocess (`npx … --panel-orchestrator`) at import time. Now nothing spawns
+until you explicitly click Connect — the registry-safe pattern — and the panel
+still auto-connects when a bridge is already running.
+
 ### Added
 
 - **`graph_set_node_mode`** — bypass / mute / activate a node on the live canvas
   (undo-able like every other edit), so the agent can enable a bypassed path (e.g. a
   pack's Ideogram-JSON prompt builder) instead of improvising. The graph read now
   surfaces each node's mode, so bypassed/muted nodes are visible. (#30)
+
+### Changed
+
+- **Connect button replaces import-time auto-spawn.** `__init__.py` no longer
+  starts the orchestrator when ComfyUI imports the pack. Instead it registers a
+  small local API on ComfyUI's own server (`/comfyui_mcp_panel/{status,connect,
+  disconnect}`), and the panel's **Connect** button starts the orchestrator on
+  demand — an explicit, authenticated, local action. On load the panel only
+  auto-connects if a bridge is *already* running (you started it, or another
+  tab did); otherwise it waits behind the Connect button. A **Disconnect**
+  button stops an orchestrator the pack started. `COMFYUI_MCP_NO_AUTOSPAWN=1`
+  now makes Connect report status without spawning; `COMFYUI_MCP_BRIDGE_PORT`
+  still overrides the port. Fixes the `NodeVersionStatusFlagged` 0.4.0 release.
 
 ### Fixed
 
@@ -3848,6 +4867,9 @@ _No user-facing changes._
   a preview's temp name as the output. Applies to images and videos. (#31)
 
 ## [0.4.0] - 2026-06-26
+
+The panel now drives itself: it auto-starts an autonomous background agent on
+your Claude subscription, so you just open ComfyUI and type.
 
 ### Added
 
@@ -3860,6 +4882,17 @@ _No user-facing changes._
   - **About** — ⭐ Star on GitHub. **API tokens** — secure CivitAI / HuggingFace
     buttons (stored by the orchestrator, never in ComfyUI settings).
   - The comfyui-mcp logo in the panel header.
+  - **Auto-start the panel orchestrator on load.** The pack launches
+    `npx -y comfyui-mcp --panel-orchestrator` when ComfyUI loads it — idempotent
+    (skips if the bridge port is already owned), auto-detects this ComfyUI's
+    `COMFYUI_URL`, and runs on your Claude **subscription** (no API key). The agent
+    is a background Claude Agent SDK session per tab that loads comfyui-mcp's
+    bundled skills (model expertise), so the only prerequisite is being signed in
+    to Claude (`claude` once). Opt out with `COMFYUI_MCP_NO_AUTOSPAWN=1`; override
+    the port with `COMFYUI_MCP_BRIDGE_PORT`. Requires comfyui-mcp ≥ 0.14.
+  - **Lifecycle beacon.** The pack passes its PID so the orchestrator shuts down
+    when ComfyUI exits — including crashes/hard-kills — with an `atexit` teardown
+    on clean shutdown too. No orphan left holding the bridge port.
 
 ### Fixed
 
@@ -3878,6 +4911,14 @@ _No user-facing changes._
   settings load; appliers are now gated until the panel is armed. (#22)
 - **Steady connection status** — no connecting↔disconnected flicker, with
   backend-aware patience for slow Codex cold starts. (#24)
+
+### Changed
+
+- **Connection UI reflects the orchestrator model.** The settings help text and
+  header no longer tell you to wire the MCP into your interactive session with
+  `--channels` (which would steal the bridge port from the orchestrator); they
+  now describe the autonomous background agent and the one-time
+  `npx -y comfyui-mcp --panel-orchestrator` fallback.
 
 ## [0.3.1] - 2026-06-25
 
@@ -3902,6 +4943,8 @@ _No user-facing changes._
   orchestrator fix).
 
 ## [0.3.0] - 2026-06-25
+
+The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) and installable from ComfyUI-Manager.
 
 ### Added
 
@@ -3951,6 +4994,64 @@ _No user-facing changes._
   packs are local/free; for an ad-hoc or generated graph the agent classifies the
   runtime (local / api / mixed / unknown) and **asks before spending paid API
   credits** rather than silently using hosted API nodes.
+- **Registry banner & SEO listing.** Added a 21:9 brand banner
+  (`assets/banner.png`) so the registry/social card uses a custom image
+  instead of the generic OG fallback, and rewrote the pack description to
+  lead with the terms people actually search (Claude Code, MCP / Model
+  Context Protocol, AI agent, live graph editing).
+
+- **Capability-aware empty state.** The onboarding hero now reflects the
+  agent's full surface — build/edit the live graph, generate images **and
+  audio** (`generate_audio`, ACE Step 1.5 / Stable Audio 3), run the workflow
+  and read its errors, and find models on Civitai — with clickable example
+  prompts that prefill the composer. Requires comfyui-mcp ≥ 0.13.
+- **Native ComfyUI design system.** The panel is restyled on the same
+  PrimeVue semantic tokens (`--p-content-background`, `--p-form-field-*`,
+  `--p-primary-color`, border radii, Inter) the built-in sidebar panels use —
+  it tracks your ComfyUI theme automatically. Header with live status dot,
+  empty-state onboarding, animated message bubbles, auto-growing composer.
+- **Activity cards.** Every graph edit the agent makes renders as a human-
+  readable card in the chat feed — "➕ Added KSampler (id 26)",
+  "🔗 Connected 4.MODEL → 26.model", "🎚 Set steps = 30 (was 20)" — so you
+  can watch Claude work.
+- **Multi-tab support.** Each ComfyUI browser tab holds its own bridge
+  connection, identified by a per-tab session id plus the open workflow's
+  title. The agent sees every tab (`panel_status`), routes edits per tab,
+  and knows which tab you typed in. Requires comfyui-mcp ≥ 0.12.
+- **Markdown-lite agent bubbles** — `code` and **bold** rendering, safely.
+- **"Claude is working…" indicator.** Sending a message shows an animated
+  typing indicator immediately; incoming graph edits keep it alive (and bump
+  it below the newest activity card), the agent's reply retires it, and a
+  45-second quiet period swaps it for a hint explaining that the agent reads
+  panel messages by polling its inbox. (Claude Code doesn't stream its
+  internal reasoning to MCP servers — narration + activity cards + this
+  indicator are the feedback surface.)
+- **`graph_clear` command** — wipes every node in a single
+  `beforeChange`/`afterChange` pair, so one Ctrl+Z restores the whole graph.
+  Exposed as the `panel_clear` MCP tool (comfyui-mcp ≥ 0.12).
+- **Full programmatic graph & app control.** New executor commands (each
+  with a matching `panel_*` MCP tool): `graph_move_node`, `graph_canvas`
+  (fit / center-on-node / pan / zoom), `graph_run` (queue the open workflow,
+  surfacing frontend validation errors), `graph_get_errors` (last
+  `execution_error` event + `lastNodeErrors`), `workflow_save` (Ctrl+S
+  path) and `workflow_save_as` (duplicate to `workflows/<name>.json`).
+- **Subgraph-aware reads.** Executors target the graph you're *viewing*
+  (root or an opened subgraph); `graph_get_state` reports `viewing`, marks
+  subgraph nodes `is_subgraph` with an inner node count (boundary slots +
+  widgets only), and `graph_get_subgraph` drills inside on demand.
+- **Zed-style composer.** Rounded composer card with a context-window ring
+  (radial fill — wired to `agent_status` frames; data source pending host
+  support), model chip, attach button (uploads straight into ComfyUI's
+  `input/` folder and inserts an `@input:` mention), and voice dictation
+  via the browser's speech recognition.
+- **Slash commands & @ mentions.** `/new`, `/fit`, `/run`, `/errors`,
+  `/help` run locally with arrow-key + Enter completion; `@` autocompletes
+  the current workflow, graph nodes, subgraphs, and registered node types.
+  Outgoing messages stamp the workflow + opened subgraph so the agent has
+  the context without asking.
+- **Chat threads.** New-chat and history buttons in the header; threads
+  persist to localStorage (last 20) and replay verbatim, activity cards
+  included.
 
 ## [0.2.0] - 2026-06-19
 
@@ -3990,6 +5091,22 @@ _No user-facing changes._
   the message's own handler (not an array index), so a bounded-history eviction
   can't point a rollback at the wrong turn.
 - **Save-card** rendering fix.
+
+### Changed
+
+- **BREAKING: MCP-driven, no API keys.** Dropped the AI-SDK `/api/chat`
+  backend entirely. The panel is now a WebSocket client of
+  [comfyui-mcp](https://github.com/artokun/comfyui-mcp)'s `--channels`
+  bridge (`ws://127.0.0.1:9101`): **your own Claude Code session is the
+  agent**, subscription-billed, zero LLM API keys anywhere in the path.
+  Settings reduced to one field (bridge URL); SSE parser and bearer token
+  removed.
+
+### Fixed
+
+- `import { app } from "/scripts/app.js"` — `window.app` is no longer
+  assigned at extension-eval time on ComfyUI frontend 1.4x, so the v1
+  global-read pattern silently failed and the sidebar tab never registered.
 
 ## [0.1.3] - 2026-06-19
 
@@ -4053,137 +5170,6 @@ _No user-facing changes._
 - **Smooth animated zoom-to-fit** after the agent makes structural edits.
 - **Programmatic save** (no Save/Rename dialog) and a persistent **"working"**
   indicator with cycling status words.
-
-## [0.4.1] - 2026-06-17
-
-Start the agent with a **Connect** button instead of auto-spawning it on load.
-The Comfy Registry's security scanner flagged 0.4.0 because the pack launched a
-subprocess (`npx … --panel-orchestrator`) at import time. Now nothing spawns
-until you explicitly click Connect — the registry-safe pattern — and the panel
-still auto-connects when a bridge is already running.
-
-### Changed
-
-- **Connect button replaces import-time auto-spawn.** `__init__.py` no longer
-  starts the orchestrator when ComfyUI imports the pack. Instead it registers a
-  small local API on ComfyUI's own server (`/comfyui_mcp_panel/{status,connect,
-  disconnect}`), and the panel's **Connect** button starts the orchestrator on
-  demand — an explicit, authenticated, local action. On load the panel only
-  auto-connects if a bridge is *already* running (you started it, or another
-  tab did); otherwise it waits behind the Connect button. A **Disconnect**
-  button stops an orchestrator the pack started. `COMFYUI_MCP_NO_AUTOSPAWN=1`
-  now makes Connect report status without spawning; `COMFYUI_MCP_BRIDGE_PORT`
-  still overrides the port. Fixes the `NodeVersionStatusFlagged` 0.4.0 release.
-
-## [0.4.0] - 2026-06-17
-
-The panel now drives itself: it auto-starts an autonomous background agent on
-your Claude subscription, so you just open ComfyUI and type.
-
-### Added
-
-- **Auto-start the panel orchestrator on load.** The pack launches
-  `npx -y comfyui-mcp --panel-orchestrator` when ComfyUI loads it — idempotent
-  (skips if the bridge port is already owned), auto-detects this ComfyUI's
-  `COMFYUI_URL`, and runs on your Claude **subscription** (no API key). The agent
-  is a background Claude Agent SDK session per tab that loads comfyui-mcp's
-  bundled skills (model expertise), so the only prerequisite is being signed in
-  to Claude (`claude` once). Opt out with `COMFYUI_MCP_NO_AUTOSPAWN=1`; override
-  the port with `COMFYUI_MCP_BRIDGE_PORT`. Requires comfyui-mcp ≥ 0.14.
-- **Lifecycle beacon.** The pack passes its PID so the orchestrator shuts down
-  when ComfyUI exits — including crashes/hard-kills — with an `atexit` teardown
-  on clean shutdown too. No orphan left holding the bridge port.
-
-### Changed
-
-- **Connection UI reflects the orchestrator model.** The settings help text and
-  header no longer tell you to wire the MCP into your interactive session with
-  `--channels` (which would steal the bridge port from the orchestrator); they
-  now describe the autonomous background agent and the one-time
-  `npx -y comfyui-mcp --panel-orchestrator` fallback.
-
-## [0.3.0] - 2026-06-16
-
-The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) and installable from ComfyUI-Manager.
-
-### Added
-
-- **Registry banner & SEO listing.** Added a 21:9 brand banner
-  (`assets/banner.png`) so the registry/social card uses a custom image
-  instead of the generic OG fallback, and rewrote the pack description to
-  lead with the terms people actually search (Claude Code, MCP / Model
-  Context Protocol, AI agent, live graph editing).
-
-- **Capability-aware empty state.** The onboarding hero now reflects the
-  agent's full surface — build/edit the live graph, generate images **and
-  audio** (`generate_audio`, ACE Step 1.5 / Stable Audio 3), run the workflow
-  and read its errors, and find models on Civitai — with clickable example
-  prompts that prefill the composer. Requires comfyui-mcp ≥ 0.13.
-- **Native ComfyUI design system.** The panel is restyled on the same
-  PrimeVue semantic tokens (`--p-content-background`, `--p-form-field-*`,
-  `--p-primary-color`, border radii, Inter) the built-in sidebar panels use —
-  it tracks your ComfyUI theme automatically. Header with live status dot,
-  empty-state onboarding, animated message bubbles, auto-growing composer.
-- **Activity cards.** Every graph edit the agent makes renders as a human-
-  readable card in the chat feed — "➕ Added KSampler (id 26)",
-  "🔗 Connected 4.MODEL → 26.model", "🎚 Set steps = 30 (was 20)" — so you
-  can watch Claude work.
-- **Multi-tab support.** Each ComfyUI browser tab holds its own bridge
-  connection, identified by a per-tab session id plus the open workflow's
-  title. The agent sees every tab (`panel_status`), routes edits per tab,
-  and knows which tab you typed in. Requires comfyui-mcp ≥ 0.12.
-- **Markdown-lite agent bubbles** — `code` and **bold** rendering, safely.
-- **"Claude is working…" indicator.** Sending a message shows an animated
-  typing indicator immediately; incoming graph edits keep it alive (and bump
-  it below the newest activity card), the agent's reply retires it, and a
-  45-second quiet period swaps it for a hint explaining that the agent reads
-  panel messages by polling its inbox. (Claude Code doesn't stream its
-  internal reasoning to MCP servers — narration + activity cards + this
-  indicator are the feedback surface.)
-- **`graph_clear` command** — wipes every node in a single
-  `beforeChange`/`afterChange` pair, so one Ctrl+Z restores the whole graph.
-  Exposed as the `panel_clear` MCP tool (comfyui-mcp ≥ 0.12).
-- **Full programmatic graph & app control.** New executor commands (each
-  with a matching `panel_*` MCP tool): `graph_move_node`, `graph_canvas`
-  (fit / center-on-node / pan / zoom), `graph_run` (queue the open workflow,
-  surfacing frontend validation errors), `graph_get_errors` (last
-  `execution_error` event + `lastNodeErrors`), `workflow_save` (Ctrl+S
-  path) and `workflow_save_as` (duplicate to `workflows/<name>.json`).
-- **Subgraph-aware reads.** Executors target the graph you're *viewing*
-  (root or an opened subgraph); `graph_get_state` reports `viewing`, marks
-  subgraph nodes `is_subgraph` with an inner node count (boundary slots +
-  widgets only), and `graph_get_subgraph` drills inside on demand.
-- **Zed-style composer.** Rounded composer card with a context-window ring
-  (radial fill — wired to `agent_status` frames; data source pending host
-  support), model chip, attach button (uploads straight into ComfyUI's
-  `input/` folder and inserts an `@input:` mention), and voice dictation
-  via the browser's speech recognition.
-- **Slash commands & @ mentions.** `/new`, `/fit`, `/run`, `/errors`,
-  `/help` run locally with arrow-key + Enter completion; `@` autocompletes
-  the current workflow, graph nodes, subgraphs, and registered node types.
-  Outgoing messages stamp the workflow + opened subgraph so the agent has
-  the context without asking.
-- **Chat threads.** New-chat and history buttons in the header; threads
-  persist to localStorage (last 20) and replay verbatim, activity cards
-  included.
-
-## [0.2.0] - 2026-06-12
-
-### Changed
-
-- **BREAKING: MCP-driven, no API keys.** Dropped the AI-SDK `/api/chat`
-  backend entirely. The panel is now a WebSocket client of
-  [comfyui-mcp](https://github.com/artokun/comfyui-mcp)'s `--channels`
-  bridge (`ws://127.0.0.1:9101`): **your own Claude Code session is the
-  agent**, subscription-billed, zero LLM API keys anywhere in the path.
-  Settings reduced to one field (bridge URL); SSE parser and bearer token
-  removed.
-
-### Fixed
-
-- `import { app } from "/scripts/app.js"` — `window.app` is no longer
-  assigned at extension-eval time on ComfyUI frontend 1.4x, so the v1
-  global-read pattern silently failed and the sidebar tab never registered.
 
 ## [0.1.0] - 2026-06-12
 

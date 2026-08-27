@@ -5,6 +5,39 @@ import { tr } from "./i18n.js";
 // input its handler overwrites) already live in scoped-batch-seed.js; this file
 // imports the verdict rather than restating them.
 import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
+// comfyui-mcp#1871 — ComfyUI's prompt validation requires EVERY node in the posted
+// prompt to resolve to an installed class before it narrows execution to
+// partial_execution_targets, so one unavailable pack on an unrelated branch vetoes a
+// run-to-node of a branch that does not touch it. The measured upstream facts, the
+// backward-closure walk, and the structured test that licenses a second post live in
+// partial-run-prune.js; this file imports the verdict.
+import { prunedRetryForRejection } from "./partial-run-prune.js";
+// #1273 — the THIRD volatility signal: cg-use-everywhere materialises its
+// broadcast links into the prompt inside its own queuePrompt patch, so the
+// inputs it will inject are queue-time volatile too. The measured facts about
+// the pack (the extra.ue_links record, the io-node ids, the subgraph routing)
+// live in use-everywhere-links.js; this file imports the verdict.
+import { ueQueueTimeLinkPairs } from "./use-everywhere-links.js";
+// #1331 — after reconnect a converted widget's leftover value (clip/vae/model/…)
+// can still churn while the live input is already linked. control_after_generate
+// can also be present by OPTION SHAPE before its beforeQueued hook is re-hung.
+// Both detectors already live in their own modules; this file imports the verdict.
+import { controlAfterGenerateEntries } from "./control-after-generate.js";
+// #1565 — THE RUN PATH HAS TO ANSWER INSIDE THE WINDOW ITS REPLY IS RELAYED IN.
+// `panel_run` relays `graph_run` in 20,000 ms, and every wait below is a wait the
+// READ path (panel_query_graph reads live LiteGraph objects) never takes — which is
+// exactly the asymmetry the reporter measured: reads sub-second on the same tab
+// while the run never answered at all. The bounds here are APPLIED with the shared
+// `withTimeout`; the allowances come from the caller's command budget. A second
+// timeout helper is how this repo keeps producing near-duplicate bugs (bounded-step's
+// own header), so there is not one.
+import { withTimeout } from "./bounded-step.js";
+
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -76,7 +109,11 @@ import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
 //    at queue time (beforeQueued hooks: seed widgets re-rolled by their linked
 //    control_after_generate, and the hook widgets themselves; plus prompts
 //    rewritten by an extension's own api.queuePrompt patch, which carry no hook
-//    at all — rgthree's armed Seed node, #1124), which change
+//    at all — rgthree's armed Seed node, #1124; plus leftover values of
+//    link-driven converted widgets that settle from the widget default to the
+//    incoming link after reconnect — MiniMax H3 clip/vae/model, #1331), and known
+//    serializer-backed derived fields such as Ideogram4PromptBuilderKJ's
+//    elements_data (#2130), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
 //    unserialized control the hook hangs on), and (b) inputs whose value the
@@ -121,7 +158,11 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * The ordered list of 3rd-argument shapes to try for app.queuePrompt when a
  * run-to-node scope is requested. The positional array comes first (native on
  * positional builds, normalized by the Array.isArray shim on options builds);
- * the QueuePromptOptions object is next for builds that dropped the shim.
+ * the QueuePromptOptions object is next for builds that dropped the shim. The
+ * object carries both the store-layer `queueNodeIds` key and the API-layer
+ * `partialExecutionTargets` key: ComfyApp 1.49.6 reads the former and translates
+ * it to the latter, while a wrapper that forwards the options directly to the
+ * API can read the latter without needing a separate attempt.
  * `[undefined]` when no scope was requested — a plain full run, exactly the
  * historical call shape.
  *
@@ -148,13 +189,13 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * a build that does not read it.
  *
  * @param {string[]|undefined} partialTargets
- * @returns {(string[]|{queueNodeIds:string[]}|undefined)[]}
+ * @returns {(string[]|{queueNodeIds:string[],partialExecutionTargets:string[]}|undefined)[]}
  */
 export function queuePromptScopeArgs(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) return [undefined];
   return [
     partialTargets,
-    { queueNodeIds: partialTargets },
+    { queueNodeIds: partialTargets, partialExecutionTargets: partialTargets },
     { partialExecutionTargets: partialTargets },
   ];
 }
@@ -162,7 +203,10 @@ export function queuePromptScopeArgs(partialTargets) {
 /**
  * The ordered DELIVERY ATTEMPTS for a run-to-node scope. The first two hand the
  * scope to `app.queuePrompt` in each of its two documented third-argument
- * shapes. The LAST one hands over the positional array again but also licenses
+ * shapes. The options object carries both the store and API option keys so the
+ * same call works through the 1.49.6 ComfyApp layer and an API-forwarding
+ * wrapper. The remaining API-level compatibility attempt is retained for
+ * wrappers that allow only that key. The LAST one hands over the positional array but also licenses
  * the guard to write `partial_execution_targets` straight into this run's own
  * /prompt body (repairScopeInBody) if it still has not arrived.
  *
@@ -175,16 +219,17 @@ export function queuePromptScopeArgs(partialTargets) {
  * the panel only reaches for the body when the supported routes have failed.
  *
  * @param {string[]|undefined} partialTargets
- * @returns {{arg: string[]|{queueNodeIds:string[]}|undefined, repair: boolean}[]}
+ * @returns {{arg: string[]|{queueNodeIds:string[],partialExecutionTargets:string[]}|{partialExecutionTargets:string[]}|undefined, repair: boolean}[]}
  */
 export function queuePromptScopeAttempts(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) {
     return [{ arg: undefined, repair: false }];
   }
+  const [, optionsArg, apiArg] = queuePromptScopeArgs(partialTargets);
   return [
     { arg: partialTargets, repair: false },
-    { arg: { queueNodeIds: partialTargets }, repair: false },
-    { arg: { partialExecutionTargets: partialTargets }, repair: false },
+    { arg: optionsArg, repair: false },
+    { arg: apiArg, repair: false },
     { arg: partialTargets, repair: true },
   ];
 }
@@ -218,7 +263,9 @@ const fnv1aHex = (s) =>
  *     collectVolatileInputs knows about: a `beforeQueued` hook (stock seed
  *     widgets re-rolled by their linked control_after_generate, third-party hook
  *     widgets), or an extension rewriting the outgoing prompt in its own
- *     `api.queuePrompt` patch (rgthree's armed Seed node, #1124). Those change
+ *     `api.queuePrompt` patch (rgthree's armed Seed node, #1124), or a known
+ *     serializer-backed derived widget (Ideogram4PromptBuilderKJ's
+ *     `elements_data`, #2130). Those change
  *     between any two serializations of the SAME graph by design, so hashing
  *     them would refuse our own dispatch. Exclusions are PER-NODE pairs
  *     (prompt node id + input name, r8): an edit to a NON-hook node's
@@ -398,11 +445,20 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 /**
  * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
  * pre-dispatch stamp and before the POST body is built — collected from the live
- * root graph and every nested subgraph. TWO signals, because there are two
- * mechanisms (#1124): a widget-level `beforeQueued` hook, and an extension that
- * patches `api.queuePrompt` and rewrites the outgoing prompt directly. The
- * second is invisible to any widget scan, so it is matched by node identity
- * instead (rgthree's armed Seed node — see rgthreeQueueTimeSeedInput).
+ * root graph and every nested subgraph. SIX signals, one per mechanism: a
+ * widget-level `beforeQueued` hook (#572), an extension that patches
+ * `api.queuePrompt` and rewrites the outgoing prompt directly (rgthree's armed
+ * Seed node, #1124 — invisible to any widget scan, matched by node identity),
+ * an extension that materialises virtual links into the prompt at queue
+ * time (cg-use-everywhere, #1273 — matched by the pack's own `extra.ue_links`
+ * record, see ueQueueTimeLinkPairs), and a leftover widget value whose
+ * SAME-NAMED input is already link-connected (#1331 — after reconnect the
+ * serialized form flips from the stale widget default to the incoming link,
+ * or the leftover filename itself settles, while the canvas is idle), plus
+ * VHS_VideoCombine filename_prefix date templates (#2099), which the frontend
+ * resolves at queue time, and the known Ideogram4PromptBuilderKJ `elements_data`
+ * serializer-backed editor state (#2130), which can be rewritten while the prompt
+ * is serialized.
  * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
@@ -439,6 +495,72 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * run result's `drift_coverage` note so the caller knows which inputs were not
  * drift-covered for that run.
  */
+/**
+ * Widget names on `node` whose SAME-NAMED input is currently link-connected
+ * (#1331). The leftover widget value is non-semantic: execution reads the
+ * link. A connected input with no matching widget and no convert-to-input
+ * marker is a pure socket and is NOT returned — those stay drift-covered.
+ * Never throws: this runs on the stamp path.
+ */
+function linkDrivenWidgetInputNames(node) {
+  const names = new Set();
+  try {
+    const live = new Set();
+    for (const w of node?.widgets ?? []) {
+      if (w && typeof w.name === "string") live.add(w.name);
+    }
+    for (const input of node?.inputs ?? []) {
+      if (!input || input.link == null) continue;
+      const converted = typeof input.widget?.name === "string" ? input.widget.name : null;
+      if (converted) names.add(converted);
+      else if (typeof input.name === "string" && live.has(input.name)) names.add(input.name);
+    }
+  } catch {
+    /* a malformed node contributes no pairs — fail toward detecting drift */
+  }
+  return names;
+}
+
+function hasRecognizedDateFilenameTemplate(value) {
+  if (typeof value !== "string") return false;
+  // Comfy save-file formatting documents `%date:FORMAT%`; the recognized date
+  // format specifiers are d, M, y, h, m, and s. Accept only those plus common
+  // filename/path separators so arbitrary percent strings stay drift-covered.
+  return /%date:[dMyhms][-dMyhms ._:/\\T]*%/.test(value);
+}
+
+function vhsQueueTimeFilenamePrefixInput(node) {
+  if (node?.type !== "VHS_VideoCombine") return null;
+  for (const w of node?.widgets ?? []) {
+    if (w?.name === "filename_prefix" && hasRecognizedDateFilenameTemplate(w.value)) {
+      return "filename_prefix";
+    }
+  }
+  return null;
+}
+
+/**
+ * #2130 — KJNodes' Ideogram4PromptBuilderKJ owns `elements_data` through its
+ * editor-backed `serializeValue` implementation. The widget is executable prompt
+ * input, so this is deliberately NOT a general "any serializeValue" exemption:
+ * only the measured node type + field + live serializer qualify. A later build
+ * that drops the override is drift-covered automatically.
+ *
+ * Returns the exact serialized input name, or null when the current node does
+ * not prove the queue-time-derived mechanism.
+ */
+function ideogramQueueTimeDerivedInput(node) {
+  if (node?.type !== "Ideogram4PromptBuilderKJ") return null;
+  try {
+    const widget = (node.widgets ?? []).find((w) => w?.name === "elements_data");
+    return typeof widget?.serializeValue === "function" ? "elements_data" : null;
+  } catch {
+    // An unreadable serializer accessor is not proof of queue-time mutation;
+    // keep the input drift-covered rather than widening the exclusion.
+    return null;
+  }
+}
+
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const seen = new Set();
@@ -489,10 +611,70 @@ export function collectVolatileInputs(rootGraph) {
       // is call another extension's documented queue-time substitution a user edit.
       const rgthreeSeedInput = rgthreeQueueTimeSeedInput(node);
       if (rgthreeSeedInput != null) addPair(execId, rgthreeSeedInput);
+      // #1331 — THE FOURTH VOLATILITY SIGNAL. After a reconnect the frontend
+      // re-materialises converted widgets (clip/vae/model/length/…) while their
+      // SAME-NAMED input is already linked. graphToPrompt then serializes the
+      // leftover widget value on one pass and the incoming link (or a later
+      // leftover) on the next — 100+ `clip`/`vae`/`model` diffs on a large
+      // MiniMax H3 graph, every one of them link-driven, none of them a user
+      // edit. The #1050 single retry still races because serializeValue keeps
+      // settling those leftovers. The value that EXECUTES is the link; the
+      // leftover is non-semantic. Exclude exactly those widget names.
+      //
+      // NARROW BY CONSTRUCTION: a connected input with no matching widget and
+      // no convert-to-input marker (`input.widget`) is a PURE SOCKET and stays
+      // hashed — a rewire of KSampler.model is still drift. A converted widget
+      // (`input.widget.name`, or a live widget whose name matches a linked
+      // input) is the leftover that races.
+      for (const name of linkDrivenWidgetInputNames(node)) addPair(execId, name);
+      // #1331 (b) — after reconnect the stock control_after_generate combo
+      // can be present by OPTION SHAPE before its beforeQueued hook is
+      // re-hung. The hook scan above then finds nothing, and a randomize
+      // RandomNoise seed churns between stamp and dispatch the same way
+      // #572 already excluded when the hook WAS there. The shipped detector
+      // (controlAfterGenerateEntries) is hook-independent; a "fixed" mode
+      // still excludes nothing.
+      for (const entry of controlAfterGenerateEntries(node)) {
+        if (entry.mode === "fixed") continue;
+        addPair(execId, entry.widget);
+        if (entry.control !== entry.widget) addPair(execId, entry.control);
+      }
+      // #2099 — THE FIFTH VOLATILITY SIGNAL. VHS_VideoCombine applies Comfy's
+      // save-file date templates in its filename_prefix as the prompt is queued:
+      // `%date:yyyyMMdd_hhmmss%` in the stamped graph becomes the current clock
+      // value in the POST body. That is queue-time substitution, not graph drift.
+      //
+      // NARROW BY CONSTRUCTION: exact node class, exact input name, and a
+      // recognized `%date:FORMAT%` token only. Ordinary VHS prefixes, arbitrary
+      // percent strings, other VHS inputs, and every other node class keep full
+      // drift coverage.
+      const vhsFilenamePrefixInput = vhsQueueTimeFilenamePrefixInput(node);
+      if (vhsFilenamePrefixInput != null) addPair(execId, vhsFilenamePrefixInput);
+      // #2130 — THE SIXTH VOLATILITY SIGNAL. This exact KJNodes field is a
+      // derived editor write-back whose live serializeValue can change the
+      // prompt during queue-time serialization. Keep every other serializer-
+      // backed input drift-covered.
+      const ideogramDerivedInput = ideogramQueueTimeDerivedInput(node);
+      if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
       if (node.subgraph) walk(node.subgraph, execId);
     }
   };
   walk(rootGraph, "");
+  // #1273 — THE THIRD VOLATILITY SIGNAL. cg-use-everywhere's queuePrompt patch
+  // converts its broadcasts to REAL links before the post body is serialized
+  // and restores them after, so the stamp's graphToPrompt and the dispatch's
+  // serialization of an UNTOUCHED graph differ on exactly the pack's own
+  // `extra.ue_links` record. Every scoped run on a UE graph was refused as
+  // "the graph CHANGED", naming the broadcast targets (model/clip/vae/…), with
+  // the retry failing identically — the injection is deterministic, not a
+  // race. The pairs are exactly the inputs the injection can materialise
+  // (subgraph routing included — see use-everywhere-links.js); everything else
+  // keeps full drift coverage, and the set rides along in `volatileInputs`
+  // like the hook and rgthree pairs. This is its own walk, not a fold into
+  // the loop above: the output-panel routing needs the INSTANCE node a bare
+  // graph walk doesn't carry, and a shared subgraph definition must be walked
+  // once per instance prefix.
+  for (const pair of ueQueueTimeLinkPairs(rootGraph)) pairs.add(pair);
   return pairs;
 }
 
@@ -848,13 +1030,54 @@ export function scopeDroppedError({ toNodeId, verdict }) {
  * (graphToPrompt failed before dispatch). Without a signature our dispatch
  * can't be told apart from a stranger's, so a scoped run must NOT dispatch at
  * all — fail closed, nothing queued.
+ *
+ * #1571 — `cause` is the error `graphToPrompt` actually threw, and dropping it was
+ * expensive. The reporter's graph had been left unserializable by a subgraph
+ * conversion; ComfyUI threw `InvalidLinkError: No link found in parent graph for id
+ * [302:192] slot [0] conditioning`, which names the offending node outright. This
+ * refusal caught it, discarded it, and said only "graphToPrompt failed" — so the
+ * reporter concluded that run-to-node "cannot fingerprint NESTED output targets".
+ * Nesting had nothing to do with it. The panel knew the real reason and did not say it.
+ *
+ * The cause is quoted, never interpreted: this path cannot tell a corrupt graph from a
+ * missing pack from an extension throwing inside its own serializer, and guessing
+ * between them is how a reporter gets sent to fix the wrong thing. `cause` is optional
+ * because the refusal also fires with nothing thrown at all — a frontend with no
+ * `graphToPrompt`, or a prompt that canonicalizes to nothing — and inventing a cause
+ * for those would be the same defect pointed the other way.
  */
-export function scopeUnattributableError({ toNodeId }) {
+export function scopeUnattributableError({ toNodeId, cause } = {}) {
+  const reason = describeFingerprintFailure(cause);
   return (
     `run-to-node scope for node ${toNodeId} cannot be dispatched safely: the ` +
     `prompt could not be fingerprinted (graphToPrompt failed), so the panel ` +
     `cannot distinguish its own dispatch from unrelated queue traffic. ` +
+    `${reason}` +
     `Nothing was queued rather than risk a full-graph execution (#556).`
+  );
+}
+
+/** How many characters of a thrown serializer error are worth quoting verbatim. */
+const FINGERPRINT_CAUSE_CAP = 400;
+
+/**
+ * The `cause` clause for {@link scopeUnattributableError}: the serializer's own words,
+ * bounded, or nothing at all when there were none.
+ *
+ * Deliberately says WHERE the text came from. An unattributed sentence in the middle of
+ * a panel refusal reads as the panel's own diagnosis, and this one is a third party's —
+ * ComfyUI's serializer, or whatever extension is patched into it.
+ */
+export function describeFingerprintFailure(cause) {
+  const raw = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  const text = raw.trim().replace(/\s+/g, " ");
+  if (!text) return "";
+  const quoted = text.length > FINGERPRINT_CAUSE_CAP ? `${text.slice(0, FINGERPRINT_CAUSE_CAP)}…` : text;
+  return (
+    `ComfyUI's serializer failed with: "${quoted}" — that is the frontend's own error, ` +
+    `not the panel's diagnosis of it. A graph left unserializable by an earlier edit ` +
+    `(comfyui-mcp#1571: a subgraph conversion that dropped a boundary link) fails here ` +
+    `whatever node you scope to, so this is not specific to run-to-node or to nesting. `
   );
 }
 
@@ -872,14 +1095,31 @@ export function scopeUnattributableError({ toNodeId }) {
  *    verified prompts DID queue (scoped); only the unverified remainder is
  *    in doubt.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1, inFlight = 0 }) {
+export function scopeUnverifiedError({
+  toNodeId,
+  timeoutMs,
+  cancelled = false,
+  verified = 0,
+  batch = 1,
+  inFlight = 0,
+  budgetMs = 0,
+}) {
   const count =
     verified > 0
       ? ` (${verified} of ${batch} batch prompts WERE verified and are queued with the scope)`
       : "";
+  // #1565 — SAY WHICH CLOCK RAN OUT. When the command budget is what expired, the
+  // per-attempt figure is whatever slice was left (as little as 1 ms) and quoting it
+  // would describe a wait nobody made. The budget is also the actionable number: it
+  // tells the reader the panel STOPPED WAITING ON PURPOSE, inside the window its reply
+  // is relayed in, rather than that their frontend answered in 0s.
+  const waited =
+    budgetMs > 0
+      ? `within this run's whole ${Math.round(budgetMs / 1000)}s command budget`
+      : `within ${Math.round(timeoutMs / 1000)}s of queueing`;
   const base =
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
-    `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
+    `dispatch was observed ${waited} ` +
     `(the frontend deferred or silently dropped the request)${count}. `;
   // IN FLIGHT ≠ NEVER SENT (codex gate r9). A correctly-scoped request that has
   // already left the panel but whose response has not come back yet is neither
@@ -984,21 +1224,71 @@ export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
   );
 }
 
-// Capture the #358 top-level rejection / #370 prompt_id out of a /prompt
-// response that is ATTRIBUTED to this run. prompt_id is normalized to a string
-// at capture (0 and "0" are the same run).
-async function captureRunResponse(res, { onRejection, onPromptId }) {
+/**
+ * #1504 — node_errors on an ACCEPTED (200) reply are dropped outputs, not a refusal.
+ *
+ * ComfyUI's `validate_prompt` validates each output independently and keeps the ones
+ * that pass (`good_outputs`). When at least one survives, server.py takes the
+ * `if valid[0]:` branch — it mints a prompt id, calls `prompt_queue.put(...)`, and
+ * answers
+ *
+ *     web.json_response({"prompt_id": …, "number": …, "node_errors": valid[3]})
+ *
+ * with status **200**. So an accepted, already-executing prompt can carry a populated
+ * `node_errors` map naming the outputs it dropped ("Output will be ignored").
+ *
+ * That map is ALSO what the frontend stores: `app.queuePrompt` calls
+ * `recordNodeErrors(res.node_errors)` on the resolved (200) response, so
+ * `app.lastNodeErrors` is populated for a run that is on the GPU right now. Reading
+ * only that channel is what made graph_run answer "ComfyUI refused to queue the
+ * workflow" for six VAEDecode nodes whose branches were bypassed — while the render
+ * they belonged to was running, and every following graph read came back QUEUE BUSY.
+ *
+ * The 200 body is the authoritative, non-stale source for both halves: it says a
+ * prompt id was minted AND which outputs were dropped, in one structured receipt.
+ * `lastNodeErrors` cannot distinguish those two cases at all.
+ */
+function normalizePromptId(value) {
+  if (value == null) return null;
+  const id = String(value).trim();
+  return id || null;
+}
+
+async function captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors, onMissingPromptId }) {
   try {
     const body = await res.clone().json();
     if (res.status !== 200) {
       if (body && (body.error || body.node_errors)) {
         onRejection?.({ error: body.error ?? null, node_errors: body.node_errors ?? null });
+      } else {
+        onMissingPromptId?.();
       }
-    } else if (body && body.prompt_id != null) {
-      onPromptId?.(String(body.prompt_id));
+    } else {
+      const promptId = normalizePromptId(body?.prompt_id);
+      if (promptId != null) {
+        onPromptId?.(promptId);
+        reportAcceptedNodeErrors(body, onAcceptedNodeErrors);
+      } else {
+        // A 200 proves the request reached the server, but without a usable
+        // receipt it cannot prove which batch item was accepted or correlate
+        // its completion. Do not let stale app.lastNodeErrors turn this into
+        // a definitive refusal.
+        onMissingPromptId?.();
+      }
     }
   } catch {
-    // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
+    // An unreadable body cannot establish either a definitive refusal or a
+    // usable acceptance receipt, regardless of status. Keep the acknowledgement
+    // uncertain so a mixed batch cannot be reported as fully queued.
+    onMissingPromptId?.();
+  }
+}
+
+/** Forward a 200 reply's non-empty `node_errors` (the #1504 partial-validation drops). */
+function reportAcceptedNodeErrors(body, onAcceptedNodeErrors) {
+  const ne = body?.node_errors;
+  if (ne && typeof ne === "object" && !Array.isArray(ne) && Object.keys(ne).length) {
+    onAcceptedNodeErrors?.(ne);
   }
 }
 
@@ -1008,13 +1298,15 @@ async function captureRunResponse(res, { onRejection, onPromptId }) {
 // captured through the established #358 channel); "malformed" for anything
 // else (2xx without a prompt_id, non-200 without a rejection body, unparseable
 // body, missing response). Only "accepted" may ever count as verified.
-async function classifyRunResponse(res, { onRejection, onPromptId }) {
+async function classifyRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors }) {
   if (!res) return "malformed";
   try {
     const body = await res.clone().json();
     if (res.status === 200) {
-      if (body && body.prompt_id != null) {
-        onPromptId?.(String(body.prompt_id));
+      const promptId = normalizePromptId(body?.prompt_id);
+      if (promptId != null) {
+        onPromptId?.(promptId);
+        reportAcceptedNodeErrors(body, onAcceptedNodeErrors); // #1504
         return "accepted";
       }
       return "malformed";
@@ -1036,15 +1328,62 @@ async function classifyRunResponse(res, { onRejection, onPromptId }) {
  * lands on lastNodeErrors), so the raw non-200 /prompt body is the only place
  * that error exists; and EVERY accepted prompt_id is captured for the recovery
  * ledger. Installed only for the duration of the queuePrompt call.
+ *
+ * #1565 — IT ALSO COUNTS WHAT LEFT. `interceptor.state` is live:
+ *   - `posted`   /prompt requests this run handed to the network, ever;
+ *   - `inFlight` those whose response has not come back yet.
+ *   - `missingPromptIds` responses that did come back but carried no usable
+ *     prompt_id receipt (including an unreadable/empty acknowledgement).
+ * A full run whose `app.queuePrompt` is abandoned at the command budget has to say
+ * whether anything actually left the panel, and "nothing was queued" and "a request
+ * is in flight" are different answers with different retry advice — only one of them
+ * is safe to act on blindly. This is the only place that sees the request leave, so
+ * it is the only place that can answer it from observation rather than assumption.
  */
-export function createRunFetchInterceptor({ origFetchApi, onRejection = null, onPromptId = null } = {}) {
-  return async function runFetchInterceptor(route, options) {
-    const res = await origFetchApi(route, options);
-    if (isPromptPost(route, options) && res) {
-      await captureRunResponse(res, { onRejection, onPromptId });
+export function createRunFetchInterceptor({
+  origFetchApi,
+  onRejection = null,
+  onPromptId = null,
+  onAcceptedNodeErrors = null,
+} = {}) {
+  const state = { posted: 0, inFlight: 0, missingPromptIds: 0 };
+  const interceptor = async function runFetchInterceptor(route, options) {
+    // Classified BEFORE the request leaves, because that is the only moment at which
+    // "this one is ours to count" can still be decided. Guarded: reading `options`
+    // is itself an operation that can throw (a throwing getter, a Proxy), and this
+    // used to run only AFTER the fetch — so a throw here must not be able to stop a
+    // request that previously went out. An unreadable request is simply not counted.
+    let isPost = false;
+    try {
+      isPost = isPromptPost(route, options);
+    } catch {
+      isPost = false;
     }
-    return res;
+    if (isPost) {
+      state.posted++;
+      state.inFlight++;
+    }
+    try {
+      const res = await origFetchApi(route, options);
+      if (isPost) {
+        if (res) {
+          await captureRunResponse(res, {
+            onRejection,
+            onPromptId,
+            onAcceptedNodeErrors,
+            onMissingPromptId: () => state.missingPromptIds++,
+          });
+        } else {
+          state.missingPromptIds++;
+        }
+      }
+      return res;
+    } finally {
+      if (isPost) state.inFlight--;
+    }
   };
+  interceptor.state = state;
+  return interceptor;
 }
 
 /**
@@ -1089,11 +1428,12 @@ export function createScopedRunGuard({
   repairScope = false,
   onRejection = null,
   onPromptId = null,
+  onAcceptedNodeErrors = null,
   onScopeDropped = null,
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null, prunedRetry: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -1221,6 +1561,20 @@ export function createScopedRunGuard({
       let res;
       try {
         res = await origFetchApi(route, forwardOptions);
+        // comfyui-mcp#1871 — ComfyUI refuses a prompt whose OTHER branch names a class
+        // this server does not have, before it ever looks at partial_execution_targets.
+        // That refusal queued nothing (structured proof: non-2xx, a top-level `error`,
+        // no prompt_id), and the node it names is one this run's own scope excluded —
+        // so the requested branch gets ONE more post, with the excluded nodes left out.
+        // Null for every other outcome, including an accepted prompt: a run ComfyUI
+        // takes never reaches a second post, and the response below is the first one.
+        const retry = await prunedRetryForRejection(res, forwardOptions?.body, expected);
+        if (retry) {
+          // Record BEFORE the post, so a retry that throws is still disclosed as having
+          // been attempted rather than vanishing into the dispatch-failure message.
+          state.prunedRetry = { namedNode: retry.namedNode, removed: retry.removed };
+          res = await origFetchApi(route, { ...forwardOptions, body: retry.text });
+        }
       } catch (err) {
         // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
         // after ComfyUI already received and queued the prompt — a reset while
@@ -1242,7 +1596,11 @@ export function createScopedRunGuard({
         notify();
         throw err; // the frontend sees exactly the failure it would have seen
       }
-      const verdict = await classifyRunResponse(res, { onRejection, onPromptId });
+      const verdict = await classifyRunResponse(res, {
+        onRejection,
+        onPromptId,
+        onAcceptedNodeErrors,
+      });
       // The request DID leave, so the reservation is now settled into a
       // definite outcome. A malformed response keeps the slot consumed on
       // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
@@ -1435,10 +1793,73 @@ export async function dispatchScopedRun({
   toNodeId = null,
   verifyTimeoutMs = 5000,
   queueMark = null,
+  budget = null,
   onRejection = null,
   onPromptId = null,
+  onAcceptedNodeErrors = null,
 } = {}) {
   const mark = queueMark ?? newScopedQueueMark();
+  // #1565 — ONE DEADLINE FOR THE WHOLE DISPATCH, so the per-attempt bounds COMPOSE.
+  //
+  // Every wait in this function used to start its own fresh clock: four argument
+  // shapes are tried in sequence, and each one that reached no verdict paid a full
+  // `verifyTimeoutMs`. 4 × 5,000 ms is 20,000 ms — EXACTLY the window `panel_run`
+  // relays `graph_run` in — so on a frontend whose queue processor is busy (the
+  // reporter had user Queue presses interleaved with agent runs) the command could
+  // not answer, or refuse, inside its own reply window. MEASURED on the shipped
+  // module with a busy processor draining at 4,990 ms/item: dispatchScopedRun took
+  // 20,003 ms and the prompt POSTED at 20,003 ms — after the caller had already been
+  // told the tab "may be backgrounded or frozen". A retry then renders twice.
+  //
+  // `budget.bounded(ms)` caps every allowance by what the COMMAND has left, so the
+  // sum can never exceed it. NO BUDGET ⇒ NO BOUND: `withTimeout` treats ms <= 0 as
+  // no bound, so a caller that supplies none keeps today's behaviour byte for byte
+  // (the panel's own call site always supplies one — see graph_run).
+  const hasBudget = !!budget && typeof budget.bounded === "function";
+  /** The bound for one step, capped by what the command has left; 0 (= unbounded) with no budget. */
+  const boundedBy = (ms) => (hasBudget ? budget.bounded(ms) : 0);
+  /**
+   * This attempt's FAIR SHARE of what is left. A fresh `verifyTimeoutMs` per attempt is
+   * what failed to compose; handing the first attempt everything would be the same defect
+   * with a different shape — on the reporter's build the ONLY argument shape that carries
+   * the scope is the LAST one (they reported `scope_applied_by:"request_body_repair"` on
+   * every successful run), so an allocation that starves the later attempts would refuse
+   * the runs that work today. Never MORE than the caller's own `verifyTimeoutMs`.
+   */
+  const shareFor = (attemptsLeft) => {
+    if (!hasBudget) return verifyTimeoutMs;
+    const left = typeof budget.remaining === "function" ? budget.remaining() : 0;
+    const share = Math.floor(left / Math.max(1, attemptsLeft));
+    return budget.bounded(Math.min(verifyTimeoutMs, share));
+  };
+  /**
+   * The command budget's total, but ONLY when the budget is what SHORTENED this attempt's
+   * wait — i.e. the slice came out below the caller's own `verifyTimeoutMs`. Then the
+   * per-attempt figure describes a wait the budget imposed, and rounding it to seconds can
+   * read as "0s", which is a wait nobody made. A give-up that happens while the command
+   * still had room for a full slice is honestly a per-attempt give-up and keeps saying so.
+   */
+  const budgetShortened = (attemptMs) =>
+    hasBudget && attemptMs < verifyTimeoutMs ? Number(budget.totalMs) || 0 : 0;
+  // Sentinel for a bounded step that did not settle. A Symbol so it can never collide
+  // with a value the bounded promise itself resolves.
+  const TIMED_OUT = Symbol("cmcp-run-step-timeout");
+  /**
+   * Await `promise` under `ms`, PRESERVING ITS REJECTION. `withTimeout` folds a
+   * rejection into its timeout fallback, which here would turn a frontend that THREW
+   * (today: propagates out of graph_run and is reported as the error it is) into one
+   * that "timed out" — a different, wrong story. Settling into {value}/{error} first
+   * keeps the two apart; the caller re-throws.
+   */
+  const boundedStep = (promise, ms) =>
+    withTimeout(
+      Promise.resolve(promise).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      ),
+      ms,
+      () => TIMED_OUT,
+    );
   // CHAIN COMPOSITION (codex gate r8). Both the entry-time capture below and
   // the per-attempt restore used to be WRONG in the presence of a concurrent
   // run:
@@ -1458,7 +1879,8 @@ export async function dispatchScopedRun({
   //      never unhooked. Nothing in this module writes apiTarget.fetchApi back
   //      to an older value any more, so no run can displace another's guard.
   const entryFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
-  const origFetchApi = entryFetchApi ? entryFetchApi.bind(apiTarget) : null;
+  // #1854 — invoked through Function.prototype.call; see configure-app-mode.js.
+  const origFetchApi = entryFetchApi ? (...a) => rawApply(entryFetchApi, apiTarget, a) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
@@ -1482,20 +1904,44 @@ export async function dispatchScopedRun({
   let contentHash = null;
   let contentCanon = null;
   let volatileInputs = null;
+  // #1571 — KEEP what was thrown. The refusal below is the only thing the caller sees,
+  // and without this the serializer's own message (which names the offending node) was
+  // discarded at exactly the moment it was needed.
+  let fingerprintCause = null;
   try {
     if (typeof app.graphToPrompt === "function") {
       // This panel's live root is app.graph (r8) — app.rootGraph only as a
       // fallback for frontends that expose it instead.
       volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
-      contentCanon = canonicalizePrompt((await app.graphToPrompt())?.output, volatileInputs);
+      // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
+      // does that the read path never does, and an extension's serializeValue that never
+      // settles held the command open with no bound at all. A serializer that will not
+      // answer leaves no fingerprint, which is already the fail-closed state below:
+      // `unverifiable`, nothing queued, and the cause named.
+      const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
+      if (built === TIMED_OUT) {
+        throw new Error(
+          `app.graphToPrompt did not answer within this run's command budget — the ` +
+            `frontend could not serialize the workflow, so nothing was queued`,
+        );
+      }
+      // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
+      // used to propagate out of here, and a bound must not swallow it.
+      if ("error" in built) throw built.error;
+      contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
       contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
     }
-  } catch {
+  } catch (err) {
     contentHash = null;
     contentCanon = null;
+    fingerprintCause = err;
   }
   if (!contentHash) {
-    return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
+    return {
+      outcome: "unverifiable",
+      queueMark: mark,
+      error: scopeUnattributableError({ toNodeId, cause: fingerprintCause }),
+    };
   }
   // #572/#1124 — the inputs this run does NOT drift-cover (queue-time hook
   // carriers plus their linked, serialized targets; and an armed rgthree Seed
@@ -1537,8 +1983,10 @@ export async function dispatchScopedRun({
     // which may be another run's live sentinel, or our own previous attempt.
     // Capturing the run's entry-time fetchApi here instead would bypass a
     // newer run's guard entirely (r8 P0).
-    const chainBelow =
-      typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi.bind(apiTarget) : origFetchApi;
+    // #1854 — captured into a local FIRST so this still snapshots the fetchApi
+    // installed RIGHT NOW, which is the whole point of the note above.
+    const chainBelowFn = typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi : null;
+    const chainBelow = chainBelowFn ? (...a) => rawApply(chainBelowFn, apiTarget, a) : origFetchApi;
     const guard = createScopedRunGuard({
       origFetchApi: chainBelow,
       execIds,
@@ -1551,16 +1999,33 @@ export async function dispatchScopedRun({
       repairScope: repair,
       onRejection,
       onPromptId,
+      onAcceptedNodeErrors,
     });
     apiTarget.fetchApi = guard;
+    // #1565 — this attempt's slice of the command budget, taken ONCE so the queue
+    // call and the observation wait are quoted the same number in the refusal.
+    const attemptMs = shareFor(attempts.length - attemptIndex);
     try {
-      await app.queuePrompt(mark, batch, scopeArg);
+      // #1565 — BOUNDED. `await app.queuePrompt(…)` had no bound of any kind, and it is
+      // the single most reachable hang on the run path: the reporter's own machine has
+      // BOTH `app.queuePrompt` and `api.queuePrompt` shadowed by an extension's own
+      // property, and a wrapper that never settles held graph_run open forever while
+      // reads on the same tab answered in 0.06 ms (MEASURED against this module).
+      //
+      // Abandoning the wait is safe HERE and only here: falling through with no verdict
+      // is the state the give-up path below already exists for — it cancels the still-
+      // pending queue item and, either way, CLOSES this guard, so a post the abandoned
+      // queuePrompt emits later still meets the fence and is refused rather than
+      // dispatched scopeless. A throw is re-thrown unchanged (boundedStep keeps it).
+      const queued = await boundedStep(app.queuePrompt(mark, batch, scopeArg), boundedBy(attemptMs));
+      // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
+      if (queued !== TIMED_OUT && "error" in queued) throw queued.error;
       if (!guard.verdictReached()) {
         // queuePrompt returned without our dispatch surfacing — the
         // frontend's processor was busy and will serialize/post the item
         // LATER. Keep the guard installed and wait for the WHOLE batch to be
         // accounted (r5: never dispatched on a partial count), or the timeout.
-        await guard.waitForVerdict(verifyTimeoutMs);
+        await guard.waitForVerdict(attemptMs);
       }
       if (!guard.verdictReached()) {
         // GIVE-UP. The guard stays (that is now the default — the finally only
@@ -1600,7 +2065,7 @@ export async function dispatchScopedRun({
             indeterminate: guard.state.indeterminate,
             inFlight,
             volatileInputs: volatileList,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch, inFlight }),
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: true, verified, batch, inFlight, budgetMs: budgetShortened(attemptMs) }),
           };
         }
         return {
@@ -1610,7 +2075,7 @@ export async function dispatchScopedRun({
           indeterminate: guard.state.indeterminate,
           inFlight,
           volatileInputs: volatileList,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch, inFlight }),
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: false, verified, batch, inFlight, budgetMs: budgetShortened(attemptMs) }),
         };
       }
       // r6: a dispatch FAILURE with the batch not fully accounted — the
@@ -1676,6 +2141,10 @@ export async function dispatchScopedRun({
     }
     // r6: the dispatch itself failed (fetch threw / malformed response) —
     // terminal, truthful, NEVER queued:true.
+    // comfyui-mcp#1871 — every terminal return carries `prunedRetry`: when ComfyUI
+    // refused the first post over a node on ANOTHER branch and the run only queued
+    // because a second post left that branch out, this is the only place the caller
+    // can learn it happened. Null on every run that was accepted first time.
     if (guard.state.failed != null) {
       return {
         outcome: "failed",
@@ -1683,6 +2152,7 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
         error: guard.state.failed +
           (!retireGuard
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
@@ -1702,6 +2172,7 @@ export async function dispatchScopedRun({
         repairedFromKeys: guard.state.repairedFromKeys,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
       };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
@@ -1728,6 +2199,7 @@ export async function dispatchScopedRun({
         overrunNote: guard.state.overrunError,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
       };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
@@ -1754,6 +2226,7 @@ export async function dispatchScopedRun({
       verified: guard.state.observed,
       indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+      prunedRetry: guard.state.prunedRetry,
       error: scopePartialBatchError({
         toNodeId,
         verified: guard.state.observed,

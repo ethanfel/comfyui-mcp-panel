@@ -20,6 +20,13 @@
  *
  * This module answers the question the failure raises: WHERE is it, then?
  *
+ * #1298 is the sibling when the answer is NOWHERE. A mutation after a graph
+ * change (the user deleted nodes; a load remapped ids) used to stop at "not in
+ * the current graph" and send the caller to re-read. The re-read is a second
+ * round-trip they already had the evidence for: the live graph the write just
+ * searched. The genuine-miss path now names the current ids on the graph the
+ * mutation applied to, so the next call can retarget without another outline.
+ *
  * SEARCH IS BOUNDED AND NON-THROWING. It runs only on the failure path, and any
  * unexpected shape simply ends that branch — a diagnostic that throws would replace a
  * bad error with a worse one.
@@ -39,8 +46,24 @@
  * with a plausible-looking shape.
  */
 
+import { canonicalNodeId } from "./node-id.js";
+
 /** Depth guard for a pathological/looping graph. Real workflows nest a handful deep. */
 const MAX_DEPTH = 12;
+
+/**
+ * Cap on ids named in a genuine-miss error. The list exists so a mutation can
+ * retarget without another outline call (#1298); it is not a substitute for
+ * outline, so a 200-node dump would hide the diagnosis.
+ */
+const MAX_CURRENT_IDS = 40;
+
+/**
+ * The opening of the retarget suffix, named once because #1495's message has to ask
+ * whether the suffix actually NAMES ids (it degrades to "…has no nodes" on an empty
+ * graph) before it may offer it as the remedy. A second literal here would drift.
+ */
+const CURRENT_IDS_PREFIX = "Current ids on the graph you are viewing: ";
 
 function nodesOf(graph) {
   const raw = graph?._nodes ?? graph?.nodes;
@@ -48,24 +71,33 @@ function nodesOf(graph) {
 }
 
 /**
- * Find a node by its LOCAL id anywhere in the workflow, reporting the route to it.
+ * Find a node by its local integer or subgraph-qualified id anywhere in the
+ * workflow, reporting the route to it.
  *
  * @param {object} rootGraph the workflow's root graph
- * @param {number|string} nodeId the local id being looked up
- * @returns {null | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>}}
+ * @param {number|string} nodeId the id being looked up
+ * @returns {null | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>} | {undetermined: "threw"|"unparseable"}}
  *   `hostPath` is the chain of subgraph HOST nodes to enter, outermost first; empty
  *   for a node on the root graph.
+ *   `null` is a completed search that found nothing. `undetermined` is the
+ *   distinct "could not look" answer (#1501): the walk threw, or the id is not
+ *   a searchable local/qualified form. Callers must not treat it as a miss.
  */
 export function locateNodeAcrossScopes(rootGraph, nodeId) {
-  const target = Number(nodeId);
-  if (!Number.isFinite(target)) return null;
+  // #1425 / #1501 — a qualified id (`120:104`) is not a finite number. Number()
+  // here used to return null before searching, and the consumer spelled that as
+  // "may be from a different workflow". Use the same identity the writes use.
+  const target = canonicalNodeId(nodeId);
+  if (typeof target === "number" && !Number.isFinite(target)) {
+    return { undetermined: "unparseable" };
+  }
   const seen = new Set();
 
   const walk = (graph, hostPath, depth) => {
     if (!graph || depth > MAX_DEPTH || seen.has(graph)) return null;
     seen.add(graph);
     for (const n of nodesOf(graph)) {
-      if (Number(n?.id) === target) {
+      if (n?.id != null && canonicalNodeId(n.id) === target) {
         return { scope: hostPath.length ? "subgraph" : "root", hostPath };
       }
     }
@@ -82,7 +114,9 @@ export function locateNodeAcrossScopes(rootGraph, nodeId) {
   try {
     return walk(rootGraph, [], 0);
   } catch {
-    return null; // a diagnostic must never throw
+    // a diagnostic must never throw — but null is "searched and absent", and
+    // the consumer used to publish that as a fact about the node (#1501)
+    return { undetermined: "threw" };
   }
 }
 
@@ -108,32 +142,126 @@ export function countSubgraphs(rootGraph) {
 }
 
 /**
+ * Current ids on the graph a mutation actually applied to, so a genuine miss
+ * can name what IS addressable (#1298). Best-effort and non-throwing: a
+ * diagnostic that throws replaces a bad error with a worse one.
+ *
+ * The missing id is filtered out even if `_nodes` and `getNodeById` have
+ * drifted — listing it as live would send the caller back at the same miss.
+ */
+function currentIdSuffix(graph, nodeId) {
+  if (!graph) return "";
+  try {
+    const wanted = nodeId == null ? "" : String(nodeId);
+    const parts = [];
+    for (const n of nodesOf(graph)) {
+      if (n?.id == null) continue;
+      if (wanted && String(n.id) === wanted) continue;
+      const type =
+        typeof n.type === "string" && n.type
+          ? n.type
+          : typeof n.comfyClass === "string" && n.comfyClass
+            ? n.comfyClass
+            : "";
+      parts.push(type ? `${n.id} (${type})` : `${n.id}`);
+    }
+    if (!parts.length) {
+      return (
+        "The graph you are viewing currently has no nodes. " +
+        "Re-read with panel_graph_outline before retrying."
+      );
+    }
+    const shown = parts.slice(0, MAX_CURRENT_IDS);
+    const extra =
+      parts.length > MAX_CURRENT_IDS ? `, …and ${parts.length - MAX_CURRENT_IDS} more` : "";
+    return (
+      `${CURRENT_IDS_PREFIX}${shown.join(", ")}${extra}. ` +
+      `Retarget using a current id; re-read with panel_graph_outline if you need wiring.`
+    );
+  } catch {
+    return "";
+  }
+}
+
+/**
  * The message for a node id that did not resolve in the current graph.
  *
  * Always begins `No node with id <id>` so existing callers/tests that match that
  * prefix are unaffected.
  *
  * @param {number|string} nodeId
- * @param {object|null} rootGraph  null/absent ⇒ the plain message, unchanged
+ * @param {object|null} rootGraph  null/absent ⇒ the plain message, unless
+ *   `currentGraph` can still name live ids
  * @param {boolean} viewingRoot    true when the current graph IS the root
+ * @param {object|null} [currentGraph]  the graph the mutation applied to (the
+ *   one `getNodeById` just searched). When omitted, the root is used only if
+ *   `viewingRoot` is true — a subgraph view must not be told the root's ids.
  */
-export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
+export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph) {
   const base = `No node with id ${nodeId} in the current graph`;
-  if (!rootGraph) return base;
+  const graphForIds = currentGraph ?? (viewingRoot ? rootGraph : null);
+  const ids = currentIdSuffix(graphForIds, nodeId);
+  if (!rootGraph) return ids ? `${base}. ${ids}` : base;
 
   const found = locateNodeAcrossScopes(rootGraph, nodeId);
+  // #1501 — `null` used to mean three things (absent, threw, unparseable) and
+  // this branch could only spell one of them. An inconclusive walk must not
+  // claim the node is missing from the workflow.
+  if (found?.undetermined) {
+    const detail =
+      found.undetermined === "unparseable"
+        ? `${nodeId} is not a local integer or a subgraph-qualified id (e.g. 120:104), so the other scopes were not searched`
+        : `a walk of the other scopes threw before it finished, so their contents were not determined`;
+    return (
+      `${base} — this is not a finding that the node is absent from the rest of the workflow: ${detail}. ` +
+      (ids || `Re-read with panel_graph_outline before retrying.`)
+    );
+  }
   if (!found) {
     const subs = countSubgraphs(rootGraph);
     return (
       `${base} — and it is not in any other scope either ` +
       `(searched the root graph${subs ? ` and ${subs} subgraph(s)` : ""}). ` +
       `The id may be from a different workflow, or the node was removed. ` +
-      `Re-read with panel_graph_outline before retrying.`
+      (ids || `Re-read with panel_graph_outline before retrying.`)
     );
   }
 
   if (found.scope === "root") {
-    // Only reachable while viewing a subgraph, so the remedy is to leave it.
+    // #1495 — this branch used to assert "you are currently inside a subgraph"
+    // unconditionally, on the premise the old comment here stated: that it was
+    // "only reachable while viewing a subgraph". Nothing enforces that premise.
+    // The branch fires whenever the ROOT walk finds the id, and the ROOT walk reads
+    // the graph's node LIST (`_nodes`) while the lookup that just missed reads the
+    // id INDEX (`getNodeById`) — the same two sources `currentIdSuffix` above
+    // already assumes can drift. When they drift on the root graph, the caller is
+    // AT root and is told to leave a subgraph they are not in. The reporter ran
+    // exactly that: panel_exit_subgraph answered "already at root", and the retry
+    // that followed succeeded. The wasted round-trip IS the defect, and its cause
+    // is a scope claim published without checking the scope.
+    //
+    // So decide it from evidence THIS call holds. `currentGraph` is the graph the
+    // failed lookup actually searched, so `currentGraph === rootGraph` is
+    // same-reading object identity. `viewingRoot` is a separately-timed reading of
+    // the viewing scope (resolveNode takes it AFTER the lookup, from a second
+    // getGraphCtx()), so it is only consulted when no `currentGraph` was passed.
+    const searchedRoot = currentGraph ? currentGraph === rootGraph : Boolean(viewingRoot);
+    if (searchedRoot) {
+      // The retarget list is offered only when it actually names ids: on a graph
+      // whose only node is the missing one it degrades to "has no nodes", which
+      // would contradict the sentence right before it.
+      const retarget = ids.startsWith(CURRENT_IDS_PREFIX)
+        ? ids
+        : "Re-read with panel_graph_outline before retrying.";
+      return (
+        `${base} — but node ${nodeId} IS on the root graph, and the root graph is what ` +
+        `you are VIEWING, so this is NOT a subgraph scope problem: panel_exit_subgraph ` +
+        `would answer "already at root" and change nothing. The root graph's node list ` +
+        `holds ${nodeId} while the id lookup this write uses did not resolve it, so the ` +
+        `id and that graph's index disagree. ` +
+        retarget
+      );
+    }
     return (
       `${base}. Node ${nodeId} is on the ROOT graph, but you are currently inside a ` +
       `subgraph — the write applies to the graph you are VIEWING, not the whole ` +
@@ -177,10 +305,12 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
  * even true of the panel's own tool surface.
  *
  * WHAT IS AND IS NOT CLAIMED. It says what the id is, that this operation works on
- * ordinary nodes, and what does work today. It does NOT promise a removal path,
- * because there is none: `expose_subgraph_input`/`expose_subgraph_output`/`move_rail`
- * exist and no unexpose does. Naming the invasive workaround is honest; inventing a
- * tool name would send the caller to a command that does not exist.
+ * ordinary nodes, and what does work today. Removal now exists —
+ * `panel_unexpose_subgraph_input`/`panel_unexpose_subgraph_output` take a slot's
+ * NAME (artokun/comfyui-mcp#1294) — but a RAIL id is refused there too, because it
+ * names the whole rail, not a slot on it; the message must not read as "pass -20 to
+ * unexpose". The interior-node workaround stays named for the caller who wants the
+ * slot and its source gone together.
  *
  * @param {number|string} nodeId
  * @param {"input"|"output"} rail
@@ -195,10 +325,11 @@ export function describeRailNodeTarget(nodeId, rail) {
     `panel_move_node DOES accept a rail id, but only to reposition it (pos only — a ` +
     `rail has nothing else to set); panel_move_rail addresses the same rail by SIDE ` +
     `("${rail}") rather than by id. ` +
-    `There is currently NO unexpose/remove-boundary operation: expose_subgraph_input, ` +
-    `expose_subgraph_output and panel_move_rail are the whole boundary surface. To ` +
-    `REMOVE an exposed slot today, remove or replace the interior node feeding it and ` +
-    `the boundary slot is cleaned up automatically. ` +
+    `To REMOVE one slot from this rail, panel_unexpose_subgraph_input / ` +
+    `panel_unexpose_subgraph_output take the slot's NAME as panel_query_graph lists ` +
+    `it under rails.${rail} — a rail id is refused there too, because it names the ` +
+    `whole rail, not a slot on it. Removing or replacing the interior node feeding ` +
+    `a slot also cleans the slot up automatically. ` +
     // The one thing this CANNOT rule out, stated rather than glossed over: node ids
     // are arbitrary integers, so an ordinary node may once have held this id and been
     // removed. Then the id really is stale and re-reading is right — which is why the

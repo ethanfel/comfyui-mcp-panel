@@ -27,6 +27,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { SET_WIDGET_POST_REFRESH_RESERVE_MS } from "./_panel-constants.mjs";
+import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 const panelSrc = readFileSync(PANEL_JS, "utf8");
@@ -34,30 +38,54 @@ const panelSrc = readFileSync(PANEL_JS, "utf8");
 // Drive the SHIPPED callback, not a transcription of it. The other set-widget
 // suites re-implement `refreshCombos` in the test file, so none of them would
 // notice this wiring changing.
-const match = panelSrc.match(/refreshCombos: \(defs, target, concreteType, nameMap\) => \{[\s\S]*?\n {6}\},/);
+const match = panelSrc.match(/refreshCombos: async \(defs, target, concreteType, nameMap\) => \{[\s\S]*?\n {6}\},/);
 assert.ok(match, "could not locate the panel's refreshCombos wiring");
 
-function shippedRefreshCombos({ onFromDefs, onFullRefresh }) {
+function shippedRefreshCombos({
+  onFromDefs,
+  onFullRefresh,
+  // #1413 — the callback now draws its join bound from the command budget the handler
+  // took on its first line. A healthy command's remainder, by default.
+  budget = { remaining: () => 21000 },
+  // #1418 — the coalescer's live slot, read to tell "a run is still going" apart from
+  // "nothing was started". Empty by default.
+  nodeDefRefreshInFlight = null,
+}) {
   const body = match[0].replace(/^refreshCombos: /, "");
   const factory = new Function(
     "refreshComboOptionsFromDefs",
     "refreshComfyNodeDefs",
+    "budget",
+    "SET_WIDGET_POST_REFRESH_RESERVE_MS",
+    "nodeDefRefreshInFlight",
+    "REFRESH_JOIN_ABANDONED",
+    "COMBO_REFRESH_NEVER_RAN",
     `return (${body.replace(/,$/, "")});`,
   );
-  return factory(onFromDefs, onFullRefresh);
+  return factory(
+    onFromDefs,
+    onFullRefresh,
+    budget,
+    SET_WIDGET_POST_REFRESH_RESERVE_MS,
+    nodeDefRefreshInFlight,
+    REFRESH_JOIN_ABANDONED,
+    COMBO_REFRESH_NEVER_RAN,
+  );
 }
 
-function spies() {
-  const calls = { fromDefs: [], full: 0 };
+function spies(overrides = {}) {
+  const calls = { fromDefs: [], full: 0, fullArgs: [] };
   const fn = shippedRefreshCombos({
     onFromDefs: (target, defs, type, nameMap) => {
       calls.fromDefs.push({ target, defs, type, nameMap });
       return 1;
     },
-    onFullRefresh: () => {
+    onFullRefresh: (...args) => {
       calls.full++;
+      calls.fullArgs.push(args);
       return Promise.resolve("full");
     },
+    ...overrides,
   });
   return { fn, calls };
 }
@@ -116,4 +144,65 @@ test("#767 nameMap still reaches the refresh for a RENAMED nested promotion", ()
   const nameMap = { outer_name: "ckpt_name" };
   fn(DEFS, TARGET, "CheckpointLoaderSimple", nameMap);
   assert.equal(calls.fromDefs[0].nameMap, nameMap);
+});
+
+test("#1413 the full-refresh fallback is bounded by the command's remaining budget", () => {
+  // The whole point of the issue: this await used to be a bare `refreshComfyNodeDefs()`,
+  // a plain join of a run someone else started with no bound at all, inside the 30s relay
+  // window. Deleting the joinMs from the panel must fail HERE — a lib-level test cannot
+  // see the wiring, and the other suites re-implement this callback.
+  const budget = { remaining: () => 12345 };
+  const { fn, calls } = spies({ budget });
+  fn(undefined, TARGET, "CheckpointLoaderSimple", null);
+  assert.equal(calls.full, 1, "the fallback still runs");
+  assert.deepEqual(
+    calls.fullArgs[0],
+    [undefined, { joinMs: 12345 - SET_WIDGET_POST_REFRESH_RESERVE_MS }],
+    "joinMs is the command's remainder minus the reserve — not a fresh constant, not absent",
+  );
+});
+
+test("#1413 an exhausted command hands the coalescer a non-positive joinMs, not silence", () => {
+  // The coalescer treats joinMs <= 0 as "abandon WITHOUT awaiting" (withTimeout would read
+  // it as NO BOUND), which is the honest refusal the lib then raises. Wiring that dropped
+  // the joinMs instead would restore the unbounded hang at exactly the worst moment.
+  const budget = { remaining: () => -50 };
+  const { fn, calls } = spies({ budget });
+  fn(undefined, TARGET, "CheckpointLoaderSimple", null);
+  assert.equal(calls.full, 1);
+  const { joinMs } = calls.fullArgs[0][1];
+  assert.ok(Number.isFinite(joinMs) && joinMs <= 0, `joinMs must say "spent", got ${joinMs}`);
+});
+
+test("#1418 an abandonment with NOTHING running is a distinct token, not REFRESH_JOIN_ABANDONED", async () => {
+  // The whole point of the issue: with the budget spent and the slot empty the coalescer
+  // starts NOTHING, so "a refresh is still running — retry joins it" would be a claim about
+  // a run that does not exist. The wrapper translates that arm to COMBO_REFRESH_NEVER_RAN.
+  const { fn } = spies({
+    budget: { remaining: () => -50 }, // joinMs <= 0
+    nodeDefRefreshInFlight: null, // …and the slot is empty
+    onFullRefresh: async () => REFRESH_JOIN_ABANDONED,
+  });
+  const outcome = await fn(undefined, TARGET, "CheckpointLoaderSimple", null);
+  assert.equal(outcome, COMBO_REFRESH_NEVER_RAN, "the refusal must be worded for 'never ran'");
+});
+
+test("#1418 an abandonment with a run in flight (or budget for an own run) stays REFRESH_JOIN_ABANDONED", async () => {
+  // The state the original wording IS true of: a run occupies the slot and is still
+  // registering. Both facts are read BEFORE the coalescer call, so the translation can
+  // never disagree with the coalescer's own decision.
+  for (const [label, extra] of [
+    ["slot occupied, budget spent", { budget: { remaining: () => -50 }, nodeDefRefreshInFlight: Promise.resolve() }],
+    ["slot empty, budget left", { budget: { remaining: () => 5000 }, nodeDefRefreshInFlight: null }],
+  ]) {
+    const { fn } = spies({ ...extra, onFullRefresh: async () => REFRESH_JOIN_ABANDONED });
+    const outcome = await fn(undefined, TARGET, "CheckpointLoaderSimple", null);
+    assert.equal(outcome, REFRESH_JOIN_ABANDONED, `${label}: a refresh is verifiably running`);
+  }
+});
+
+test("#1418 a COMPLETED refresh is returned untouched by the translation", async () => {
+  const { fn } = spies({ budget: { remaining: () => -50 }, nodeDefRefreshInFlight: null });
+  const outcome = await fn(undefined, TARGET, "CheckpointLoaderSimple", null);
+  assert.equal(outcome, "full", "only the abandoned state is reworded");
 });

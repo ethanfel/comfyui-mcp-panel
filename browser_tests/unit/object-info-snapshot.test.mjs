@@ -26,12 +26,16 @@ import {
   noBackendAnswerEstablished,
   snapshotAuthorizationNote,
 } from "../../web/js/lib/object-info-snapshot.js";
+import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import {
   TRANSPORT_OUTCOME,
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/object-info-oracle.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
 const silence = [
@@ -39,8 +43,14 @@ const silence = [
   { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
 ];
 /** The v2 record contract: an epoch captured before the fetch, unchanged since, and a claim. */
-const stored = (snap, defs = SCHEMA, epoch = 3) =>
-  snap.record(defs, { observedAtEpoch: epoch, currentEpoch: epoch, whole: true });
+const stored = (snap, defs = SCHEMA, epoch = 3, generation = 0) =>
+  snap.record(defs, {
+    observedAtEpoch: epoch,
+    currentEpoch: epoch,
+    observedAtGeneration: generation,
+    currentGeneration: generation,
+    whole: true,
+  });
 
 // ---------------------------------------------------------------------------
 // Condition 4: the backend never ANSWERED
@@ -275,6 +285,66 @@ test("#1223 the reported case: silent probes on an unbroken connection authorize
   assert.ok(Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "and the reported node type is in it");
 });
 
+test("#1582 a same-connection snapshot can shorten the live probe budget", () => {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(stored(snap, SCHEMA, 3), true);
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: false }), true);
+});
+
+test("#1582 snapshot budget shortening keeps the reconnect and socket-down fences", () => {
+  const empty = createObjectInfoSnapshot();
+  assert.equal(empty.isReusable({ epoch: 3, socketDown: false }), false, "nothing observed cannot shorten a probe");
+
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: true }), false, "a down socket may be restarting");
+  assert.equal(snap.isReusable({ epoch: 4, socketDown: false }), false, "a new epoch may define different types");
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: false }), true, "the original connection is reusable");
+});
+
+test("#1582 the first silence does not skip — an answered error must still be able to refuse", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  assert.equal(
+    snap.shouldSkipProbe({ epoch: 3, socketDown: false }),
+    false,
+    "holding a snapshot is not itself evidence the live routes went silent",
+  );
+});
+
+test("#1582 after silence on a held snapshot, later probes may skip", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), true);
+  const held = snap.authorize({ epoch: 3, socketDown: false, requireSilence: false });
+  assert.ok(held.defs, "skipping the probe still authorizes from the held map");
+  assert.ok(Object.prototype.hasOwnProperty.call(held.defs, "H3Keyframes"));
+});
+
+test("#1582 a skip still refuses a down socket, a reconnect, and an empty store", () => {
+  const empty = createObjectInfoSnapshot();
+  empty.markProbesSilent();
+  assert.equal(empty.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "silence without a map licenses nothing");
+
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: true }), false, "a down socket may be restarting");
+  assert.equal(snap.shouldSkipProbe({ epoch: 4, socketDown: false }), false, "a new epoch may define different types");
+  snap.clear();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "clearing the snapshot clears the silence latch");
+});
+
+test("#1582 a later live record unlatches silence so the next write prefers a live schema", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), true);
+  stored(snap, SCHEMA, 3);
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "a live map means the routes answered again");
+});
+
 test("#1223 what is stored is DETACHED — registration hooks mutate defs in place", () => {
   // `registerNodesFromDefs` runs `beforeRegisterNodeDef` hooks that mutate the definitions
   // in place (Comfy's own upload hook adds an input the backend never declared). Retaining
@@ -341,7 +411,13 @@ test("#1223 a reconnect DURING the fetch is refused at record time", () => {
   // captured before the request goes out and re-checked when the answer lands.
   const snap = createObjectInfoSnapshot();
   assert.equal(
-    snap.record(SCHEMA, { observedAtEpoch: 3, currentEpoch: 4, whole: true }),
+    snap.record(SCHEMA, {
+      observedAtEpoch: 3,
+      currentEpoch: 4,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
     false,
     "the connection was replaced while this payload was in flight",
   );
@@ -354,16 +430,52 @@ test("#1223 a payload nobody vouched for as WHOLE is refused", () => {
   // type read as absent and the ever-seen gate diagnose the whole install as removed packs.
   // `record` cannot judge wholeness from the value, so it requires the claim.
   const snap = createObjectInfoSnapshot();
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1 }), false);
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: false }), false);
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: "yes" }), false);
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: false,
+    }),
+    false,
+  );
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: "yes",
+    }),
+    false,
+  );
   assert.equal(snap.peek().held, false);
 });
 
 test("#1223 an unreadable epoch refuses, at record time and at authorize time", () => {
   const snap = createObjectInfoSnapshot();
   for (const bad of [undefined, null, NaN, Infinity, "3"]) {
-    assert.equal(snap.record(SCHEMA, { observedAtEpoch: bad, currentEpoch: bad, whole: true }), false, `record ${String(bad)}`);
+    assert.equal(
+      snap.record(SCHEMA, {
+        observedAtEpoch: bad,
+        currentEpoch: bad,
+        observedAtGeneration: 0,
+        currentGeneration: 0,
+        whole: true,
+      }),
+      false,
+      `record ${String(bad)}`,
+    );
   }
   stored(snap);
   for (const bad of [undefined, null, NaN, Infinity, "3"]) {
@@ -390,13 +502,35 @@ test("#1223 a backend that ANSWERED is told apart from an empty snapshot in the 
   assert.match(reason, /ANSWERED/);
 });
 
+test("#1582 requireSilence false does not invent silence — it only skips the outcomes check", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 1);
+  const withoutOutcomes = snap.authorize({ epoch: 1, socketDown: false, requireSilence: false });
+  assert.ok(withoutOutcomes.defs, "a held same-connection map authorizes when silence is already known");
+  const answered = snap.authorize({
+    epoch: 1,
+    socketDown: false,
+    outcomes: [{ route: "http", kind: TRANSPORT_OUTCOME.THREW }],
+    requireSilence: false,
+  });
+  assert.ok(answered.defs, "an answered-error list must not veto a skip that already established silence earlier");
+  const reconnect = snap.authorize({ epoch: 2, socketDown: false, requireSilence: false });
+  assert.equal(reconnect.defs, null, "the reconnect fence is still load-bearing");
+});
+
 test("#1223 only a payload that could authorize anything is stored", () => {
   const snap = createObjectInfoSnapshot();
   // Called directly, NOT through `stored`: that helper defaults its payload, so passing
   // `undefined` silently tested the good schema and the case passed for the wrong reason.
   for (const bad of [null, undefined, {}, [], "schema", 7, [SCHEMA]]) {
     assert.equal(
-      snap.record(bad, { observedAtEpoch: 3, currentEpoch: 3, whole: true }),
+      snap.record(bad, {
+        observedAtEpoch: 3,
+        currentEpoch: 3,
+        observedAtGeneration: 0,
+        currentGeneration: 0,
+        whole: true,
+      }),
       false,
       `${String(bad)} is not a schema`,
     );
@@ -426,12 +560,76 @@ test("#1223 a good snapshot is not displaced by a later failed fetch", () => {
   assert.ok(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs);
 });
 
+test("#2249 a failed same-epoch replacement rebinds the last snapshot after fencing it", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 7, 11);
+
+  snap.beginReplacement();
+  assert.equal(snap.isReplacementPending(), true);
+  assert.equal(
+    snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence }).defs,
+    null,
+    "the old map cannot authorize while the replacement is unresolved",
+  );
+
+  assert.equal(
+    snap.retainAfterReplacementFailure({ epoch: 7, generation: 12, socketDown: false }),
+    true,
+    "a failed refresh rebinds the held map to the retired-proof generation",
+  );
+  const fallback = snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence });
+  assert.ok(fallback.defs, "the prior whole observation remains usable after replacement failure");
+  assert.equal(snap.isReplacementPending(), false);
+});
+
+test("#2249 a successful replacement supersedes the retained snapshot", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, { OldNode: {} }, 7, 11);
+  snap.beginReplacement();
+  assert.equal(
+    snap.record({ NewNode: {} }, {
+      observedAtEpoch: 7,
+      currentEpoch: 7,
+      observedAtGeneration: 12,
+      currentGeneration: 12,
+      whole: true,
+    }),
+    true,
+  );
+  const current = snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence });
+  assert.equal(Object.prototype.hasOwnProperty.call(current.defs, "OldNode"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(current.defs, "NewNode"), true);
+  assert.equal(snap.isReplacementPending(), false);
+});
+
 test("#1223 clear() retires it — a suspicion of change outranks a stored schema", () => {
   const snap = createObjectInfoSnapshot();
   stored(snap, SCHEMA, 2);
   snap.clear();
   assert.equal(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs, null);
   assert.equal(snap.peek().held, false);
+});
+
+test("#1709 a same-epoch generation retirement rejects a late snapshot writer", () => {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(stored(snap, SCHEMA, 3, 4), true);
+  snap.clear();
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 3,
+      currentEpoch: 3,
+      observedAtGeneration: 4,
+      currentGeneration: 5,
+      whole: true,
+    }),
+    false,
+    "same-epoch refresh invalidation still fences the old writer",
+  );
+  assert.equal(
+    snap.authorize({ epoch: 3, generation: 5, socketDown: false, outcomes: silence }).defs,
+    null,
+    "the retired snapshot cannot authorize at the new generation",
+  );
 });
 
 test("#1223 a successful write authorized this way DISCLOSES it", () => {
@@ -448,13 +646,22 @@ test("#1223 a successful write authorized this way DISCLOSES it", () => {
 
 const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
-/** Balanced-brace extraction of the set_widget oracle, by the marker above its body. */
+/**
+ * Balanced-brace extraction of the set_widget oracle, by the marker above its body.
+ *
+ * #1126 round-5 renamed this from `getFreshObjectInfo` to `readObjectInfo(readThroughCache)`,
+ * because the ordinary read and the last-resort forced reread now enter ONE body through
+ * different cache methods. The property name is asserted rather than searched loosely: when
+ * it moved, `lastIndexOf` silently matched graph_add_node's own `getFreshObjectInfo` further
+ * up the file and these tests ran a different executor's oracle — green on the wrong code
+ * until it happened to reference an undefined binding.
+ */
 function extractSetWidgetOracle() {
   const anchor = PANEL_SRC.indexOf("// #716 — READ THROUGH THE BURST CACHE.");
   assert.notEqual(anchor, -1, "the set_widget oracle's marker comment moved");
-  const start = PANEL_SRC.lastIndexOf("getFreshObjectInfo: async () => {", anchor);
-  assert.notEqual(start, -1, "getFreshObjectInfo not found above its own marker");
-  const open = PANEL_SRC.indexOf("{", start);
+  const start = PANEL_SRC.lastIndexOf("readObjectInfo: async (readThroughCache, { reuseSnapshot = true } = {}) => {", anchor);
+  assert.notEqual(start, -1, "readObjectInfo not found above its own marker");
+  const open = PANEL_SRC.indexOf("=> {", start) + 3;
   let depth = 0;
   for (let i = open; i < PANEL_SRC.length; i += 1) {
     const ch = PANEL_SRC[i];
@@ -487,7 +694,19 @@ function extractSetWidgetOracle() {
  * `epochDuringFetch` lets a test move the connection epoch WHILE the read is in flight —
  * the reconnect-mid-fetch hazard, which cannot be exercised any other way.
  */
-function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null }) {
+function buildShippedOracle({
+  api,
+  socketDown = false,
+  epoch = 5,
+  snapshot,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  objectInfoCache = createObjectInfoCache(),
+  epochDuringFetch = null,
+  onFetch = null,
+  snapshotProbeDeadlineMs = 2000,
+  oracleDeadlineMs = 20,
+  realFetchWholeObjectInfo = fetchWholeObjectInfo,
+}) {
   const body = extractSetWidgetOracle();
   const factory = new Function(
     "api",
@@ -495,10 +714,21 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "realFetchWholeObjectInfo",
     "CACHE_OUTCOME",
     "objectInfoSnapshot",
+    "verifiedNodeDefCache",
     "initialEpoch",
     "epochDuringFetch",
     "comfyBackendSocketDown",
     "objectInfoOracleFailureNote",
+    "OBJECT_INFO_DEADLINE_MS",
+    "OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS",
+    "makeCommandBudget",
+    "onFetch",
+    // #1560 — the shipped body decides the type-scoped route's silence licence beside the
+    // snapshot's own verdict, so this sandbox has to supply the same predicate. A name the
+    // body closes over and the harness does not provide is a harness that models a panel
+    // which does not exist.
+    "noBackendAnswerEstablished",
+    "oracleDeadlineMs",
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
@@ -507,40 +737,80 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     `let backendReconnectEpoch = initialEpoch;
      let oracleFailures = [];
      let snapshotIneligibility = "";
+     let scopedReadLicensed = false;
      let setWidgetSchemaFromSnapshot = null;
+     const comfyBackendIsDown = () => comfyBackendSocketDown;
      const historyRecorded = [];
      const recordObjectInfoTypes = (defs) => { historyRecorded.push(defs); return defs; };
+     // #1418 — the shipped body now draws the oracle's deadline from the command budget.
+     // The REAL budget, freshly minted per build, so the arithmetic is production's; the
+     // harness wrapper below still overrides the deadline to its own 20ms, so no test here
+     // waits on it either way.
+     const budget = makeCommandBudget(25000);
      // Declared HERE so it closes over the mutable epoch above and can move it the moment
      // the read is issued — the panel's real hazard is a reconnect landing mid-fetch.
      const fetchWholeObjectInfo = (opts) => {
-       const pending = realFetchWholeObjectInfo({ ...opts, deadlineMs: 20 });
+       onFetch?.(opts);
+       const pending = realFetchWholeObjectInfo({
+         ...opts,
+         deadlineMs: oracleDeadlineMs === null ? opts.deadlineMs : oracleDeadlineMs,
+       });
        if (epochDuringFetch !== null) backendReconnectEpoch = epochDuringFetch;
        return pending;
      };
-     const getFreshObjectInfo = async () => ${body};
+     // The shipped body now takes the cache entry point, so the ordinary read and the
+     // last-resort forced reread share it. Driving it the way graph_set_widget's own
+     // getFreshObjectInfo does keeps this exercising production wiring, not a paraphrase.
+     const readObjectInfo = async (readThroughCache, { reuseSnapshot = true } = {}) => ${body};
+     const getFreshObjectInfo = async () =>
+       readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts));
+     const refetchObjectInfoLive = async () =>
+       readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts), { reuseSnapshot: false });
      return {
        getFreshObjectInfo,
+       refetchObjectInfoLive,
        setEpoch: (n) => { backendReconnectEpoch = n; },
        readNote: () => setWidgetSchemaFromSnapshot,
        readIneligibility: () => snapshotIneligibility,
        readFailures: () => oracleFailures,
+       readScopedLicence: () => scopedReadLicensed,
+       readProvenance: () => setWidgetSchemaProvenance(),
        readHistory: () => historyRecorded,
      };`,
   );
   return factory(
     api,
-    createObjectInfoCache(),
-    fetchWholeObjectInfo,
+    objectInfoCache,
+    realFetchWholeObjectInfo,
     CACHE_OUTCOME,
-    snapshot,
-    epoch,
+     snapshot,
+     verifiedNodeDefCache,
+     epoch,
     epochDuringFetch,
     socketDown,
     objectInfoOracleFailureNote,
+    OBJECT_INFO_DEADLINE_MS,
+    snapshotProbeDeadlineMs,
+    makeCommandBudget,
+    onFetch,
+    noBackendAnswerEstablished,
+    oracleDeadlineMs,
   );
 }
 
 const hungApi = { getNodeDefs: () => new Promise(() => {}), fetchApi: () => new Promise(() => {}) };
+
+function schemaOracleForLatency(minimumMs) {
+  return ({ deadlineMs }) =>
+    deadlineMs >= minimumMs
+      ? { [CACHE_OUTCOME]: true, defs: SCHEMA, failures: [], outcomes: [] }
+      : {
+          [CACHE_OUTCOME]: true,
+          defs: null,
+          failures: [`remote schema needs ${minimumMs}ms`],
+          outcomes: silence,
+        };
+}
 
 test("#1223 SHIPPED: a live answer is returned and snapshotted", async () => {
   const snapshot = createObjectInfoSnapshot();
@@ -549,6 +819,41 @@ test("#1223 SHIPPED: a live answer is returned and snapshotted", async () => {
   assert.deepEqual(snapshot.peek(), { held: true, epoch: 5 }, "stamped with the connection it was read on");
   assert.equal(o.readNote(), null, "a live authorization discloses nothing, because there is nothing to disclose");
   assert.deepEqual(o.readHistory(), [SCHEMA], "and it IS a real observation, so the ever-seen history takes it");
+});
+
+test("#1709 SHIPPED: authoritative empty retires cache and snapshot, while timeout stays non-authoritative", async () => {
+  let defs = SCHEMA;
+  const api = {
+    getNodeDefs: async () => defs,
+    fetchApi: async () => ({ status: 503, json: async () => ({}) }),
+  };
+  const snapshot = createObjectInfoSnapshot();
+  const cache = createObjectInfoCache();
+  const o = buildShippedOracle({ api, snapshot, objectInfoCache: cache, epoch: 5 });
+
+  assert.deepEqual(await o.getFreshObjectInfo(), SCHEMA, "the initial whole read establishes both old trust roots");
+  assert.equal(cache.peek().cached, true);
+  assert.equal(snapshot.peek().held, true);
+
+  defs = undefined;
+  const timedOut = await o.refetchObjectInfoLive();
+  assert.equal(timedOut, null, "an unavailable forced read has no schema to promote");
+  assert.equal(cache.peek().cached, true, "timeout did not turn a still-valid old cache into an invalidation");
+  assert.equal(snapshot.peek().held, true, "timeout did not turn a still-valid old snapshot into an invalidation");
+
+  defs = {};
+  const denied = await o.refetchObjectInfoLive();
+  assert.equal(denied, null, "authoritative empty remains fail-closed");
+  assert.equal(cache.peek().cached, false, "authoritative empty retired the old whole payload");
+  assert.equal(snapshot.peek().held, false, "authoritative empty retired old membership proof");
+
+  defs = undefined;
+  assert.equal(
+    await o.getFreshObjectInfo(),
+    null,
+    "the later ordinary timeout cannot resurrect the retired schema through cache or snapshot fallback",
+  );
+  assert.match(o.readIneligibility(), /no snapshot|schema/i, "the timeout path remains a refusal without old authority");
 });
 
 test("#1223 SHIPPED: a reconnect DURING the read means the answer is not snapshotted", async () => {
@@ -580,7 +885,7 @@ test("#1223 SHIPPED: a CACHE HIT is never filed as evidence — it can predate a
 
   snapshot.clear(); // what a reconnect does
   o.setEpoch(6); // ...and the epoch it bumps
-  assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the cache still answers its waiter");
+  assert.deepEqual(await o.getFreshObjectInfo(), SCHEMA, "the cache still answers its waiter");
   assert.equal(
     snapshot.peek().held,
     false,
@@ -588,13 +893,251 @@ test("#1223 SHIPPED: a CACHE HIT is never filed as evidence — it can predate a
   );
 });
 
-test("#1223 SHIPPED: the reported case — hung probes fall back and disclose", async () => {
+test("#1582 SHIPPED: the reported case — a held snapshot shortens hung probes", async () => {
   const snapshot = createObjectInfoSnapshot();
   stored(snapshot, SCHEMA, 5);
-  const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5, socketDown: false });
+  let clientCalls = 0;
+  let httpCalls = 0;
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => {
+        httpCalls += 1;
+        return new Promise(() => {});
+      },
+    },
+    snapshot,
+    epoch: 5,
+    socketDown: false,
+    onFetch: (opts) => deadlines.push(opts.deadlineMs),
+  });
   const defs = await o.getFreshObjectInfo();
   assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the edit is no longer refused");
-  assert.match(o.readNote(), /did not answer/, "and the reply can say which routes went silent");
+  assert.equal(clientCalls, 1, "the client route is still probed so an answered error can refuse");
+  assert.equal(httpCalls, 1, "the raw route is still probed so the fallback transport can answer");
+  assert.deepEqual(deadlines, [2000], "the reusable snapshot caps the serial oracle before the 15s stall");
+  assert.match(o.readNote(), /did not answer/);
+  assert.equal(o.readFailures().length, 2, "the fallback still discloses both silent routes");
+});
+
+test("#1734 SHIPPED set_widget: a remote high-latency schema gets the larger bounded probe", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    snapshotProbeDeadlineMs: 8000,
+    oracleDeadlineMs: null,
+    realFetchWholeObjectInfo: (opts) => {
+      deadlines.push(opts.deadlineMs);
+      return schemaOracleForLatency(3000)(opts);
+    },
+  });
+  const ctor = function NodeCtor() {};
+  ctor.nodeData = { input: { required: {} } };
+  const node = {
+    id: 1734,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: ctor,
+  };
+
+  const result = await runSetWidget(node, "steps", 30, {
+    registry: { KSampler: ctor },
+    getRegistry: () => ({ KSampler: ctor }),
+    getFreshObjectInfo: o.getFreshObjectInfo,
+    schemaProvenance: () => "live",
+    beforeChange() {},
+    afterChange() {},
+    setDirty() {},
+  });
+
+  assert.equal(result.set.value, 30, "the production write lands after the remote read");
+  assert.deepEqual(deadlines, [8000], "the remote first-silence probe stays bounded at 8s");
+});
+
+test("#1734 SHIPPED set_widget: loopback keeps the short local probe timing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    snapshotProbeDeadlineMs: 2000,
+    oracleDeadlineMs: null,
+    realFetchWholeObjectInfo: (opts) => {
+      deadlines.push(opts.deadlineMs);
+      return schemaOracleForLatency(3000)(opts);
+    },
+  });
+
+  const result = await runSetWidget(
+    {
+      id: 1734,
+      type: "KSampler",
+      widgets: [{ name: "steps", type: "INT", value: 20 }],
+      constructor: { nodeData: { input: { required: {} } } },
+    },
+    "steps",
+    30,
+    {
+      registry: { KSampler: {} },
+      getRegistry: () => ({ KSampler: {} }),
+      getFreshObjectInfo: o.getFreshObjectInfo,
+      schemaProvenance: () => "snapshot",
+      beforeChange() {},
+      afterChange() {},
+      setDirty() {},
+    },
+  );
+
+  assert.equal(result.set.value, 30, "a silent local probe still uses the held snapshot");
+  assert.deepEqual(deadlines, [2000], "loopback keeps the original short discovery window");
+  assert.equal(o.readProvenance(), "snapshot", "the short silent probe falls back to the held snapshot");
+  assert.match(o.readNote(), /Tried one route/i);
+});
+
+test("#1734 SHIPPED: a concurrent refresh fences a late remote probe result", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  let release;
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    verifiedNodeDefCache,
+    snapshotProbeDeadlineMs: 8000,
+    oracleDeadlineMs: null,
+    onFetch: () => markStarted(),
+    realFetchWholeObjectInfo: (opts) => {
+      assert.equal(opts.deadlineMs, 8000);
+      return new Promise((resolve) => {
+        release = () => resolve({ [CACHE_OUTCOME]: true, defs: { ...SCHEMA, RemoteOnly: {} }, failures: [], outcomes: [] });
+      });
+    },
+  });
+
+  const pending = o.getFreshObjectInfo();
+  await started;
+  // This is the production refresh invalidation crossing the outstanding probe.
+  snapshot.clear();
+  verifiedNodeDefCache.clear();
+  release();
+
+  const result = await pending;
+  assert.ok(result.RemoteOnly, "the late response is still returned for diagnostics");
+  assert.equal(o.readProvenance(), "retired", "the response cannot authorize after refresh invalidation");
+  assert.deepEqual(o.readHistory(), [], "the late response is not recorded as current backend truth");
+  assert.equal(snapshot.peek().held, false, "the concurrent refresh keeps the old snapshot retired");
+});
+
+test("#1582 SHIPPED: a second ordinary read does not re-wait on probes that already went silent", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  let httpCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => {
+        httpCalls += 1;
+        return new Promise(() => {});
+      },
+    },
+    snapshot,
+    epoch: 5,
+    socketDown: false,
+  });
+  assert.ok(await o.getFreshObjectInfo(), "the first write still discovers silence");
+  assert.equal(clientCalls, 1);
+  assert.equal(httpCalls, 1);
+
+  const started = performance.now();
+  const defs = await o.getFreshObjectInfo();
+  const elapsed = performance.now() - started;
+  assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the second write is still authorized");
+  assert.equal(clientCalls, 1, "getNodeDefs is not contacted again");
+  assert.equal(httpCalls, 1, "GET /object_info is not contacted again");
+  assert.ok(elapsed < 50, `second read stalled ${elapsed}ms on probes that were already silent`);
+  assert.match(o.readNote(), /#1582/);
+});
+
+test("#1582 SHIPPED set_widget: a second successful write does not re-wait on silent probes", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => new Promise(() => {}),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  const ctor = function NodeCtor() {};
+  ctor.nodeData = { input: { required: {} } };
+  const node = {
+    id: 3,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: ctor,
+  };
+  const reg = { KSampler: ctor };
+  const hooks = { beforeChange() {}, afterChange() {}, setDirty() {} };
+  const opts = {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: o.getFreshObjectInfo,
+    schemaProvenance: () => "snapshot",
+    ...hooks,
+  };
+
+  const first = await runSetWidget(node, "steps", 30, opts);
+  assert.equal(first.set.value, 30, "the first write lands");
+  assert.equal(node.widgets[0].value, 30);
+  assert.equal(clientCalls, 1, "the first write still probes");
+
+  const started = performance.now();
+  const second = await runSetWidget(node, "steps", 40, opts);
+  const elapsed = performance.now() - started;
+  assert.equal(second.set.value, 40, "the second write lands");
+  assert.equal(node.widgets[0].value, 40);
+  assert.equal(clientCalls, 1, "the second write must not contact the silent routes again");
+  assert.ok(elapsed < 50, `second set_widget stalled ${elapsed}ms on probes that were already silent`);
+});
+
+test("#1582 the forced live reread does not take the snapshot shortcut", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => {
+        clientCalls += 1;
+        return SCHEMA;
+      },
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.refetchObjectInfoLive(), SCHEMA);
+  assert.equal(clientCalls, 1, "the blind-write recovery still forces a live schema read");
+  assert.equal(o.readNote(), null, "a live reread does not disclose snapshot authorization");
 });
 
 test("#1223 SHIPPED: a snapshot re-read is NOT recorded as a new backend observation", async () => {
@@ -705,9 +1248,14 @@ function extractExecutor(name) {
 }
 
 function buildExecutor(name, deps) {
-  const names = Object.keys(deps);
+  const runtimeDeps = {
+    objectInfoCache: createObjectInfoCache(),
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
+    ...deps,
+  };
+  const names = Object.keys(runtimeDeps);
   const factory = new Function(...names, `const executors = { ${extractExecutor(name)} };\nreturn executors.${name};`);
-  return factory(...names.map((n) => deps[n]));
+  return factory(...names.map((n) => runtimeDeps[n]));
 }
 
 test("#1223 SHIPPED get_object_info: a successful whole read IS filed", async () => {
@@ -765,6 +1313,28 @@ test("#1223 SHIPPED get_object_info: a FAILED read files nothing", async () => {
   assert.equal(snapshot.peek().held, false);
 });
 
+test("#1709 SHIPPED get_object_info: a same-epoch refresh crossing the read cannot file its snapshot", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const get = buildExecutor("graph_get_object_info", {
+    fetchWholeObjectInfo: async () => {
+      verifiedNodeDefCache.clear();
+      return { defs: SCHEMA, failures: [], outcomes: [] };
+    },
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+    backendReconnectEpoch: 9,
+    api: { getNodeDefs: async () => SCHEMA },
+    pageComfyOrigin: () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote: () => "",
+    objectInfoFingerprint: () => "fp",
+    objectInfoUnchanged: () => false,
+  });
+  const res = await get({});
+  assert.equal(res.ok, true, "the read itself still returns its live payload");
+  assert.equal(snapshot.peek().held, false, "the old-generation result was not accepted as snapshot authority");
+});
+
 function buildRemoveWidget({ snapshot, epoch = 4, cache, defs = SCHEMA }) {
   const node = { id: 3, type: "KSampler", comfyClass: "KSampler", widgets: [{ name: "seed" }] };
   return buildExecutor("graph_remove_widget", {
@@ -820,18 +1390,19 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   // type read as absent and the ever-seen gate diagnose the install as removed packs.
   assert.match(
     PANEL_SRC,
-    /if \(freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    /addNodeObservedAtEpoch !== null[\s\S]*addNodeObservedAtGeneration !== null[\s\S]*objectInfoSnapshot\.record\(/,
     "add_node files its payload only when it fetched the WHOLE schema, and only then",
   );
   for (const site of sites) {
-    const call = PANEL_SRC.slice(site.index, site.index + 260);
+    const call = PANEL_SRC.slice(site.index, site.index + 420);
     assert.match(call, /whole: true/, `the record site at index ${site.index} states the wholeness claim`);
     assert.match(call, /observedAtEpoch/, `the record site at index ${site.index} stamps the issuance epoch`);
+    assert.match(call, /observedAtGeneration/, `the record site at index ${site.index} stamps the schema generation`);
   }
   assert.match(
     PANEL_SRC,
-    /if \(!preloadedDefs\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
-    "the refresh run records only a payload it fetched itself — a caller-supplied one is not provably whole",
+    /if \(\(!preloadedDefs \|\| preloadedWholeSchema\) && refreshResponseIsCurrent\) \{[\s\S]{0,1200}objectInfoSnapshot\.record\(/,
+    "the refresh run records fetched payloads or the graph_add caller's explicitly verified whole payload",
   );
 });
 
@@ -842,7 +1413,15 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
  * MATCHES the pattern, so disabling the startup snapshot left the assertion green. Mutation
  * caught that. A test for whether code RUNS has to run it.
  */
-function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null }) {
+function buildShippedSeed({
+  api,
+  epoch = 2,
+  snapshot,
+  objectInfoCache = createObjectInfoCache(),
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  epochDuringFetch = null,
+  generationDuringFetch = false,
+}) {
   const start = PANEL_SRC.indexOf("function seedObjectInfoHistory()");
   assert.notEqual(start, -1, "seedObjectInfoHistory not found");
   const open = PANEL_SRC.indexOf("{", start);
@@ -866,6 +1445,8 @@ function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null })
   const factory = new Function(
     "api",
     "objectInfoSnapshot",
+    "objectInfoCache",
+    "verifiedNodeDefCache",
     "initialEpoch",
     "epochDuringFetch",
     "objectInfoHistory",
@@ -883,17 +1464,24 @@ function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null })
        setEpoch: (n) => { backendReconnectEpoch = n; },
      };`,
   );
+  let seedFetchCount = 0;
   const built = factory(
     {
       getNodeDefs: async () => {
         // Move the epoch WHILE the request is outstanding — the reconnect-mid-fetch hazard.
-        if (epochDuringFetch !== null) built.setEpoch(epochDuringFetch);
-        return api.defs;
+        if (epochDuringFetch !== null && seedFetchCount++ === 0) {
+          built.setEpoch(epochDuringFetch);
+          return api.defs;
+        }
+        if (generationDuringFetch) verifiedNodeDefCache.clear();
+        return epochDuringFetch !== null ? null : api.defs;
       },
-    },
-    snapshot,
-    epoch,
-    null,
+     },
+     snapshot,
+     objectInfoCache,
+     verifiedNodeDefCache,
+     epoch,
+    epochDuringFetch,
     { loseBaseline: () => {} },
   );
   return built;
@@ -923,14 +1511,30 @@ test("#1223 SHIPPED STARTUP: a reconnect during the seed's fetch is not filed", 
   const snapshot = createObjectInfoSnapshot();
   const seed = buildShippedSeed({ api: { defs: SCHEMA }, epoch: 2, snapshot, epochDuringFetch: 3 });
   await seed.run();
-  assert.equal(seed.wasSeeded(), true, "the history is still seeded — that trust root is separate");
+  assert.equal(seed.wasSeeded(), false, "a replaced connection cannot establish the history baseline");
   assert.equal(snapshot.peek().held, false, "but the payload describes the connection that was replaced");
 });
 
+test("#1709 SHIPPED STARTUP: a same-epoch refresh during the seed's fetch is not filed", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const seed = buildShippedSeed({
+    api: { defs: SCHEMA },
+    epoch: 2,
+    snapshot,
+    verifiedNodeDefCache,
+    generationDuringFetch: true,
+  });
+  await seed.run();
+  assert.equal(seed.wasSeeded(), false, "a generation that changes on every retry keeps the baseline unseeded");
+  assert.deepEqual(seed.readRecorded(), [], "no pre-refresh result was recorded as history");
+  assert.equal(snapshot.peek().held, false, "the pre-refresh whole result was not recorded at the same epoch");
+});
+
 test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a refresh", () => {
-  // The `reconnected` handler's refreshComfyNodeDefs() carries no payload and no force,
-  // which makeRefreshCoalescer resolves by joining an in-flight run and returning — so
-  // registerComfyNodeDefs, and the clear inside it, may never run for that reconnect.
+  // The socket handlers clear the snapshot before any refresh is scheduled. The reconnected
+  // handler now forces a trailing run (#1695), but that run may still join an older refresh;
+  // registerComfyNodeDefs must not be the only place that retires restart-sensitive state.
   // Each handler is bounded at the NEXT listener registration. A fixed-width slice ran past
   // the end of `reconnecting` into `status` — which also clears — so deleting the clear from
   // `reconnecting` left this test green. Found by mutation, not by reading.
@@ -958,6 +1562,18 @@ test("#1223 the disclosure rides on its OWN field, never on `warning`", () => {
   );
 });
 
+test("#1709 every live whole-schema reader retires cache and snapshot on authoritative empty", () => {
+  for (const name of ["graph_get_object_info", "graph_set_widget", "graph_remove_widget"]) {
+    const start = PANEL_SRC.indexOf(`  async ${name}(`);
+    assert.notEqual(start, -1, `${name} not found`);
+    const next = PANEL_SRC.indexOf("\n  async graph_", start + 1);
+    const handler = PANEL_SRC.slice(start, next === -1 ? PANEL_SRC.length : next);
+    assert.match(handler, /authoritativeEmpty/, `${name} classifies authoritative empty`);
+    assert.match(handler, /objectInfoCache\.invalidate\(\)/, `${name} retires the burst payload`);
+    assert.match(handler, /objectInfoSnapshot\.clear\(\)/, `${name} retires membership proof`);
+  }
+});
+
 test("#1223 no comment cites a symbol that does not exist", () => {
   // A backticked identifier reads as a real export; the next reader greps for it and
   // concludes the guard was deleted. `recordsWholeSchemaOnly` was exactly that.
@@ -965,4 +1581,87 @@ test("#1223 no comment cites a symbol that does not exist", () => {
   for (const [name, src] of [["panel", PANEL_SRC], ["snapshot module", snapshotSrc]]) {
     assert.ok(!/recordsWholeSchemaOnly/.test(src), `${name} still cites a phantom symbol`);
   }
+});
+
+// ───────────── #1560: the SHIPPED body's licence for the type-scoped last resort ──────────
+
+test("#1560 SHIPPED: hung probes LICENSE the type-scoped read; the snapshot and the licence agree", async () => {
+  // Both whole-map routes went silent — the #1560 install. That is the one condition under
+  // which a per-class read may be asked at all, and it is the SAME evidence #1223's snapshot
+  // is licensed on, read once, in the same statement.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), null, "nothing usable came back");
+  assert.equal(o.readScopedLicence(), true, "silence licenses the type-scoped route");
+});
+
+test("#1560 SHIPPED: a client ANSWERING deny-all `{}` licenses NOTHING — it is never overruled", async () => {
+  // An empty schema is a client expressing deny-all. Consulting a broader per-class read
+  // there is the one direction object-info-oracle.js's note forbids, and the licence is what
+  // stops it. If this ever reads true, the fence can be widened past a deliberate refusal.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: { getNodeDefs: async () => ({}) }, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), null, "an empty schema authorizes nothing, as before");
+  assert.equal(o.readScopedLicence(), false, "and it may not be re-asked by another route");
+});
+
+test("#1560 SHIPPED: a route that THREW licenses nothing either — something answered", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => {
+        throw new Error("connection refused");
+      },
+      fetchApi: async () => {
+        throw new Error("connection refused");
+      },
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(o.readScopedLicence(), false, "a refused connection is a process that is GONE, not one that is busy");
+});
+
+test("#2249 SHIPPED: a gateway timeout leaves room for exact type-scoped authority", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: undefined,
+      fetchApi: async () => ({ ok: false, status: 504, json: async () => ({}) }),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(
+    o.readScopedLicence(),
+    true,
+    "a proxy gateway timeout did not establish absence of the requested class, so a live type-scoped answer may decide it",
+  );
+});
+
+test("#2249 SHIPPED: mixed nothing-returned plus answered-unusable evidence licenses nothing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => undefined,
+      fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(
+    o.readScopedLicence(),
+    false,
+    "a returned unusable response is an answer/refusal even when another route returned nothing",
+  );
+});
+
+test("#1560 SHIPPED: a LIVE answer leaves the licence false — there is nothing to license", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: { getNodeDefs: async () => SCHEMA }, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), SCHEMA);
+  assert.equal(o.readScopedLicence(), false);
 });

@@ -12,7 +12,13 @@
  *      the class def wasn't matched at load, even though the live def names them. (#199)
  */
 
-import { parseAnnotatedFilepath } from "./input-asset.js";
+import { authoritativeComboValues, parseAnnotatedFilepath } from "./input-asset.js";
+
+// mcp#1940 — `authoritativeComboValues` moved to the LEAF module input-asset.js so
+// `serverDeclaresEmptyComboOptions` (which lives there) can share the one canonical
+// reader without this file and that one importing each other. Re-exported here because
+// this is where it was published and callers import it from this path.
+export { authoritativeComboValues };
 
 const UNKNOWN_WIDGET_RE = /^UNKNOWN(_\d+)?$/;
 
@@ -511,7 +517,8 @@ export function collectMissingNodeTypeReasons(nodes, missingNodeTypes) {
 /**
  * True when a `graph_get_errors` RESULT payload represents a genuinely CLEAN graph —
  * no per-node validation errors, no execution failure, no errored nodes, AND no
- * missing-asset surface of ANY kind (models / media / node-types / node-count). Every
+ * missing-asset surface of ANY kind (models / media / node-types / node-count /
+ * stale placeholders left after a class registered — #1332). Every
  * consumer that summarizes the result — the command-summary label, banners, etc. —
  * must derive "errors vs none" from THIS, so a missing-asset-ONLY result (e.g. a red or
  * BYPASSED uninstalled node, #399/#356) is never labelled "none" while its own payload
@@ -529,6 +536,8 @@ export function graphErrorsResultIsClean(result) {
     !len(result.missing_media) &&
     !len(result.missing_node_types) &&
     !(Number(result.missing_node_count) > 0) &&
+    !len(result.stale_placeholders) &&
+    !result.requires_reload &&
     // #984 — the #745 LIVE scan was added to the payload after this helper was
     // written and never folded in, so a result carrying `unavailable_widget_values`
     // was still labelled "Checked errors — none". Every entry there is a widget
@@ -617,9 +626,21 @@ export function graphErrorsFindingCounts(result) {
   return {
     erroredNodes: Number(r.errored_count) || 0,
     missingAssets:
-      models.length + media.length + arr(r.missing_node_types).length + (Number(r.missing_node_count) || 0),
+      models.length +
+      media.length +
+      arr(r.missing_node_types).length +
+      (Number(r.missing_node_count) || 0) +
+      arr(r.stale_placeholders).length,
     unavailable,
-    unchecked: arr(r.unchecked_nodes).length,
+    // #1357 — DISTINCT nodes, not entries. This feeds a pill that literally reads
+    // "{count} nodes could not be checked", and since #1357 one node can put
+    // several entries in that list: a widget value the server's combo has no
+    // authority over is reported per VALUE, so three nested LoadImage paths on one
+    // node used to render as "3 nodes". The list itself still carries every entry
+    // with its own reason; only the node COUNT is counted as nodes.
+    unchecked: new Set(
+      arr(r.unchecked_nodes).map((u, i) => (u?.id == null ? `#${i}` : `id:${String(u.id)}`)),
+    ).size,
   };
 }
 
@@ -761,7 +782,23 @@ export function collectAllGraphs(rootGraph) {
  * map supplies the concrete-def key to look its options up under (#458×#366). Widgets
  * not in the map fall back to their own name.
  */
-export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap, mergedInputs) {
+
+/**
+ * Whether this input is a COMBO whose list this file could not derive — a remote V2, a
+ * dynamic V3, or a shape published after this was written. Asked only when
+ * `authoritativeComboValues` already returned null.
+ *
+ * TWO independent signals, because neither sees the whole set. A remote V2 arrives before
+ * its list does, so the live widget's `options.values` is `undefined` and only the SPEC
+ * betrays it; a shape this file has never heard of may not say "COMBO" anywhere, and only
+ * the live widget — already presenting an array of options — betrays that.
+ */
+function isUnrebuiltComboWidget(spec, widget) {
+  const declaredCombo = Array.isArray(spec) && typeof spec[0] === "string" && /COMBO/.test(spec[0]);
+  return declaredCombo || Array.isArray(widget?.options?.values);
+}
+
+export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap, mergedInputs, stats = null) {
   let refreshed = 0;
   if (!node || !defsByType) return refreshed;
   try {
@@ -778,14 +815,22 @@ export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widget
       const defKey = (widgetNameMap && widgetNameMap[w.name]) ?? w.name;
       const spec = inputs[defKey];
       if (!spec) continue;
-      // A combo's spec is `[[opt, ...], config?]` — the first element is the option
-      // array. Anything else (a type string like "INT"/"STRING") is not a combo.
-      const first = Array.isArray(spec) ? spec[0] : undefined;
-      if (!Array.isArray(first)) continue;
-      // Never clobber a dynamic (function) option source — it derives its own list.
+      // Never clobber a dynamic (function) option source — it derives its own list, and
+      // `assetCandidateResolvesLive` invokes it, so nothing here is stale for want of a
+      // rebuild. Not counted as skipped for the same reason.
       if (typeof w.options?.values === "function") continue;
+      const values = authoritativeComboValues(spec);
+      if (values === null) {
+        // NOT SILENTLY. A combo whose list this file cannot derive is the case #1193's
+        // disclosure must not claim: the caller decides whether the lists are current
+        // from this count, and a skip that went unrecorded read as "nothing to do".
+        if (stats && isUnrebuiltComboWidget(spec, w)) {
+          stats.combosSkipped = (stats.combosSkipped ?? 0) + 1;
+        }
+        continue;
+      }
       if (!w.options || typeof w.options !== "object") w.options = {};
-      w.options.values = first.slice();
+      w.options.values = values.slice();
       refreshed++;
     }
   } catch {
@@ -805,13 +850,23 @@ function mergedInputsFor(def, cache, type) {
 /**
  * Is this input spec a combo whose authoritative option list came back EMPTY?
  *
- * A combo's spec is `[[opt, ...], config?]`. An empty first element is the backend saying
- * "this widget has no valid values" — which is a real answer (#507/#1133: a server with zero
- * checkpoints), not a panel failure. It is worth DISCLOSING and never worth refusing over.
+ * An empty published list is the backend saying "this widget has no valid values" — a real
+ * answer (#507/#1133: a server with zero checkpoints), not a panel failure. It is worth
+ * DISCLOSING and never worth refusing over.
+ *
+ * mcp#1940 — read through `authoritativeComboValues`, never off `spec[0]`. This tested
+ * `Array.isArray(spec[0])`, which holds only for the V1 shape `[[opt, ...], config?]`; a V2
+ * `["COMBO", { options: [] }]` leaves the type string "COMBO" at `spec[0]` and was silently
+ * skipped, so a graph carrying one (CustomCombo, HypernetworkLoader, …) disclosed nothing.
+ * That is the same per-call-site adoption gap this reader was introduced to close in the
+ * WRITE path — found here by review of that fix, one module away from it.
+ *
+ * Unread still never counts as empty: a remote V2 whose list has not landed, and a dynamic
+ * V3, both yield null and are not disclosed.
  */
 function isEmptyComboSpec(spec) {
-  const first = Array.isArray(spec) ? spec[0] : undefined;
-  return Array.isArray(first) && first.length === 0;
+  const values = authoritativeComboValues(spec);
+  return Array.isArray(values) && values.length === 0;
 }
 
 /**
@@ -883,7 +938,39 @@ export function emptyComboNote(empties) {
   );
 }
 
-export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
+/**
+ * Whether a sweep's stats amount to "every live combo list on this graph is now the one
+ * `/object_info` just published". #1193's disclosure and the shared combo-trust flag both
+ * ask this, so they cannot drift apart by asking it differently.
+ *
+ * THREE ways to be false, and the third is the one that bit: no stats at all (the sweep
+ * never ran — no payload, no graph), `completed` false (it stopped part way), or
+ * `combosSkipped` non-zero (it finished, and left combo lists it could not derive exactly
+ * as stale as it found them). Reading only `completed` granted the claim over a graph of
+ * V2 combos that were never touched — and on ComfyUI 0.33 V2 is 467 of 529 combo inputs,
+ * so that was the normal case, not an edge one.
+ */
+export function comboRebuildCovered(stats) {
+  if (!stats || stats.completed !== true) return false;
+  return (stats.combosSkipped ?? 0) === 0;
+}
+
+/**
+ * Stamp fresh defs onto live node INSTANCES, rebuild their combo option lists, and repair
+ * UNKNOWN widget names. Returns the number of nodes whose widget names were repaired.
+ *
+ * `stats`, when given, is filled in with what this sweep OBSERVABLY did — `nodesSwept`,
+ * `combosRebuilt`, `combosSkipped` (combo widgets whose authoritative list this file could
+ * not derive: a remote V2, a dynamic V3, a shape published after this was written), and
+ * `completed` (set only after every graph was walked to the end).
+ *
+ * #1193 reads it, and reads BOTH: a caller may treat the live combo lists as rebuilt from
+ * `defsByType` only when the sweep it ran actually finished AND skipped nothing. Those are
+ * separate facts — a finished sweep that skipped a combo has left that widget's list
+ * exactly as stale as it found it — so they are reported separately rather than folded
+ * into one boolean the caller cannot take apart.
+ */
+export function reapplyDefsToLiveNodes(rootGraph, defsByType, stats = null) {
   let repaired = 0;
   if (!defsByType) return repaired;
   try {
@@ -913,7 +1000,21 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         // It is safe to run alongside the frontend call: `refreshComboOptionsFromDefs`
         // skips a dynamic (function) option source and writes the same values
         // `/object_info` just published.
-        refreshComboOptionsFromDefs(node, defsByType, type, undefined, mergedInputsFor(def, mergedCache, type));
+        const rebuilt = refreshComboOptionsFromDefs(
+          node,
+          defsByType,
+          type,
+          undefined,
+          mergedInputsFor(def, mergedCache, type),
+          // #1193 — the same object, so a combo this file could not rebuild is counted
+          // into `combosSkipped` at the widget that was skipped rather than inferred
+          // later from a total.
+          stats,
+        );
+        if (stats) {
+          stats.nodesSwept = (stats.nodesSwept ?? 0) + 1;
+          stats.combosRebuilt = (stats.combosRebuilt ?? 0) + rebuilt;
+        }
         // Stamp only onto a TYPE-SPECIFIC constructor (already carries nodeData
         // for this type) — never onto a shared generic/unknown fallback class,
         // which would corrupt every other unknown node.
@@ -928,6 +1029,12 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         if (reconcileUnknownWidgetNames(node, def)) repaired++;
       }
     }
+    // #1193 — the LAST statement inside the try, so `completed` means every graph was
+    // walked to the end. The sweep is best-effort and swallows its own throw below; a
+    // caller that treats a PARTIAL sweep as authoritative would be trusting combo lists
+    // that were never rebuilt. Set here, the flag cannot say "yes" for a sweep that
+    // stopped early — and stays absent, which is neither yes nor no, when it did.
+    if (stats) stats.completed = true;
   } catch {
     /* best-effort sweep */
   }

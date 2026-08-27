@@ -12,15 +12,56 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       # ---- Gate: never publish a broken pack to the Registry. -------------
       # web/js is served live and a broken save crashes the whole ComfyUI
       # frontend; these checks mirror ci.yml and run BEFORE publish. A failed
       # step aborts the job, so the publish step below only runs if all pass.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Read authoritative release version
+        id: release-version
+        shell: python
+        run: |
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          semver = re.compile(
+              r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+              r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          )
+          try:
+              with Path("pyproject.toml").open("rb") as pyproject:
+                  version = tomllib.load(pyproject)["project"]["version"]
+          except (KeyError, TypeError):
+              raise SystemExit("pyproject.toml [project].version is required")
+          if not isinstance(version, str) or semver.fullmatch(version) is None:
+              raise SystemExit("pyproject.toml [project].version must be strict SemVer")
+          output = os.environ.get("GITHUB_OUTPUT")
+          if not output:
+              raise SystemExit("GITHUB_OUTPUT is required")
+          with Path(output).open("a", encoding="utf-8", newline="") as output_file:
+              output_file.write(f"version={version}\n")
+
+      - name: Changelog release guard
+        env:
+          RELEASE_REF: ${{ github.sha }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: node scripts/check-changelog.mjs "$RELEASE_VERSION" --ref "$RELEASE_REF"
 
       - name: JS syntax check (web/js)
         shell: bash
@@ -38,7 +79,7 @@ jobs:
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
       # the root CI artefact also silently dropped web/js/vendor/ (the runtime
-      # marked/DOMPurify/qrcode/a2ui-lit imports) from the pack — the browser
+      # marked/DOMPurify/qrcode imports) from the pack — the browser
       # 404'd on import and the sidebar never registered (#749). The parity
       # scan below reimplements the matching root-anchored and cannot see this
       # class of loss, so assert with git's OWN ignore engine instead (empty
@@ -54,8 +95,16 @@ jobs:
             web/js/vendor/marked.esm.js \
             web/js/vendor/purify.es.js \
             web/js/vendor/qrcode.esm.js \
-            web/js/vendor/a2ui-lit.bundle.js \
           ; do
+            # A path that no longer exists passes check-ignore trivially, so a stale
+            # entry reads as coverage while asserting nothing at all.
+            # web/js/vendor/a2ui-lit.bundle.js sat in this list after #1865 deleted the
+            # file, and every publish stayed green over it (#1882). Fail on the stale
+            # entry itself, so this list cannot rot back into a no-op.
+            if [ ! -e "$f" ]; then
+              echo "::error file=.github/workflows/publish_action.yml::$f is listed in the pack-contents gate but does not exist — remove the entry or restore the file; a listed-but-missing path makes this check silently vacuous"
+              exit 1
+            fi
             if git -c core.excludesFile=.comfyignore check-ignore -q "$f"; then
               echo "::error file=.comfyignore::$f is exclude-matched but imported at runtime — the published pack would 404 on import and the sidebar would never register (#749)"
               exit 1
@@ -147,10 +196,6 @@ jobs:
       # absent — silently skipped its bundle assertions here while being mandatory in CI.
       # A publish path where a test quietly downgrades itself to a no-op is worse than one
       # that omits the test, because the summary still says it ran.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install comfyui_frontend_package (for the frontend-contract test)
         shell: bash
         run: |
@@ -206,7 +251,7 @@ jobs:
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib, re, sys
+          import tomllib, re, sys, json
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -219,13 +264,112 @@ jobs:
           js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
           assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
-          if m.group(1) != proj["version"]:
-              sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} PANEL_VERSION={m.group(1)} — run scripts/set-version.mjs")
-          print(f"publishing {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          # The three original witnesses have the reason spelled out in ci.yml: pyproject and
+          # PANEL_VERSION are written by the same script, so comparing just those two cannot
+          # detect that the script never ran. package.json is the independent witness, and the
+          # rendered changelog is the fourth witness because it is what the panel displays.
+          pkg = json.load(open("package.json", encoding="utf-8")).get("version")
+          try:
+              rendered = json.load(open("web/changelog.json", encoding="utf-8"))
+          except (OSError, ValueError) as error:
+              sys.exit(f"VERSION MISMATCH: web/changelog.json is unreadable — {error}")
+          releases = rendered.get("releases") if isinstance(rendered, dict) else None
+          rendered_version = (
+              releases[0].get("version")
+              if isinstance(releases, list)
+              and releases
+              and isinstance(releases[0], dict)
+              and isinstance(releases[0].get("version"), str)
+              else None
+          )
+          # web/changelog.json is the rendered artefact the panel actually ships and displays.
+          # Its newest record is a fourth witness: a release can leave all three version files
+          # coherent while still shipping notes that stop one version short (#1899).
+          seen = {
+              "package.json": pkg,
+              "pyproject.toml": proj["version"],
+              "PANEL_VERSION": m.group(1),
+              "web/changelog.json": rendered_version,
+          }
+          if len(set(seen.values())) != 1:
+              sys.exit("VERSION MISMATCH: " + ", ".join(f"{k}={v}" for k, v in seen.items()) + " — run scripts/set-version.mjs")
+          print(f"publishing {proj['name']} {proj['version']} (all four release version witnesses match)")
           PY
       # --------------------------------------------------------------------
 
+      # Every publish to the Registry has shipped with a BLANK changelog.
+      # `comfy node publish` accepts `--changelog-file <path>` — the Registry
+      # shows it in the pack's Updates section — but the wrapper action below
+      # never passed one. CHANGELOG.md is already curated per version, so it
+      # is the honest source. Same underlying gap as comfyui-mcp's GitHub
+      # Release fix (mcp#1138); this is its Registry twin.
+      #
+      # The authoritative version and its non-empty changelog section are required
+      # by the release guard above. This extraction remains fail-open only for the
+      # Registry's optional --changelog-file convenience.
+      # THIS STEP CANNOT FAIL THE JOB, BY CONSTRUCTION. Release notes are a
+      # nicety; the release itself is not. There is deliberately no `set -e`
+      # and the step ends in `exit 0`, so every way this can go wrong — no
+      # an extraction failure lands in the same place: `path=` empty, and the
+      # publish step below ships without optional changelog notes. A missing or
+      # empty current-version section cannot reach this step because the guard above
+      # already fails the job.
+      #
+      - name: Extract this version's changelog for the Registry
+        id: changelog
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          set -uo pipefail
+          version="$RELEASE_VERSION"
+          if [ -n "$version" ] && node scripts/changelog-section.mjs "$version" > registry-changelog.md; then
+            echo "path=registry-changelog.md" >> "$GITHUB_OUTPUT"
+            echo "changelog for $version ($(wc -c < registry-changelog.md) chars):"
+            cat registry-changelog.md
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "::warning::No usable CHANGELOG section (version='${version}') — publishing with no changelog."
+          fi
+          exit 0
+
+      # Previously `uses: Comfy-Org/publish-node-action@main` — a thin wrapper
+      # over exactly these three steps with no way to pass --changelog-file
+      # through it (github.com/Comfy-Org/publish-node-action/blob/main/action.yml
+      # exposes only personal_access_token/skip_checkout). Inlined instead of
+      # relying on undocumented env-var propagation into a third-party
+      # composite action's internals.
+      #
+      # THE CHANGELOG MUST NEVER COST US THE RELEASE. Adding `--changelog-file`
+      # to a command that worked without it introduces new ways for that command
+      # to fail, and they are not hypothetical — in comfy-cli's own
+      # `resolve_publish_changelog` an unreadable or non-UTF-8 changelog file is
+      # `typer.Exit(code=1)`, and `pip install comfy-cli` is unpinned, so a
+      # version predating the flag would reject the argument outright. Either
+      # would have aborted the publish under the previous single-attempt shape.
+      #
+      # So: attempt WITH the notes, and on any failure retry WITHOUT them. The
+      # fallback is a genuine second `comfy node publish`, which is safe for the
+      # dominant failure modes above because they happen during argument parsing
+      # or file reading, before anything is uploaded. If the first attempt
+      # instead died *after* registering the version, the retry will fail on the
+      # duplicate and the job goes red — a loud, accurate "already published"
+      # rather than a silently skipped release.
+      #
+      # Note the secret and the path move into `env:` rather than being
+      # interpolated by `${{ }}` into the script body, so neither is expanded
+      # into the shell source that the runner echoes and parses.
       - name: Publish custom node
-        uses: Comfy-Org/publish-node-action@main
-        with:
-          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        env:
+          CHANGELOG_PATH: ${{ steps.changelog.outputs.path }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          pip install comfy-cli
+          comfy --skip-prompt --no-enable-telemetry env
+          if [ -n "$CHANGELOG_PATH" ]; then
+            if comfy node publish --changelog-file "$CHANGELOG_PATH" --token "$REGISTRY_TOKEN"; then
+              exit 0
+            fi
+            echo "::warning::Registry publish with --changelog-file failed — retrying WITHOUT the changelog so the release still ships."
+          fi
+          comfy node publish --token "$REGISTRY_TOKEN"

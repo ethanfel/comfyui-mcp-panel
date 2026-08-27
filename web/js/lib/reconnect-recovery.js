@@ -94,6 +94,72 @@ export async function watchPostReconnectSettle({
 }
 
 /**
+ * #1641 — wait for the post-restart handshake before `workflow_open` compares
+ * content.
+ *
+ * After a ComfyUI restart the tab can answer `workflow_open` (and even
+ * `workflow_list`) before the backend socket, the node-def refresh kicked on
+ * `reconnected`, and the restored canvas binding have finished one synchronized
+ * handshake. The first open of the already-active workflow then reports
+ * CONTENT_UNVERIFIED — "the graph on it does not match the state that was
+ * loaded" — and publishes no `workflow_uuid`, so the orchestrator answers
+ * `FENCE: NOT cleared (active identity UNCONFIRMED after reconnect handshake)`.
+ * A retry a moment later succeeds without changing the workflow.
+ *
+ * This wait is NOT a binding proof and does not repaint. If the handshake never
+ * lands, the open proceeds: it is the documented recovery for a restore that
+ * never settles (#646). The wait only buys a settled canvas for the common
+ * case so the first open is the one that succeeds.
+ *
+ * Cadence matches the orchestrator's post-open handshake ([400, 900, 1600] ms)
+ * so a caller that already waited there is not waiting a second, longer budget
+ * here; a caller that hits the panel first pays the same ~2.9s once.
+ */
+export const OPEN_RECONNECT_HANDSHAKE_STEPS_MS = Object.freeze([400, 900, 1600]);
+
+/**
+ * @param {{
+ *   needsWait?: () => boolean,  // true while the handshake is still in flight
+ *   isReady?: () => boolean,    // true when the open may compare content
+ *   sleep?: (ms: number) => Promise<void>,
+ *   stepsMs?: readonly number[],
+ * }} o
+ * @returns {Promise<"ready"|"timeout">}
+ */
+export async function waitForReconnectHandshakeBeforeOpen({
+  needsWait,
+  isReady,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  stepsMs = OPEN_RECONNECT_HANDSHAKE_STEPS_MS,
+} = {}) {
+  const pending = () => {
+    try {
+      return typeof needsWait === "function" && needsWait() === true;
+    } catch {
+      // An unreadable probe is not a reason to stall the open — the open itself
+      // is the recovery (#646). Same direction as a throwing settle-watch proof.
+      return false;
+    }
+  };
+  const ready = () => {
+    try {
+      return typeof isReady === "function" && isReady() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (!pending()) return "ready";
+  if (ready()) return "ready";
+  const steps = Array.isArray(stepsMs) && stepsMs.length ? stepsMs : OPEN_RECONNECT_HANDSHAKE_STEPS_MS;
+  for (const waitMs of steps) {
+    const ms = Number(waitMs);
+    if (Number.isFinite(ms) && ms > 0) await sleep(ms);
+    if (ready() || !pending()) return "ready";
+  }
+  return ready() ? "ready" : "timeout";
+}
+
+/**
  * The #646 graph-mutation gate: the refusal message for a mutating graph
  * command that arrives while the post-reconnect environment is known-unstable,
  * or null when the command may run. Two independent instability signals:
@@ -137,6 +203,90 @@ export async function watchPostReconnectSettle({
 function brandGateRefusal(refusal) {
   GATE_REFUSALS.add(refusal);
   return refusal;
+}
+
+/** ComfyUI's WebSocket OPEN readyState. Inlined so Node tests need no DOM WebSocket. */
+export const WS_OPEN = 1;
+
+/**
+ * #1325 — is the backend socket actually down RIGHT NOW?
+ *
+ * The sticky `comfyBackendSocketDown` flag is necessary: ComfyUI announces a drop
+ * as events, and a mutation in that gap is the #646 applied-then-wiped hazard.
+ * It is not sufficient. ComfyUI also dispatches `status` with a null payload from
+ * `_pollQueue` whenever `GET /prompt` fails, and that poller — once started —
+ * runs for the life of the tab. A long GPU-bound render (Wan 2.2 dual-pass)
+ * blocks the backend event loop, the poll fails, the flag arms, and `reconnected`
+ * never fires again because the websocket never left OPEN. Graph reads keep
+ * working (they read the local canvas); mutations stay refused forever.
+ *
+ * The live readyState is the fact a restore-is-incoming decision can rest on:
+ * OPEN means no canvas rebuild is in flight. Flagged-down + OPEN is a stale or
+ * busy-poll signal, not a down socket.
+ *
+ * An omitted/unknown readyState + flaggedDown still refuses — fail closed when
+ * we cannot see the socket, which is the #646 direction.
+ */
+export function backendSocketIsDown({ flaggedDown = false, socketReadyState } = {}) {
+  if (flaggedDown !== true) return false;
+  if (socketReadyState === WS_OPEN) return false;
+  return true;
+}
+
+/**
+ * #1325 — classify a ComfyUI `status` event for the mutation-guard flag.
+ *
+ *   - "alive"  — a real queue/status payload; the backend is talking
+ *   - "lost"   — null payload AND the socket is not OPEN (the close-handler signal)
+ *   - "ignore" — null payload while the socket is still OPEN (busy `/prompt` poll)
+ */
+export function classifyBackendStatusEvent({ detail, socketReadyState } = {}) {
+  if (detail != null && typeof detail === "object") return "alive";
+  if (detail == null) {
+    return socketReadyState === WS_OPEN ? "ignore" : "lost";
+  }
+  return "ignore";
+}
+
+const BACKEND_SOCKET_DOWN_NOTE =
+  "ComfyUI's backend connection is down (a restart or reconnect is in progress). " +
+  "The canvas is still readable from local state, but graph mutations are refused " +
+  "until the backend reconnects. Wait a few seconds and retry; if it never comes " +
+  "back, reload the ComfyUI page or restart ComfyUI.";
+
+/**
+ * #1325 — binding-status view of the backend socket.
+ *
+ * Canvas binding ("bound") is a different question (who owns this graph). A
+ * reply that reports only `bound`/`already_current` while mutations are gated
+ * is the #1325 misread: the agent retries the wrong recovery. When the socket
+ * is down, `graph_binding` is "reconnecting" and `canvas_binding` still names
+ * the canvas identity so the two facts stay distinguishable.
+ */
+export function describeGraphMutationReadiness({
+  flaggedDown = false,
+  socketReadyState,
+  canvasBinding,
+} = {}) {
+  const down = backendSocketIsDown({ flaggedDown, socketReadyState });
+  const canvas =
+    canvasBinding === "bound" || canvasBinding === "foreign" || canvasBinding === "unknown"
+      ? canvasBinding
+      : null;
+  if (down) {
+    return {
+      backend_socket: "reconnecting",
+      mutations_ready: false,
+      graph_binding: "reconnecting",
+      ...(canvas ? { canvas_binding: canvas } : {}),
+      backend_socket_note: BACKEND_SOCKET_DOWN_NOTE,
+    };
+  }
+  return {
+    backend_socket: "up",
+    mutations_ready: true,
+    ...(canvas ? { canvas_binding: canvas, graph_binding: canvas } : {}),
+  };
 }
 
 export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSettleWindow = false } = {}) {

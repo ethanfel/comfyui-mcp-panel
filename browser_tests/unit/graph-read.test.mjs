@@ -5,14 +5,21 @@
 //          stored value as if it were the value that executes.
 //   #609 — one oversized widget blob (or several nodes) must not blow the whole
 //          max_chars budget and return shown:0 for a node asked for by id.
+//   #342 — a link's recorded target_slot goes stale when the target's inputs are
+//          compacted; the outline must resolve the LIVE backlink and render
+//          NOTHING for an orphaned link.
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
   WIDGET_VALUE_CAP,
+  DETAIL_WIDGET_VALUE_CEILING,
+  clampDetailWidgetCap,
+  COMPACT_VALUE_CLIP,
   linkDrivenWidgets,
   drivenWidgetsFor,
   drivenTag,
+  liveLinkTargetInput,
   capWidgetValue,
   capSummaryWidgets,
   clipLine,
@@ -33,6 +40,8 @@ import {
   clipOutlineTitle,
   OUTLINE_TITLE_CAP,
   MAX_CHARS_CEILING,
+  // #1748
+  NOTE_NODE_TYPES,
 } from "../../web/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
@@ -118,6 +127,40 @@ test("capWidgetValue clips an oversized string and reports the drop (#609)", () 
   assert.ok(JSON.stringify(out).length <= WIDGET_VALUE_CAP, "ESCAPED size within the cap");
 });
 
+test("capWidgetValue preserves a quote-heavy object whose single JSON encoding fits (#1681)", () => {
+  const value = { prompt: '"'.repeat(3000), items: ["\\", '"', "\n"] };
+  const serialized = JSON.stringify(value);
+  assert.ok(serialized.length < 8192, "the actual object encoding fits the explicit cap");
+  assert.ok(JSON.stringify(serialized).length > 8192, "double-escaping would incorrectly reject it");
+
+  const out = capWidgetValue(value, 8192);
+  assert.equal(out, value, "fitting non-string values keep identity");
+  assert.equal(typeof out, "object");
+  assert.equal(JSON.stringify(out), serialized, "JSON output is unchanged");
+});
+
+test("#1681 detail widget cap keeps the default and clamps opt-in requests", () => {
+  assert.equal(clampDetailWidgetCap(undefined), WIDGET_VALUE_CAP);
+  assert.equal(clampDetailWidgetCap(1024), WIDGET_VALUE_CAP, "the default cap is not lowered");
+  assert.equal(clampDetailWidgetCap(8192), 8192);
+  assert.equal(clampDetailWidgetCap(1e9), DETAIL_WIDGET_VALUE_CEILING);
+  assert.equal(clampDetailWidgetCap("not-a-number"), WIDGET_VALUE_CAP);
+});
+
+test("#1681 an explicit detail cap returns a long widget without changing its shape", () => {
+  const value = "prompt-" + "x".repeat(5000);
+  const summary = capSummaryWidgets({ id: 78, type: "MarkdownNote", widgets: { text: value } }, 8192, 12000);
+  assert.deepEqual(Object.keys(summary), ["id", "type", "widgets"]);
+  assert.equal(summary.widgets.text, value);
+  assert.equal(JSON.parse(JSON.stringify(summary)).widgets.text, value);
+});
+
+test("#1681 an opt-in cap still yields to the total max_chars budget", () => {
+  const capped = capSummaryWidgets({ id: 78, widgets: { text: "x".repeat(50000), other: 1 } }, 32768, 5000);
+  assert.ok(JSON.stringify(capped).length < 5000 * 2, "detail remains bounded by the total budget");
+  assert.match(capped.widgets.text, /over the `max_chars` budget/);
+});
+
 test("capWidgetValue bounds by ESCAPED size for control chars / surrogates (#609)", () => {
   // NUL escapes to 6 chars each (\\u0000); a raw-length cap would blow the budget.
   const nuls = String.fromCharCode(0).repeat(5000);
@@ -178,6 +221,62 @@ test("capSummaryWidgets tightens the per-value cap to a SMALL total budget (#609
   // #809 (codex gate): the raise must state HOW FAR. "raise `max_chars`" with no ceiling
   // leaves a caller unable to tell whether the retry is even possible.
   assert.match(capped.widgets.blob, /over the `max_chars` budget; raise `max_chars` \(up to 60000\)\)$/);
+});
+
+test("#1402: duplicate_widgets is bounded by the SAME budget, not exempt from it", () => {
+  // duplicate_widgets carries a value per OCCURRENCE, and the node it exists for (a Fast
+  // Groups Bypasser over many groups) is exactly the one that repeats a row many times.
+  // Left uncapped it would push the detail past max_chars and fitDetailLine would stub
+  // the WHOLE row — the field would make the read carry LESS than before it existed.
+  const rows = Array.from({ length: 40 }, (_, i) => ({
+    index: i,
+    label: `Enable GROUP ${i}`,
+    value: "z".repeat(500),
+  }));
+  const capped = capSummaryWidgets(
+    { id: 1, widgets: { RGTHREE_TOGGLE_AND_NAV: "z".repeat(500) }, duplicate_widgets: { RGTHREE_TOGGLE_AND_NAV: rows } },
+    WIDGET_VALUE_CAP,
+    3000,
+  );
+  assert.ok(JSON.stringify(capped).length < 3000 * 2, `line bounded, got ${JSON.stringify(capped).length}`);
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(capped)), "still valid JSON");
+  // Dropped occurrences are ANNOUNCED with the lever that lifts them, never silently
+  // lost — a silent drop here is the collapsed map's failure wearing a different key.
+  assert.match(
+    capped.duplicate_widgets["…"],
+    /more duplicate widget occurrence\(s\) cut by the `max_chars` budget; raise `max_chars` \(up to 60000\)/,
+  );
+  // At least one occurrence always survives, so the field never renders empty.
+  assert.ok(capped.duplicate_widgets.RGTHREE_TOGGLE_AND_NAV.length >= 1);
+  // The input is not mutated (the #609 contract for `widgets` holds here too).
+  assert.equal(rows.length, 40);
+  assert.equal(rows[0].value.length, 500);
+});
+
+test("#1402: a duplicate report that FITS is passed through untouched", () => {
+  // The common affected node — two rgthree toggle rows — is far under budget and must
+  // arrive exactly as summarizeNode built it, markers and clipping nowhere in sight.
+  const duplicate_widgets = {
+    RGTHREE_TOGGLE_AND_NAV: [
+      { index: 0, label: "Enable MODEL FL2", value: { toggled: true } },
+      { index: 1, label: "Enable MODEL REF", value: { toggled: false } },
+    ],
+  };
+  const summary = { id: 1, widgets: { RGTHREE_TOGGLE_AND_NAV: { toggled: false } }, duplicate_widgets };
+  const capped = capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000);
+  assert.deepEqual(capped.duplicate_widgets, duplicate_widgets);
+  assert.ok(!("…" in capped.duplicate_widgets), "nothing was cut, so nothing is announced");
+  // Nothing changed at all ⇒ the identical object comes back, as with an uncapped node.
+  assert.equal(capped, summary);
+});
+
+test("#1402: a summary with NO duplicates is untouched — the common node is unchanged", () => {
+  const summary = { id: 1, widgets: { seed: 1, steps: 20 } };
+  assert.equal(capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000), summary);
+  assert.ok(!("duplicate_widgets" in capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000)));
+  // A widgets-only clip must not invent the key either.
+  const clipped = capSummaryWidgets({ id: 1, widgets: { blob: "x".repeat(5000) } }, WIDGET_VALUE_CAP, 600);
+  assert.ok(!("duplicate_widgets" in clipped));
 });
 
 test("capSummaryWidgets stays bounded on ESCAPE-HEAVY content at a small budget (#609)", () => {
@@ -368,6 +467,33 @@ test("#809 the outline footer covers title clips as well as value clips", () => 
   assert.match(both, /`max_chars` does not raise/);
 });
 
+test("#1748 the outline footer names NOTE nodes whose text was clipped", () => {
+  // No note ids → byte-identical to the old footer: an unnoted graph pays nothing and
+  // the clause never fires on title-only clips either.
+  assert.equal(outlineValueClipNote(2, 0), outlineValueClipNote(2, 0, []), "no ids, no clause");
+  const noted = outlineValueClipNote(3, 0, [7, 12]);
+  assert.match(noted, /3 widget value\(s\) clipped to 60 chars/);
+  assert.match(noted, /on-canvas note text \(node id\(s\): 7, 12\)/, "names the note nodes");
+  assert.match(noted, /trigger words and usage instructions/, "says WHY a note clip matters");
+  // The remedy that was already there still applies — detail reads the note up to the
+  // fixed per-widget cap.
+  assert.match(noted, /panel_query_graph \{ids:\[…\], fields:'detail'\}/);
+  // The id list is bounded: a graph dense with notes cannot flood the footer (the
+  // footer is part of the measured rung, but an unbounded list would still be noise).
+  const many = outlineValueClipNote(25, 0, Array.from({ length: 30 }, (_, i) => i + 1));
+  assert.match(many, /\+10 more/, "the id list is capped with an explicit remainder");
+  assert.doesNotMatch(many, /\b21\b/, "ids past the cap are not listed");
+});
+
+test("#1748 NOTE_NODE_TYPES is the positive allowlist of on-canvas prose nodes", () => {
+  assert.ok(NOTE_NODE_TYPES.has("Note"));
+  assert.ok(NOTE_NODE_TYPES.has("MarkdownNote"));
+  // A type that merely CONTAINS "note" is not prose-on-canvas by convention — the
+  // footer naming a non-note would send the agent reading instructions that are not.
+  assert.ok(!NOTE_NODE_TYPES.has("NoteToSelf"));
+  assert.ok(!NOTE_NODE_TYPES.has("Reroute"));
+});
+
 test("#809 shown-of-matched is always stated, so 'how much is left' is never guesswork", () => {
   for (const by of ["limit", "max_chars"]) {
     for (const ids of [true, false]) {
@@ -498,4 +624,125 @@ test("budget loop stays bounded for a large ids list — only the first overflow
   }
   assert.ok(shown >= 1 && shown < 10, `bounded: rendered ${shown} of 10, not all`);
   assert.equal(truncated, true, "the rest are honestly marked truncated");
+});
+
+// #1634 — a compact row's 60-char clip is a SURVEY cap. On a PINPOINT read (explicit
+// `ids`) it starved the very value the caller asked for: measured on a FOUR-node graph,
+// {ids:["2"]} returned a 300-char prompt cut at 60 in a 301-char reply against a
+// 12000-char budget. These pin the note's half of that fix — it must name the cap that
+// ACTUALLY fired, because at the fixed cap "use fields:detail" is a dead retry.
+test("#1634 the clip note names the cap actually in force", () => {
+  // Survey read: unchanged — 60 chars, and `fields`:"detail" is a live remedy.
+  const survey = compactClipNote(3);
+  assert.match(survey, /clipped to 60 chars by `fields`:"compact"/);
+  assert.match(survey, /read fuller values with `fields`:"detail"/);
+  assert.equal(compactClipNote(3), compactClipNote(3, 60), "60 is the survey default");
+
+  // Pinpoint at the FIXED cap: `fields`:"detail" applies the SAME cap, so pointing
+  // there would be exactly the dead retry #809 exists to remove.
+  const atCap = compactClipNote(1, WIDGET_VALUE_CAP);
+  assert.match(atCap, new RegExp(`clipped to ${WIDGET_VALUE_CAP} chars`));
+  assert.doesNotMatch(atCap, /read fuller values with `fields`:"detail"/);
+  assert.match(atCap, /no parameter raises/);
+
+  // #1634 (gate): there are exactly TWO honest forms, because the cap is uniform across
+  // the row and is only ever the survey clip or the fixed cap. An intermediate,
+  // budget-derived cap was tried and removed — it named a number that was in force for no
+  // widget, and called a cut "unraisable" that raising `max_chars` demonstrably lifted.
+  // The survey clip is one of them, verbatim.
+  assert.equal(compactClipNote(1, 60), compactClipNote(1), "the survey cap uses the survey note");
+  // Whichever form is emitted, the number it names is a cap that really applies — never a
+  // budget-derived figure that was in force for no widget.
+  for (const cap of [COMPACT_VALUE_CLIP, WIDGET_VALUE_CAP]) {
+    const named = /clipped to (\d+) chars/.exec(compactClipNote(1, cap))?.[1];
+    assert.equal(named, String(cap), `the note must name the cap in force (${cap})`);
+  }
+  assert.equal(compactClipNote(0, WIDGET_VALUE_CAP), "", "still silent when nothing clipped");
+});
+
+test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {
+  const prompt = "m".repeat(300);
+  // Survey cap starves it...
+  const survey = clipCompactValue(prompt, 60);
+  assert.equal(survey.clipped, true);
+  assert.ok(survey.text.length < 70);
+  // ...the pinpoint cap carries it whole, with no clip to report.
+  const pinpoint = clipCompactValue(prompt, WIDGET_VALUE_CAP);
+  assert.equal(pinpoint.clipped, false);
+  assert.equal(pinpoint.text, prompt);
+});
+
+// ---- #342: live target-slot resolution for the outline ---------------------
+
+// The #342 shape: `easy saveVideo` after `input_mode` (COMFY_DYNAMICCOMBO_V3)
+// collapsed — link 7's recorded target_slot (2, the old `input_mode.images`) is
+// stale, and slot 2 is now occupied by the BOOLEAN `output_mode.save_metadata`.
+// The live truth: NO input backlinks link 7 — the connection is gone.
+function saveVideoAfterComboCollapse() {
+  return {
+    id: 12,
+    type: "easy saveVideo",
+    inputs: [
+      { name: "input_mode", type: "COMBO", link: null },
+      { name: "output_mode.save_metadata", type: "BOOLEAN", link: null },
+      { name: "output_mode", type: "COMBO", link: null },
+      { name: "filename_prefix", type: "STRING", link: null },
+    ],
+  };
+}
+
+test("liveLinkTargetInput returns null for an orphaned link (slot removed) (#342)", () => {
+  // The orphaned record must render NOTHING — the old render showed it against
+  // save_metadata, fabricating a connection the graph no longer has.
+  assert.equal(liveLinkTargetInput(saveVideoAfterComboCollapse(), 7), null);
+});
+
+test("liveLinkTargetInput finds the live slot AFTER compaction shifted it (#342)", () => {
+  // A removed ref_video_0 input compacted the tail: link 9 was recorded against
+  // slot 3 but the input that still backlinks it now sits at index 2.
+  const node = {
+    id: 5,
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "ref_video_1", type: "VIDEO", link: 9 },
+      { name: "fps", type: "FLOAT", link: null },
+    ],
+  };
+  assert.deepEqual(liveLinkTargetInput(node, 9), { index: 1, name: "ref_video_1" });
+});
+
+test("liveLinkTargetInput resolves the ordinary uncompacted case (#342)", () => {
+  const node = {
+    id: 3,
+    inputs: [
+      { name: "model", type: "MODEL", link: 4 },
+      { name: "clip", type: "CLIP", link: null },
+    ],
+  };
+  assert.deepEqual(liveLinkTargetInput(node, 4), { index: 0, name: "model" });
+});
+
+test("liveLinkTargetInput keeps the index when the live input has no name (#342)", () => {
+  const node = { id: 8, inputs: [{ type: "IMAGE", link: 2 }] };
+  assert.deepEqual(liveLinkTargetInput(node, 2), { index: 0, name: undefined });
+});
+
+test("liveLinkTargetInput matches a string link id against a numeric backlink (#342)", () => {
+  const node = { id: 8, inputs: [{ name: "image", type: "IMAGE", link: 7 }] };
+  assert.deepEqual(liveLinkTargetInput(node, "7"), { index: 0, name: "image" });
+});
+
+test("liveLinkTargetInput never matches an unlinked input — even to link id 0 (#342)", () => {
+  // Number(null) is 0: without the null guard, link id 0 would "resolve" to the
+  // first UNCONNECTED input and fabricate the very connectivity #342 removes.
+  const node = { id: 8, inputs: [{ name: "image", type: "IMAGE", link: null }] };
+  assert.equal(liveLinkTargetInput(node, 0), null);
+});
+
+test("liveLinkTargetInput never throws on malformed nodes (#342)", () => {
+  assert.equal(liveLinkTargetInput(null, 1), null);
+  assert.equal(liveLinkTargetInput({}, 1), null);
+  // Holes in the inputs array are skipped, not crashed on.
+  assert.equal(liveLinkTargetInput({ inputs: [null, undefined] }, 3), null);
+  assert.deepEqual(liveLinkTargetInput({ inputs: [null, { link: 3 }] }, 3), { index: 1, name: undefined });
 });

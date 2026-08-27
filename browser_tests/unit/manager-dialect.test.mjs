@@ -21,6 +21,7 @@ const {
   legacyUpdateBody,
   assertBatchOk,
   classifyUpdateOutcome,
+  taskFailureReason,
 } = ManagerInstall;
 
 const UNREACHABLE = "ComfyUI-Manager not reachable (is the built-in Manager enabled?)";
@@ -91,7 +92,10 @@ function buildTransportsOverRejectingFetch(thrown) {
     "classifyManager404",
     "markManagerUnreachable",
     "managerFetchFailureMessage",
-    `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "AbortSignal",
+    `${pick(src, /function anyAbortSignal\(signals\) \{[\s\S]*?\n\}/, "anyAbortSignal")}
+${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
   );
@@ -104,6 +108,8 @@ return { managerV2, managerCall };`,
     classifyManager404,
     ManagerInstall.markManagerUnreachable,
     (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+    15000,
+    AbortSignal,
   );
 }
 
@@ -156,7 +162,11 @@ test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-respo
     // recognises it without reading the (translated) message. Real implementation,
     // same as classifyManager404.
     "markManagerUnreachable",
-    `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
+    "managerFetchFailureMessage",
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "AbortSignal",
+    `${pick(src, /function anyAbortSignal\(signals\) \{[\s\S]*?\n\}/, "anyAbortSignal")}
+${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
   );
@@ -168,6 +178,9 @@ return { managerV2, managerCall };`,
       { fetchApi: async () => res },
       classifyManager404,
       ManagerInstall.markManagerUnreachable,
+      (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+      15000,
+      AbortSignal,
     );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/status").then(
@@ -205,6 +218,10 @@ return { managerV2, managerCall };`,
     const { managerV2: mv2, managerCall: mcall } = factory(
       { fetchApi: async () => secRes },
       classifyManager404,
+      ManagerInstall.markManagerUnreachable,
+      (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+      15000,
+      AbortSignal,
     );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/install").then(
@@ -228,7 +245,14 @@ return { managerV2, managerCall };`,
         throw new Error("stream already consumed");
       },
     };
-    const { managerV2: mv2 } = factory({ fetchApi: async () => brokenBody }, classifyManager404);
+    const { managerV2: mv2 } = factory(
+      { fetchApi: async () => brokenBody },
+      classifyManager404,
+      ManagerInstall.markManagerUnreachable,
+      (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+      15000,
+      AbortSignal,
+    );
     const err = await mv2("manager/queue/status").then(
       () => null,
       (e) => e,
@@ -588,6 +612,7 @@ function buildGraphUpdateNode(deps) {
 function graphUpdateDeps(overrides) {
   return {
     detectManagerDialect: async () => "legacy",
+    resolveManagerUpdateTarget: async (id) => id,
     crypto: { randomUUID: () => "u-1" },
     api: { clientId: "c-1" },
     legacyUpdateBody,
@@ -609,6 +634,11 @@ function graphUpdateDeps(overrides) {
       status: QUEUE_STATUS,
     }),
     classifyUpdateOutcome,
+    // #1320 — finalizeUpdate reads the log only on a generic Manager failure.
+    // Dialect tests stub waitForUpdateResult to a success, so these stay quiet.
+    isGenericManagerUpdateError: () => false,
+    readUpdateTraceback: async () => null,
+    taskFailureReason,
     ...overrides,
   };
 }
@@ -971,6 +1001,10 @@ function nodesInstallDeps(overrides) {
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),
+    // comfyui-mcp#1606 — the ui_id ↔ pack correlation the handler records so a
+    // captured Manager failure can name what it was installing. A REAL log, so
+    // a regression in that call surfaces here instead of hitting a no-op stub.
+    managerTaskResults: ManagerInstall.createManagerTaskResultLog(),
     ...overrides,
   };
 }

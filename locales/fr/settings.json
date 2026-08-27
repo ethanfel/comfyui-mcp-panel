@@ -23,9 +23,9 @@
     "name": "Backend d'agent par défaut",
     "tooltip": "L'agent d'arrière-plan auquel le panneau se connecte par défaut. Claude tourne sur votre abonnement Claude ; ChatGPT sur votre compte Codex (ChatGPT) ; Gemini sur votre connexion Google (Gemini). Amorce le backend du panneau (et détermine quel groupe ci-dessous amorce le runtime) ; vous pouvez toujours changer à chaud dans le sélecteur de modèles (un changement à chaud ne vaut que pour la session et ne modifie PAS cette valeur par défaut)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Connexion automatique au chargement",
-    "tooltip": "Connecte automatiquement l'agent (en démarrant l'orchestrateur local) à l'ouverture du panneau, sans cliquer sur Connecter. Désactivé par défaut — sinon l'orchestrateur n'est démarré que par un clic explicite sur Connecter."
+  "comfyui-mcp_autostartMcp": {
+    "name": "Démarrage automatique de MCP",
+    "tooltip": "À l'ouverture de ce panneau, demande au lanceur compagnon installé explicitement d'ouvrir un terminal exécutant MCP s'il n'est pas déjà lancé."
   },
   "comfyui-mcp_language": {
     "name": "Langue du panneau",
@@ -47,6 +47,10 @@
     "name": "Afficher RunPod / Local",
     "tooltip": "Affiche le bouton d'hôte RunPod / Local dans la barre d'outils — déployer, démarrer, arrêter ou connecter un pod GPU cloud, ou revenir en local. Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "Aperçus vidéo dans le chat",
+    "tooltip": "Lire les vidéos générées directement dans le chat. Désactivez pour économiser la RAM : la vidéo apparaît alors comme un espace réservé avec sa première image et son nom de fichier, et un clic ouvre la vidéo complète dans la visionneuse. S'applique aux vidéos générées après le changement ; les cartes déjà présentes dans le chat conservent leur lecteur."
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Obtenir l'appli bêta",
     "tooltip": "Téléchargements réservés aux testeurs de l'appli mobile ComfyUI MCP. iOS s'installe via Apple TestFlight ; Android via Firebase App Distribution. Les deux canaux sont en bêta : les builds sont mis à jour souvent et peuvent exiger un réappairage avec ce panneau."
@@ -65,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "URL du pont (avancé)",
-    "tooltip": "URL WebSocket du pont de l'orchestrateur du panneau — UN seul pont dessert désormais tous les fournisseurs (par défaut ws://127.0.0.1:9180). Ne la changez que si vous démarrez l'orchestrateur sur un port non standard (COMFYUI_MCP_BRIDGE_PORT). S'applique au prochain Connecter."
+    "tooltip": "URL WebSocket du pont de l'orchestrateur du panneau — UN seul pont dessert désormais tous les fournisseurs (par défaut ws://127.0.0.1:9199). Ne la changez que si vous démarrez l'orchestrateur sur un port non standard (COMFYUI_MCP_BRIDGE_PORT). S'applique au prochain Connecter."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Zoomer sur les modifications de l'agent",
@@ -110,6 +114,10 @@
   "comfyui-mcp_defaultModel_grok": {
     "name": "Modèle par défaut",
     "tooltip": "Modèle par défaut de l'agent d'arrière-plan Grok, choisi parmi les modèles récupérés pour Grok (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Grok, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Qwen Code, choisi parmi les modèles récupérés pour Qwen Code (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Qwen Code, seuls « Auto » et votre choix enregistré peuvent apparaître."
   },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Modèle par défaut",
@@ -170,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Effort de raisonnement par défaut",
     "tooltip": "Grok n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Qwen Code n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Effort de raisonnement par défaut",

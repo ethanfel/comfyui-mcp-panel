@@ -208,6 +208,75 @@ export function parseInstalled(raw) {
 }
 
 /**
+ * #1496 — which filter a `nodes_list` command asked for.
+ * `search` is the reporter's key (and the compact-mode list_tools filter).
+ * `query` is the alias panel_search_nodes / panel_find_nodes already use.
+ * Prefer `search` when both are non-empty.
+ */
+export function installedListQuery(args = {}) {
+  const search = args?.search;
+  const query = args?.query;
+  if (typeof search === "string" && search.trim()) return { key: "search", value: search };
+  if (typeof query === "string" && query.trim()) return { key: "query", value: query };
+  return { key: null, value: "" };
+}
+
+function installedEntryHay(entry, mapKey) {
+  if (typeof entry === "string") return entry.toLowerCase();
+  if (!entry || typeof entry !== "object") return String(mapKey ?? "").toLowerCase();
+  return [mapKey, entry.title, entry.module, entry.cnr_id, entry.aux_id, entry.ver]
+    .filter((v) => typeof v === "string" && v)
+    .join(" ")
+    .toLowerCase();
+}
+
+/** Filter a raw Manager `/customnode/installed` payload, preserving map vs array shape. */
+export function filterInstalledPayload(raw, query) {
+  const terms = queryTerms(query);
+  if (Array.isArray(raw)) {
+    const total = raw.length;
+    if (!terms.length) return { installed: raw, total, count: total };
+    const installed = raw.filter((entry) => matchesAllTerms(installedEntryHay(entry), terms));
+    return { installed, total, count: installed.length };
+  }
+  if (raw && typeof raw === "object") {
+    const entries = Object.entries(raw);
+    const total = entries.length;
+    if (!terms.length) return { installed: raw, total, count: total };
+    const installed = Object.create(null);
+    for (const [k, v] of entries) {
+      if (matchesAllTerms(installedEntryHay(v, k), terms)) installed[k] = v;
+    }
+    return { installed, total, count: Object.keys(installed).length };
+  }
+  return { installed: raw, total: 0, count: 0 };
+}
+
+/**
+ * #1496 — `panel_list_nodes` result. No filter → `{installed}` as before.
+ * A `search`/`query` filters the payload and discloses count/total so a miss
+ * cannot be read as "nothing is installed".
+ */
+export function listedNodesResult(raw, args = {}) {
+  const { key, value } = installedListQuery(args);
+  if (!key) return { installed: raw };
+  const filtered = filterInstalledPayload(raw, value);
+  const out = {
+    installed: filtered.installed,
+    [key]: value,
+    count: filtered.count,
+    total: filtered.total,
+  };
+  if (filtered.count === 0) {
+    out.note =
+      `0 of ${filtered.total} installed packs matched ${key} "${value}". ` +
+      `This filters ALREADY-INSTALLED packs, not the installable registry — ` +
+      `use panel_search_nodes with query for packs you can install.`;
+  }
+  return out;
+}
+
+/**
  * Does the installed-nodes list contain the pack we just tried to install?
  * `idOrUrl` is the install target — a registry id (author/pack or CNR id) or a
  * git URL. For a git URL we match on the derived repo name. Compares against
@@ -231,6 +300,39 @@ export function nodeInstalledMatches(idOrUrl, installed) {
     }
     return candidates.includes(wanted) || candidates.includes(repoName);
   });
+}
+
+/**
+ * Resolve a caller's installed directory, registry id, or repository spelling
+ * to the key ComfyUI-Manager uses for `active_nodes` updates. The installed
+ * endpoint is keyed by the on-disk module name, but a registry install may
+ * carry a different `cnr_id`; Manager indexes that same pack by `cnr_id`.
+ * Unknown git packs use the repository basename from `aux_id` before their
+ * directory name.
+ * Returns null when the installed list does not identify a matching pack.
+ */
+export function resolveInstalledUpdateId(idOrUrl, installed) {
+  if (!idOrUrl) return null;
+  const nodes = Array.isArray(installed) && installed.every((n) => n && "module" in n)
+    ? installed
+    : parseInstalled(installed);
+  const wanted = String(idOrUrl).trim().toLowerCase();
+  const repoName = looksLikeGitUrl(idOrUrl) ? gitRepoName(idOrUrl).toLowerCase() : wanted;
+  const node = nodes.find((entry) => {
+    const candidates = [];
+    for (const value of [entry.module, entry.cnrId, entry.auxId]) {
+      if (!value) continue;
+      const normalized = String(value).trim().toLowerCase();
+      candidates.push(normalized, baseName(normalized));
+    }
+    return candidates.includes(wanted) || candidates.includes(repoName);
+  });
+  if (!node) return null;
+  return (
+    node.cnrId ||
+    (node.auxId ? baseName(node.auxId) : null) ||
+    (node.module && node.module !== "unknown" ? node.module : null)
+  );
 }
 
 /** Has the Manager queue POSITIVELY drained? True ONLY for a well-formed status
@@ -574,10 +676,22 @@ export function matchesAllTerms(hay, terms) {
 }
 
 /**
+ * #1287 — the most `limit` panel_search_nodes will return. The orchestrator's input
+ * schema rejects anything above this (MCP -32602, `maximum: 40`) and the panel applies
+ * the same bound when it slices results. A request ABOVE the cap is not an error — the
+ * search itself is valid — but silently returning fewer rows than asked is how a caller
+ * ends up reasoning over a truncated list as if it were the whole answer, so the result
+ * DISCLOSES the clamp as `limit_cap` whenever it bit.
+ */
+export const SEARCH_LIMIT_CAP = 40;
+
+/**
  * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
  * nodes_search result shape `{ count, results:[{id,title,description}] }`,
- * filtered by `query` and capped at `limit` (default 15, max 40). Pure so the
- * parse/filter is unit-testable away from the browser Manager client. Handles
+ * filtered by `query` and capped at `limit` (default 15, max SEARCH_LIMIT_CAP —
+ * a request above the cap is disclosed as `limit_cap`, never silently honored,
+ * #1287). Pure so the parse/filter is unit-testable away from the browser
+ * Manager client. Handles
  * both wire shapes: an ARRAY of pack objects, or the documented MAP keyed by
  * repo/url → [ [classNames…], { title, description, … } ]. Issues #251/#255.
  *
@@ -614,13 +728,18 @@ export function parseNodeMappings(data, query, limit) {
       push(meta?.id ?? meta?.reference ?? key, meta?.title, meta?.description);
     }
   }
-  const max = Math.min(Number(limit) || 15, 40);
+  const requested = Number(limit) || 15;
+  const max = Math.min(requested, SEARCH_LIMIT_CAP);
   // #808 — `catalogue_size` is how many packs the payload CONTAINED, before the query
   // filter. Without it, "the catalogue is empty" and "the catalogue is fine, your query
   // matched nothing" both arrive as `count: 0` — and the reader takes the first for the
   // second, concludes the pack does not exist, and goes on trying variations of a search
   // that cannot succeed. That conflation is the whole of #808.
-  return { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+  const result = { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+  // #1287 — the caller asked for more than the cap; say so, or the short list reads
+  // as the whole answer.
+  if (requested > SEARCH_LIMIT_CAP) result.limit_cap = SEARCH_LIMIT_CAP;
+  return result;
 }
 
 /**
@@ -646,7 +765,9 @@ export function catalogueSize(data) {
  * name → { display_name, category, description, ... } and is ALWAYS present on any
  * running ComfyUI, so an agent can still discover the nodes it can use RIGHT NOW.
  * Filters by `query` across class name / display_name / category / description and
- * caps at `limit` (default 15, max 40). Pure so it is unit-testable off-browser.
+ * caps at `limit` (default 15, max SEARCH_LIMIT_CAP — a request above the cap is
+ * disclosed as `limit_cap`, never silently honored, #1287). Pure so it is
+ * unit-testable off-browser.
  * `id` is the node class name (usable directly as a node type); these are already
  * installed, so no registry install id is needed.
  */
@@ -664,8 +785,12 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
       }
     }
   }
-  const max = Math.min(Number(limit) || 15, 40);
-  return { count: out.length, results: out.slice(0, max) };
+  const requested = Number(limit) || 15;
+  const max = Math.min(requested, SEARCH_LIMIT_CAP);
+  const result = { count: out.length, results: out.slice(0, max) };
+  // #1287 — same disclosure as the registry search: a clamped limit is named, not silent.
+  if (requested > SEARCH_LIMIT_CAP) result.limit_cap = SEARCH_LIMIT_CAP;
+  return result;
 }
 
 /**
@@ -676,17 +801,35 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
  * (the panel wires the live /object_info fetch) so this stays unit-testable, and
  * NEVER throws — any /object_info failure degrades to managerUnavailableResult.
  */
-export async function objectInfoSearchFallback(objectInfoGet, query, limit, err) {
+export async function objectInfoSearchFallback(
+  objectInfoGet,
+  query,
+  limit,
+  err,
+  requestSignal,
+  timeoutMs,
+  budgetSignal,
+  callerSignal,
+) {
+  const effectiveCallerSignal = callerSignal ?? (budgetSignal ? undefined : requestSignal);
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+  if (isAbortLikeError(err)) throw err;
   if (typeof objectInfoGet !== "function") return managerUnavailableResult(query, err);
   let info;
   try {
-    info = await objectInfoGet();
-  } catch {
+    info = await objectInfoGet(requestSignal ? { signal: requestSignal } : undefined);
+  } catch (fallbackErr) {
+    throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(fallbackErr)) throw fallbackErr;
     return managerUnavailableResult(query, err);
   }
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseObjectInfoSearch(info, query, limit);
   if (!parsed.count) return managerUnavailableResult(query, err);
-  return {
+  const result = {
     supported: true,
     managerReachable: false,
     source: "object_info",
@@ -701,6 +844,9 @@ export async function objectInfoSearchFallback(objectInfoGet, query, limit, err)
       "already available to use directly (add with panel_add_node). Searching/installing " +
       "NEW packs from the registry needs the built-in Manager (v4+) enabled.",
   };
+  // #1287 — the clamp disclosure must survive the fallback re-wrap too.
+  if (parsed.limit_cap) result.limit_cap = parsed.limit_cap;
+  return result;
 }
 
 /**
@@ -712,6 +858,7 @@ export async function objectInfoSearchFallback(objectInfoGet, query, limit, err)
  * result the caller can branch on. Issues #251/#255.
  */
 export function managerUnavailableResult(query, err) {
+  const timedOut = err?.managerSearchTimedOut === true;
   return {
     supported: false,
     managerReachable: false,
@@ -719,13 +866,67 @@ export function managerUnavailableResult(query, err) {
     results: [],
     query: query == null ? "" : String(query),
     reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
-    message:
-      "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
-      "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
-      "build without the search endpoint). Enable the built-in Manager to search the " +
-      "registry, or continue with the nodes already installed — inspect them with " +
-      "panel_list_nodes and the current graph with panel_query_graph.",
+    message: timedOut
+      ? "Node-registry search timed out before ComfyUI-Manager replied. No canvas " +
+        "workflow was changed. Retry the search; if the Manager remains slow or " +
+        "unresponsive, enable/check the built-in Manager and continue with nodes " +
+        "already installed via panel_list_nodes or the current graph via " +
+        "panel_query_graph."
+      : "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
+        "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
+        "build without the search endpoint). Enable the built-in Manager to search the " +
+        "registry, or continue with the nodes already installed — inspect them with " +
+        "panel_list_nodes and the current graph with panel_query_graph.",
   };
+}
+
+/** #1908 — Manager search is a canvas-independent read, but its command still
+ * returns through the browser tab that received it. Only the explicit internal
+ * budget is converted into a bounded, actionable result. Caller cancellation
+ * remains an AbortError so callers can stop the operation without it looking like
+ * a successful, structured Manager timeout. */
+function managerSearchTimedOutResult(query, timeoutMs) {
+  const err = new Error(
+    `ComfyUI-Manager node search timed out after ${timeoutMs ?? 15000} ms; no reply arrived.`,
+  );
+  err.managerSearchTimedOut = true;
+  return managerUnavailableResult(query, err);
+}
+
+function isAbortLikeError(err) {
+  return err?.name === "AbortError" || err?.name === "TimeoutError";
+}
+
+function managerSearchAbortError() {
+  return Object.assign(new Error("The Manager node search was cancelled"), {
+    name: "AbortError",
+  });
+}
+
+function throwIfManagerSearchCallerAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? managerSearchAbortError();
+}
+
+/** Compose the caller's cancellation with the internal budget for transport, while
+ * keeping the two source signals separate for result classification. */
+function managerSearchRequestSignal(callerSignal, budgetSignal) {
+  if (!callerSignal) return budgetSignal;
+  if (!budgetSignal) return callerSignal;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") {
+    return AbortSignal.any([callerSignal, budgetSignal]);
+  }
+  const controller = new AbortController();
+  const forward = (source) => {
+    if (source.aborted) {
+      controller.abort(source.reason);
+      return true;
+    }
+    source.addEventListener("abort", () => controller.abort(source.reason), { once: true });
+    return false;
+  };
+  if (forward(callerSignal)) return controller.signal;
+  forward(budgetSignal);
+  return controller.signal;
 }
 
 /**
@@ -860,22 +1061,42 @@ export function emptyCatalogueResult(query) {
 export async function searchNodesVia(
   managerGet,
   managerCall,
-  { query, limit, objectInfoGet } = {},
+  { query, limit, objectInfoGet, signal, budgetSignal, timeoutMs } = {},
 ) {
   const route = "customnode/getmappings?mode=cache";
+  const requestSignal = managerSearchRequestSignal(signal, budgetSignal);
+  const requestOptions = requestSignal ? { signal: requestSignal } : undefined;
+  throwIfManagerSearchCallerAborted(signal);
   let data;
   try {
-    data = await managerGet(route);
+    data = await managerGet(route, requestOptions);
   } catch (err) {
+    throwIfManagerSearchCallerAborted(signal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(err)) throw err;
     if (!isManagerUnreachable(err)) throw err;
     try {
-      data = await managerCall(route);
+      data = await managerCall(route, requestOptions);
     } catch (err2) {
+      throwIfManagerSearchCallerAborted(signal);
+      if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+      if (isAbortLikeError(err2)) throw err2;
       if (isManagerUnreachable(err2))
-        return objectInfoSearchFallback(objectInfoGet, query, limit, err2);
+        return objectInfoSearchFallback(
+          objectInfoGet,
+          query,
+          limit,
+          err2,
+          requestSignal,
+          timeoutMs,
+          budgetSignal,
+          signal,
+        );
       throw err2;
     }
   }
+  throwIfManagerSearchCallerAborted(signal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseNodeMappings(data, query, limit);
   // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
   // caller so. Checked on `catalogue_size` (packs the payload carried) rather than
@@ -895,6 +1116,123 @@ export async function searchNodesVia(
   // That is the panel's own request, not an inference about the payload, and it is
   // exactly the fact a reader needs before concluding a pack does not exist.
   return parsed.count === 0 ? { ...parsed, ...cachedCatalogueNoMatch(query, parsed.catalogue_size, route) } : parsed;
+}
+
+/**
+ * #1645 — reconstruct installed custom-node PACKS from ComfyUI's `/object_info`
+ * map. Each loaded class carries `python_module` (`custom_nodes.<folder>` or
+ * `custom_nodes.<folder>.<sub>`); the folder is the on-disk pack name Manager
+ * would have listed. Core modules (`nodes`, `comfy_extras.*`) are not packs.
+ */
+export function installedPacksFromObjectInfo(objectInfo) {
+  // Pack names come from the connected ComfyUI's untrusted /object_info
+  // response. A null-prototype map keeps names such as __proto__, constructor,
+  // and toString as ordinary pack keys instead of inherited properties.
+  const installed = Object.create(null);
+  if (!objectInfo || typeof objectInfo !== "object") return installed;
+  for (const [cls, meta] of Object.entries(objectInfo)) {
+    const pythonModule = meta && typeof meta === "object" ? meta.python_module : "";
+    const s = String(pythonModule || "").trim();
+    const m = /^(?:custom_nodes)[./]([^./\\]+)/i.exec(s);
+    if (!m) continue;
+    const pack = m[1];
+    if (!installed[pack]) {
+      installed[pack] = { python_module: s, classes: [] };
+    }
+    installed[pack].classes.push(cls);
+  }
+  return installed;
+}
+
+const LIST_OBJECT_INFO_NOTE =
+  "ComfyUI-Manager is unreachable; these packs were reconstructed from the connected " +
+  "ComfyUI's /object_info (loaded custom-node python_module folders). Manager metadata " +
+  "(version, cnr_id, enabled) is not available. Enable the built-in Manager for the " +
+  "full installed-pack inventory.";
+
+/**
+ * #1645 — when BOTH Manager installed-list routes are unreachable, try the
+ * loaded `/object_info` registry before giving up. On a readable map, return
+ * an inspectable pack inventory (possibly empty — core-only is still an
+ * inventory). Any `/object_info` failure degrades to managerListUnavailableResult
+ * rather than throwing.
+ */
+export async function objectInfoListFallback(objectInfoGet, args, err) {
+  if (typeof objectInfoGet !== "function") return managerListUnavailableResult(err);
+  let info;
+  try {
+    info = await objectInfoGet();
+  } catch {
+    return managerListUnavailableResult(err);
+  }
+  if (!info || typeof info !== "object" || Array.isArray(info)) {
+    return managerListUnavailableResult(err);
+  }
+  const hasNodeDefinition = Object.values(info).some((meta) => {
+    if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+    return ["python_module", "input", "output", "display_name", "category", "description"]
+      .some((key) => Object.prototype.hasOwnProperty.call(meta, key));
+  });
+  if (Object.keys(info).length === 0 || !hasNodeDefinition) {
+    return managerListUnavailableResult(err);
+  }
+  const listed = listedNodesResult(installedPacksFromObjectInfo(info), args);
+  return {
+    ...listed,
+    managerReachable: false,
+    source: "object_info",
+    note: listed.note ? `${listed.note} ${LIST_OBJECT_INFO_NOTE}` : LIST_OBJECT_INFO_NOTE,
+  };
+}
+
+/**
+ * #1645 — structured unavailable result for panel_list_nodes when Manager AND
+ * `/object_info` cannot inventory packs. Inspectable (never a raw throw) so a
+ * connected canvas is not blocked by a missing Manager.
+ */
+export function managerListUnavailableResult(err) {
+  return {
+    supported: false,
+    managerReachable: false,
+    installed: {},
+    reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
+    message:
+      "Installed custom-node pack inventory from ComfyUI-Manager is unavailable: " +
+      "the built-in Manager could not be reached on this ComfyUI (it may be disabled, " +
+      "or a legacy/partial build without /customnode/installed). The live canvas is " +
+      "still usable — inspect the current graph with panel_graph_outline / " +
+      "panel_query_graph. Enable the built-in Manager for the full pack list " +
+      "(version, cnr_id, enabled).",
+  };
+}
+
+/**
+ * Run the nodes_list flow with graceful degradation against an unreachable
+ * ComfyUI-Manager (#1645). Same ladder as searchNodesVia: dialect-routed GET,
+ * absolute legacy retry on unreachable/404, then `/object_info` pack
+ * reconstruction, then a structured unavailable result. Never throws on
+ * unreachable. Genuine server errors (500/403) still propagate.
+ */
+export async function listNodesVia(
+  managerGet,
+  managerCall,
+  { args = {}, objectInfoGet } = {},
+) {
+  const route = installedListRoute();
+  let raw;
+  try {
+    raw = await managerGet(route);
+  } catch (err) {
+    if (!isManagerUnreachable(err)) throw err;
+    try {
+      raw = await managerCall(route);
+    } catch (err2) {
+      if (isManagerUnreachable(err2))
+        return objectInfoListFallback(objectInfoGet, args, err2);
+      throw err2;
+    }
+  }
+  return listedNodesResult(raw, args);
 }
 
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
@@ -1103,6 +1441,405 @@ export function collectRecentTaskFailures(resp, { limit = 20 } = {}) {
   return out.slice(-limit);
 }
 
+// ---------------------------------------------------------------------------
+// #1480 — a silent in_progress is not progress
+// ---------------------------------------------------------------------------
+//
+// /v2/manager/queue/status is an aggregate of counts. A wedged Manager worker
+// keeps answering the same `{total_count:1, in_progress_count:1, is_processing:true}`
+// forever, with no per-task terminal record and no install log. The panel was
+// forwarding that payload as-is — which is the right status, and the wrong
+// conclusion: a poll that never times a silent in_progress reads as "still
+// working, wait longer" for as long as the caller is willing to wait.
+//
+// These helpers do not rewrite Manager's counts and do not manufacture a
+// failure. They measure whether the SAME processing fingerprint has been
+// repeating, and after QUEUE_SILENT_STALL_MS they name that as a stall.
+
+/** Status strings that mean the task has not reached a terminal yet. Narrow
+ *  on purpose: only spellings Manager actually writes for a live task. */
+const TASK_IN_PROGRESS_STATUS = new Set(["in_progress", "running", "pending"]);
+
+/** How long the same processing counts may repeat before a poll names a stall.
+ *  Matches the reported wait (over two minutes of unchanged in_progress). A
+ *  slow-but-alive clone can outlive this; the stall note is a visibility
+ *  warning, never a failure verdict. */
+export const QUEUE_SILENT_STALL_MS = 120_000;
+
+/** Is Manager currently claiming the queue is working? True only on an explicit
+ *  processing flag or a positive in-progress/pending count — a malformed or
+ *  idle status is not processing. */
+export function queueIsProcessing(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return false;
+  if (status.is_processing === true) return true;
+  if (typeof status.in_progress_count === "number" && status.in_progress_count > 0) return true;
+  if (typeof status.pending_count === "number" && status.pending_count > 0) return true;
+  return false;
+}
+
+/** A fingerprint of the processing counts so "the same in_progress repeating"
+ *  is distinguishable from a count that actually moved. Idle/malformed → null. */
+export function queueProgressFingerprint(status) {
+  if (!queueIsProcessing(status)) return null;
+  return [
+    status.is_processing === true ? "1" : "0",
+    Number(status.total_count) || 0,
+    Number(status.done_count) || 0,
+    Number(status.in_progress_count) || 0,
+    Number(status.pending_count) || 0,
+  ].join(":");
+}
+
+/**
+ * Collect the still-running tasks from a /v2/manager/queue/history response.
+ * Only explicit in_progress/running/pending status_str values — never inferred
+ * from a missing terminal, so an unrecognized shape cannot become a live task.
+ */
+export function collectInProgressTasks(resp, { limit = 20 } = {}) {
+  const history =
+    resp && typeof resp === "object" && "history" in resp ? resp.history : resp;
+  if (!history || typeof history !== "object") return [];
+  const items = Array.isArray(history) ? history : Object.values(history);
+  const out = [];
+  for (const item of items) {
+    if (!isTaskHistoryItem(item)) continue;
+    const str = taskStatusStr(item);
+    if (!str) continue;
+    const lower = str.toLowerCase();
+    if (!TASK_IN_PROGRESS_STATUS.has(lower)) continue;
+    if (TASK_SUCCESS_STATUS.has(lower) || TASK_FAILURE_STATUS.has(lower)) continue;
+    out.push({
+      ui_id: typeof item.ui_id === "string" ? item.ui_id : undefined,
+      kind: typeof item.kind === "string" ? item.kind : undefined,
+      id: taskParamId(item),
+    });
+  }
+  return out.slice(-limit);
+}
+
+/**
+ * What to tell a poll whose Manager counts have not moved for stallMs.
+ * Says the in_progress is Manager's own repeating status, not panel-invented
+ * progress, and does NOT claim the task failed — absence of a log is not a
+ * terminal record.
+ */
+export function silentQueueStallNote({ silent_ms, silentMs } = {}) {
+  const ms = typeof silent_ms === "number" ? silent_ms : silentMs;
+  const secs = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  return (
+    `NOTE — the Manager queue has reported the SAME in_progress counts for ${secs}s with no change. ` +
+    `That is Manager's own status, forwarded as-is — it is NOT panel-invented progress, and it is NOT a completion. ` +
+    `A silent in_progress is not proof the install is running. VERIFY with panel_list_nodes; if the pack is still ` +
+    `absent, check the ComfyUI server log for clone/pip activity. Do not restart solely because the queue is still ` +
+    `in_progress — a restart will not finish a wedged clone. If the log is also silent, the Manager worker is stuck.`
+  );
+}
+
+/**
+ * Observes successive /queue/status payloads and times how long the SAME
+ * processing fingerprint has been repeating.
+ *
+ * @param {{stallMs?: number, now?: () => number}} [opts]
+ */
+export function createManagerQueueWatch({ stallMs = QUEUE_SILENT_STALL_MS, now = () => Date.now() } = {}) {
+  let fingerprint = null;
+  let since = 0;
+  return {
+    /**
+     * @param {unknown} status
+     * @returns {{processing: boolean, stalled: boolean, silent_ms: number, fingerprint: string|null}}
+     */
+    observe(status) {
+      const t = now();
+      if (!queueIsProcessing(status)) {
+        fingerprint = null;
+        since = 0;
+        return { processing: false, stalled: false, silent_ms: 0, fingerprint: null };
+      }
+      const fp = queueProgressFingerprint(status);
+      if (fingerprint !== fp) {
+        fingerprint = fp;
+        since = t;
+      }
+      const silentMs = Math.max(0, t - since);
+      return {
+        processing: true,
+        stalled: silentMs >= stallMs,
+        silent_ms: silentMs,
+        fingerprint: fp,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1606 — a per-task result on the build that keeps NO task history
+// ---------------------------------------------------------------------------
+//
+// #1539 gave install the Manager's own terminal verdict by reading
+// /v2/manager/queue/history?ui_id=. Released 3.x ("legacy") registers no such
+// route, so there it reads nothing and the install falls back to the drain +
+// name-presence proxies. The reporter's install drained and left no trace at
+// all: panel_node_queue_status showed an idle queue with NOTHING in it, and the
+// pack was absent.
+//
+// The record is not missing — it is DELETED. Read out of ComfyUI-Manager 3.41's
+// glob/manager_server.py: `task_worker` accumulates every task's outcome in
+// `nodepack_result[ui_id]` (do_install returns the literal string 'success', or
+// the error text — "Cannot resolve install target: …", the failed
+// `install_by_id` res.msg, a traceback summary). When the queue empties it
+// broadcasts that whole map and then throws it away:
+//
+//     PromptServer.instance.send_sync("cm-queue-status",
+//         {'status': 'done', 'nodepack_result': nodepack_result, …})
+//     nodepack_result = {}
+//     task_queue = queue.Queue()
+//
+// `queue/status` derives done_count from `len(nodepack_result)`, so the line
+// after the broadcast is what makes total/done/in_progress all read 0 — the
+// reporter's "empty idle queue", produced BY the task finishing. `queue/start`
+// clears the map too. No later HTTP read can recover the outcome.
+//
+// So the broadcast is the only place 3.x ever states it — and a panel living in
+// the ComfyUI page is already a client of it. `send_sync` with no sid goes to
+// every connected client, and ComfyUI-Manager's own UI reads it exactly this
+// way (`api.addEventListener("cm-queue-status", …)` in js/custom-nodes-manager.js).
+// The helpers below turn that frame into records the same shape the history
+// reader produces, so the verdict path above needs no new branch: a captured
+// failure is fed in as `taskFailure` and classifies identically.
+
+/**
+ * The per-task outcomes carried by ONE `cm-queue-status` payload.
+ *
+ * Only the DRAIN frame ('done') carries outcomes. The per-task 'in_progress'
+ * frame names the task that just finished (`target`) but never says how it went,
+ * so reading it as a result would record every task as an unknown one — and an
+ * unknown result is indistinguishable from a failure string here.
+ *
+ * Unknown/foreign shapes yield []: this is additive evidence, so a payload we do
+ * not recognise must add nothing rather than guess. That is also what keeps it
+ * safe on a Manager generation that emits a same-named event of its own.
+ *
+ * @returns {{ui_id: string, result: string}[]}
+ */
+export function queueEventTaskResults(detail) {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) return [];
+  if (detail.status !== "done") return [];
+  const out = [];
+  for (const key of ["nodepack_result", "model_result"]) {
+    const map = detail[key];
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+    for (const [ui_id, raw] of Object.entries(map)) {
+      const result = taskResultText(raw);
+      if (ui_id && result !== undefined) out.push({ ui_id, result });
+    }
+  }
+  return out;
+}
+
+/** A `nodepack_result` value as the 3.41 worker writes it: the worker's return
+ *  value, which is a STRING for install/uninstall/disable/fix and for 'update'
+ *  (it stores `msg['msg']`), but the whole `{msg, url, title}` record for
+ *  'update-main'. Anything else is not a result this can read. */
+function taskResultText(raw) {
+  if (typeof raw === "string") return raw.trim() || undefined;
+  if (raw && typeof raw === "object" && typeof raw.msg === "string") return raw.msg.trim() || undefined;
+  return undefined;
+}
+
+/**
+ * Is a captured result a FAILURE, and what did the Manager say?
+ *
+ * The 3.x worker writes a fixed success vocabulary and returns the ERROR TEXT
+ * itself for everything else, so "not one of the success words" is the failure
+ * test and the value IS the reason. The Manager's ComfyUI self-update task also
+ * answers "success-stable-<tag>", hence the prefix arm — a version-tagged
+ * success is still a success.
+ *
+ * Returns null for a success and for anything unreadable: this may only ever ADD
+ * a positive failure verdict, never manufacture one.
+ */
+export function queueEventFailureReason(result) {
+  if (typeof result !== "string") return null;
+  const v = result.trim();
+  if (!v) return null;
+  const lower = v.toLowerCase();
+  if (TASK_SUCCESS_STATUS.has(lower)) return null;
+  if (/^success[-:\s]/.test(lower)) return null;
+  return v;
+}
+
+/** How many captured task records to keep. Bounds the log in a tab that stays
+ *  open for days; the reads below are all "the recent ones" anyway. */
+const TASK_RESULT_LOG_LIMIT = 50;
+
+/**
+ * A bounded log of Manager task outcomes captured from `cm-queue-status`.
+ *
+ * Kept in this module rather than the panel so it is unit-testable without a
+ * browser: the panel owns the subscription (one `api.addEventListener`), this
+ * owns what the frames MEAN.
+ *
+ * Insertion-ordered by ui_id, so eviction is oldest-first and re-recording a
+ * ui_id moves it to the newest position.
+ *
+ * @param {{limit?: number, now?: () => number}} [opts]
+ */
+export function createManagerTaskResultLog({ limit = TASK_RESULT_LOG_LIMIT, now = () => Date.now() } = {}) {
+  /** @type {Map<string, {ui_id: string, target?: string, kind?: string, result?: string, at?: number}>} */
+  const byUiId = new Map();
+
+  const touch = (ui_id, patch) => {
+    const prev = byUiId.get(ui_id);
+    byUiId.delete(ui_id); // re-insert so Map order stays newest-last
+    byUiId.set(ui_id, { ...(prev ?? {}), ui_id, ...patch });
+    while (byUiId.size > limit) byUiId.delete(byUiId.keys().next().value);
+  };
+
+  return {
+    /** Correlate a ui_id we are about to submit with WHAT it acts on. The
+     *  broadcast carries only ui_id → result, so without this a captured
+     *  failure could name no pack. Optional: an uncorrelated failure is still
+     *  reported, just without an `id`. */
+    note(ui_id, { target, kind } = {}) {
+      if (typeof ui_id !== "string" || !ui_id) return;
+      touch(ui_id, { target, kind });
+    },
+
+    /** Ingest one `cm-queue-status` payload. Returns how many outcomes it carried. */
+    record(detail) {
+      const results = queueEventTaskResults(detail);
+      for (const { ui_id, result } of results) {
+        touch(ui_id, { result, at: now() });
+        // A later SUCCESS retires an earlier failure for the SAME pack. Without
+        // this, a reinstall that worked leaves the original failure sitting in
+        // the log, and the next queue poll reports a defeat that has already
+        // been undone — the stale-verdict failure mode this whole area is about.
+        const rec = byUiId.get(ui_id);
+        if (rec && rec.target && !queueEventFailureReason(rec.result)) {
+          for (const [key, other] of byUiId) {
+            if (key !== ui_id && other.target === rec.target && queueEventFailureReason(other.result)) {
+              byUiId.delete(key);
+            }
+          }
+        }
+      }
+      return results.length;
+    },
+
+    /** The Manager's own failure text for THIS ui_id, or null. Correlated by the
+     *  id we submitted, so a neighbouring task's failure is never attributed to
+     *  it — the same rule the history read follows. */
+    failureFor(ui_id) {
+      const rec = typeof ui_id === "string" ? byUiId.get(ui_id) : undefined;
+      return rec ? queueEventFailureReason(rec.result) : null;
+    },
+
+    /**
+     * Captured FAILURES, in the `{ui_id, kind, id, result}` shape
+     * collectRecentTaskFailures produces so both sources merge without a second
+     * format.
+     *
+     * `maxAgeMs` bounds how long a capture stays reportable. A failure from
+     * hours ago is not what a poll is asking about, and re-reporting it reads as
+     * a fresh one; a record with no timestamp (noted but never resolved) is not
+     * a failure and never appears here anyway.
+     */
+    recentFailures({ limit: cap = 20, maxAgeMs } = {}) {
+      const cutoff = typeof maxAgeMs === "number" ? now() - maxAgeMs : undefined;
+      const out = [];
+      for (const rec of byUiId.values()) {
+        const reason = queueEventFailureReason(rec.result);
+        if (!reason) continue;
+        if (cutoff !== undefined && !(typeof rec.at === "number" && rec.at >= cutoff)) continue;
+        out.push({ ui_id: rec.ui_id, kind: rec.kind, id: rec.target, result: reason });
+      }
+      return out.slice(-cap);
+    },
+
+    /** Records held, for tests and for bounding assertions. */
+    size() {
+      return byUiId.size;
+    },
+  };
+}
+
+/**
+ * Did a history fetch POSITIVELY return a task-history document?
+ *
+ * A missing history route does not reliably THROW: ComfyUI answers an
+ * UNREGISTERED GET with its SPA index, and an empty body parses to null — the
+ * same trap looksLikeQueueStatus guards dialect detection against. Both would
+ * otherwise traverse to zero failures and be reported as "nothing failed".
+ *
+ * Accepts the `{history: …}` envelope in item, map or array form, and a bare
+ * array/map. An empty ARRAY or an empty envelope is a real answer ("no tasks");
+ * a bare `{}` is not — it says nothing about any queue.
+ */
+export function looksLikeTaskHistory(resp) {
+  if (!resp || typeof resp !== "object") return false;
+  const hasKey = !Array.isArray(resp) && "history" in resp;
+  const history = hasKey ? resp.history : resp;
+  if (!history || typeof history !== "object") return false;
+  const items = Array.isArray(history) ? history : Object.values(history);
+  if (items.length === 0) return hasKey || Array.isArray(history);
+  if (items.every((v) => !!v && typeof v === "object")) return true;
+  // The single-record (ui_id-queried) shape: the task's own fields, so its
+  // values are strings rather than records.
+  return isTaskHistoryItem(history);
+}
+
+/**
+ * Does this Manager dialect serve a PER-TASK terminal record over HTTP?
+ *
+ * Established by #364 and already relied on by the update path: released 3.x
+ * ("legacy") has no per-task history route, and the bundled 3.x server behind
+ * --enable-manager-legacy-ui ("v2-batch") serves only BATCH history keyed by
+ * `id` and rejects a ui_id query. Only the pip Manager v4 ("v2") records a
+ * task's outcome where a later read can find it.
+ *
+ * This is what `nodes_queue_status` was missing: on the other two builds it asked
+ * for a history that cannot exist, got nothing, and returned a bare status —
+ * byte-identical to a v4 that served its history and had nothing to report.
+ */
+export function dialectServesTaskHistory(dialect) {
+  return dialect === "v2";
+}
+
+/**
+ * What to tell a queue poll that could not read per-task outcomes over HTTP.
+ *
+ * Says only what is known, and does NOT claim anything failed — the point is
+ * that on this build silence is not evidence either way. The live capture is
+ * named because it is the one thing that CAN answer here, and its limit stated:
+ * it only sees tasks that finished while this browser tab was open.
+ *
+ * THREE causes, not two. An UNKNOWN dialect (detection failed) must not borrow
+ * 3.x's explanation: "this build keeps no history" is a claim about a build we
+ * did not identify, and asserting the mechanism we happen to have written about
+ * is how a plausible sentence becomes a false one. It gets its own arm.
+ */
+export function taskHistoryBlindNote(dialect) {
+  const cause =
+    dialect === undefined || dialect === null || dialect === ""
+      ? "this panel could not determine which ComfyUI-Manager generation is running, so it " +
+        "cannot say whether a per-task record even exists here"
+      : dialectServesTaskHistory(dialect)
+        ? "this Manager's per-task history could not be read just now (a transient error, or a " +
+          "response this panel did not recognise)"
+        : "this ComfyUI-Manager build keeps NO readable per-task history (released 3.x deletes " +
+          "each task's result the moment the queue drains)";
+  return (
+    `NOTE — A FAILED TASK MAY NOT BE VISIBLE HERE: ${cause}. Any failure listed above was ` +
+    `captured live from the Manager's completion broadcast, which this panel only hears for ` +
+    `tasks that finish while this browser tab is open — so an EMPTY list is not proof that ` +
+    `nothing failed. A drained/idle queue is not proof either: the Manager counts a task it ` +
+    `aborted as "done" exactly like one it completed. VERIFY the pack with panel_list_nodes ` +
+    `before restarting or reporting success; if it is absent, the reason is in the ComfyUI ` +
+    `server log (security_level gating is a common cause).`
+  );
+}
+
 /**
  * Decide the TRUE outcome of an UPDATE after it was queued+started (#364). Pure,
  * unit-testable. Precedence guarantees neither a false success nor a false
@@ -1113,11 +1850,16 @@ export function collectRecentTaskFailures(resp, { limit = 20 } = {}) {
  *   3. "unverified"— no terminal task record yet (still running, history not
  *                    served by a legacy Manager, or a shape we don't recognize).
  *                    Honest "queued, could not confirm" — NEVER a failure.
- * @param {{ item?:unknown, status?:unknown, target:string, dialect?:string }} input
+ * @param {{ item?:unknown, status?:unknown, target:string, dialect?:string, traceback?:string }} input
  */
-export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
+export function classifyUpdateOutcome({ item, status, target, dialect, traceback } = {}) {
   const reason = taskFailureReason(item);
   if (reason) {
+    // #1320 — Manager's do_update stores only "An error occurred while updating
+    // 'X'." and prints the real traceback to the server log. When the caller
+    // managed to read that log, the tool result IS the traceback; do not also
+    // send the reader to the log they can no longer see from here.
+    const tb = typeof traceback === "string" && traceback.trim() ? traceback.trim() : "";
     return {
       state: "failed",
       status,
@@ -1125,8 +1867,10 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
         `Update of "${target}" FAILED: the ComfyUI-Manager task terminated with an ` +
         `error` +
         (dialect ? ` (dialect ${dialect})` : "") +
-        `: ${reason}. The pack was NOT updated — check the ComfyUI server log for the ` +
-        `full traceback.`,
+        `: ${reason}. The pack was NOT updated` +
+        (tb
+          ? `. Manager traceback:\n${tb}`
+          : ` — check the ComfyUI server log for the full traceback.`),
     };
   }
   if (taskSucceeded(item)) {
