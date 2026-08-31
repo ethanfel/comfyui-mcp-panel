@@ -47,9 +47,13 @@
     "name": "Afficher RunPod / Local",
     "tooltip": "Affiche le bouton d'hôte RunPod / Local dans la barre d'outils — déployer, démarrer, arrêter ou connecter un pod GPU cloud, ou revenir en local. Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
   },
+  "comfyui-mcp_chatMedia": {
+    "name": "Médias générés dans le chat",
+    "tooltip": "Affiche les images, vidéos et audios générés sous forme de cartes dans le chat. Désactivez pour garder le fil en texte seul ; l'agent reçoit toujours les sorties (y compris storyboards et cadres de fin). S'applique aux médias générés après le changement. Les cartes déjà présentes restent ; les cartes masquées ne sont pas enregistrées et ne réapparaissent pas après un rechargement."
+  },
   "comfyui-mcp_videoPreviews": {
-    "name": "Aperçus vidéo dans le chat",
-    "tooltip": "Lire les vidéos générées directement dans le chat. Désactivez pour économiser la RAM : la vidéo apparaît alors comme un espace réservé avec sa première image et son nom de fichier, et un clic ouvre la vidéo complète dans la visionneuse. S'applique aux vidéos générées après le changement ; les cartes déjà présentes dans le chat conservent leur lecteur."
+    "name": "Lecture vidéo dans le chat",
+    "tooltip": "Lire les vidéos générées directement dans le chat. Désactivez pour économiser la RAM : la vidéo apparaît alors comme un espace réservé avec sa première image et son nom de fichier, et un clic ouvre la vidéo complète dans la visionneuse. Cela ne masque pas les vidéos du chat — utilisez Médias générés dans le chat pour cela. S'applique aux vidéos générées après le changement ; les cartes déjà présentes dans le chat conservent leur lecteur."
   },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Obtenir l'appli bêta",
@@ -61,7 +65,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Alerte de rendu bloqué (secondes)",
-    "tooltip": "Durée pendant laquelle un rendu ComfyUI peut n'enregistrer AUCUNE progression avant que l'agent soit averti que son rendu semble bloqué ou coincé (par ex. une étape d'échantillonnage figée par un dépassement de mémoire) et qu'on lui demande d'annuler ou de relancer plutôt que de lancer une exécution de plus. Les étapes vidéo sont légitimement lentes : restez généreux. 180 s par défaut ; plage 15–3600. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter (ou /restart) pour le changer sur un agent en cours."
+    "tooltip": "Durée pendant laquelle un rendu ComfyUI peut n'enregistrer AUCUNE progression avant que l'agent soit averti que son rendu semble bloqué ou coincé (par ex. une étape d'échantillonnage figée par un dépassement de mémoire) et qu'on lui demande d'annuler ou de relancer plutôt que de lancer une exécution de plus. Les étapes vidéo sont légitimement lentes : restez généreux. 600 s par défaut ; plage 15–3600. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter (ou /restart) pour le changer sur un agent en cours."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "URL d'un ComfyUI distant (avancé)",

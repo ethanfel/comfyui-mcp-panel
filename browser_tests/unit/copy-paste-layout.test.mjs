@@ -584,6 +584,12 @@ test("#1294 shipped copy+paste keeps groups and distinct branch y-positions", ()
   assert.equal(result.pasted_count, 10);
   assert.equal(result.copied_groups, 5);
   assert.equal(result.pasted_groups, 5, "groups survived paste");
+  assert.equal(result.connect_inputs, false);
+  assert.match(
+    result.note,
+    /Internal wires among the copied nodes are preserved/,
+    "#1957 the paste reply must document that internals survived, not promise a disconnected copy",
+  );
   assert.equal(dst.graph._groups.length, 5);
 
   const loraYs = result.pasted.filter((n) => n.type === LORA).map((n) => n.pos[1]);
@@ -706,4 +712,31 @@ test("shipped copy still fails loud on a missing node_id", () => {
   const src = makeBranchedGraph();
   const { copy } = shippedCopyPaste(src.graph, src.canvas, src.LG);
   assert.throws(() => copy({ node_ids: [src.graph._nodes[0].id, 99999] }), /not found/);
+});
+
+test("#2004 explicit node_ids copy does not keep a stale additive selection", () => {
+  clearInMemoryClipboard();
+  clearCopiedLayout();
+  const src = makeBranchedGraph();
+  // Frontend 1.41-style: selectItems ADDS to the current Set instead of replacing it.
+  src.canvas.selectItems = function (items) {
+    for (const it of items ?? []) this.selectedItems.add(it);
+  };
+  const stale = src.branches[0];
+  src.canvas.selectedItems = new Set([stale.lora, stale.sampler, stale.group]);
+  src.canvas.selected_nodes = {
+    [stale.lora.id]: stale.lora,
+    [stale.sampler.id]: stale.sampler,
+  };
+
+  const { copy } = shippedCopyPaste(src.graph, src.canvas, src.LG);
+  const target = src.branches[4].sampler;
+  const copied = copy({ node_ids: [target.id] });
+  assert.equal(copied.copied, 1, "only the requested node is copied");
+  assert.equal(copied.copied_groups, 0, "stale fully-selected group is not copied");
+
+  const payload = JSON.parse(getInMemoryClipboard());
+  assert.equal(payload.nodes.length, 1, "clipboard contains only the requested node");
+  assert.equal(payload.nodes[0].id, target.id);
+  assert.equal(payload.groups.length, 0, "clipboard itself has no leftover group");
 });

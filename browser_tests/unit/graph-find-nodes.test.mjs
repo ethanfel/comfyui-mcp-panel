@@ -12,8 +12,9 @@ import { fileURLToPath } from "node:url";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "../../web/js/lib/slot-labels.js";
 import { duplicateWidgetRows } from "../../web/js/lib/widget-rows.js";
 import { virtualFedInputs } from "../../web/js/lib/virtual-source-promotion.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 import { controlAfterGenerateModes } from "../../web/js/lib/control-after-generate.js";
-import { drivenWidgetsFor } from "../../web/js/lib/graph-read.js";
+import { drivenWidgetsFor, isPromotedContainer } from "../../web/js/lib/graph-read.js";
 import { redactWidgetValue } from "../../web/js/lib/widget-secret-redaction.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -56,6 +57,8 @@ const summarizeNode = (() => {
     "controlAfterGenerateModes",
     "drivenWidgetsFor",
     "redactWidgetValue",
+    "nodeInstanceIdentity",
+    "isPromotedContainer",
     `${source}; return summarizeNode;`,
   )(
     virtualFedInputs,
@@ -66,6 +69,8 @@ const summarizeNode = (() => {
     controlAfterGenerateModes,
     drivenWidgetsFor,
     redactWidgetValue,
+    nodeInstanceIdentity,
+    isPromotedContainer,
   );
 })();
 

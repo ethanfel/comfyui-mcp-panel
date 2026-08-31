@@ -753,6 +753,7 @@ export function buildHelloPayload({
   resume,
   workflowUuid,
   lostReplies,
+  viewing,
 } = {}) {
   const frame = {
     type: "hello",
@@ -798,6 +799,9 @@ export function buildHelloPayload({
     // synchronous write boundary, so the orchestrator can fence a node
     // replacement between its final identity probe and mutation.
     enforces_expected_node_type_at_write: true,
+    // #2478: graph_set_widget also honors the opaque per-node incarnation
+    // identity emitted by graph reads at the same synchronous write boundary.
+    enforces_expected_node_identity_at_write: true,
     // #2314: graph_set_widget validates an optional promoted subgraph owner and
     // workflow witness against the LIVE canvas at the same synchronous boundary.
     enforces_expected_scope_at_write: true,
@@ -858,6 +862,17 @@ export function buildHelloPayload({
   // supported here for any caller whose timing is already post-handshake.
   if (Array.isArray(lostReplies) && lostReplies.length) {
     frame.lost_replies = lostReplies;
+  }
+  // #1925 — hello clears the orchestrator's promoted-scope cache. A parseable
+  // current-view witness on this frame is the only way a reconnect/tab-switch
+  // hello can restock that cache without waiting for a later graph read.
+  if (
+    viewing &&
+    typeof viewing === "object" &&
+    !Array.isArray(viewing) &&
+    (viewing.scope === "root" || viewing.scope === "subgraph")
+  ) {
+    frame.viewing = viewing;
   }
   return frame;
 }

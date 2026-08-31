@@ -42,8 +42,14 @@ import {
   findLandedRailLink,
   isRailLinkPersisted,
   landedAfterThrowWarning,
+  verifyConnect,
+  snapshotInputSlotLinks,
+  snapshotInputSlotNames,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
-import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
+import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
+import { findExistingRailSlot, refuseConnectToRawRail } from "../../web/js/lib/rail-slot.js";
 import {
   captureNodeTitles,
   describeTitleRewrites,
@@ -54,6 +60,12 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "../../web/js/lib/dynamic-slot-reconcile.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   applyCurrentDefWidgetValues,
@@ -124,6 +136,8 @@ const resolveRail = () => null;
 const isEmptyRailSlotRef = (ref) => ref == null || ref === "";
 const slotDiagnostic = () => "slot diagnostic";
 const loopbackRefusalReason = () => "loopback";
+const unresolvedWildcardPairReason = () => "wildcard pair";
+const isWildcardSlotType = () => false;
 const findSubgraphHostNode = () => null;
 const uniqueSubgraphOutputName = (_g, base) => base;
 const uniqueSubgraphInputName = (_g, base) => base;
@@ -153,10 +167,13 @@ function buildConnect(graph, titleDeps = {}) {
     railIntent,
     isEmptyRailSlotRef,
     findExistingRailSlot,
+    refuseConnectToRawRail,
     findSubgraphHostNode,
     autoMatchSlots,
     slotDiagnostic,
     loopbackRefusalReason,
+    unresolvedWildcardPairReason,
+    isWildcardSlotType,
     uniqueSubgraphOutputName,
     uniqueSubgraphInputName,
     isLinkPersisted,
@@ -169,12 +186,22 @@ function buildConnect(graph, titleDeps = {}) {
     findLandedRailLink,
     isRailLinkPersisted,
     landedAfterThrowWarning,
+    snapshotGraphState,
+    snapshotInputSlotLinks,
+    snapshotInputSlotNames,
+    verifyConnect,
+    connectCollateralBullets,
+    connectCollateralWarning,
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,
     captureSlotNames,
     describeSlotRewrites,
     slotRewriteWarning,
+    isDynamicPrefixSlotName,
+    captureNamedSlotLinks,
+    findSlotIndexByName,
+    reconcileDynamicPrefixSlots,
     ...titleDeps,
   };
   const names = Object.keys(deps);

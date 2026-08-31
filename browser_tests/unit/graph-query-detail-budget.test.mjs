@@ -21,9 +21,11 @@ import {
   drivenWidgetsFor,
   fitDetailLine,
   isLineProtected,
+  isPromotedContainer,
   truncationTail,
 } from "../../web/js/lib/graph-read.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 const PANEL_JS = join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js");
 const source = readFileSync(PANEL_JS, "utf8");
@@ -101,12 +103,22 @@ const graph = {
 
 // summarizeNode is kept deliberately small because its own production dependencies are
 // unrelated to this budget seam. The graph_query method itself is the shipped source.
-const summarizeNode = (node) => ({
-  id: node.id,
-  type: node.type,
-  title: node.title,
-  widgets: Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value])),
-});
+const summarizeNode = (node) => {
+  // Use the same panel-owned per-object identity source as the shipped bundle.
+  // The identity is deliberately not copied from a synthetic serialized field.
+  const nodeIdentity = nodeInstanceIdentity(node);
+  return {
+    id: node.id,
+    ...(nodeIdentity ? { node_identity: nodeIdentity } : {}),
+    type: node.type,
+    title: node.title,
+    widgets: Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value])),
+    // Production summarizeNode also emits inputs/outputs; those are what push a
+    // fully-capped detail row past max_chars and into fitDetailLine (#2436).
+    ...(Array.isArray(node.inputs) && node.inputs.length ? { inputs: node.inputs } : {}),
+    ...(Array.isArray(node.outputs) && node.outputs.length ? { outputs: node.outputs } : {}),
+  };
+};
 
 const graphQuerySource = methodSource(source, "graph_query({");
 const dependencyNames = [
@@ -135,6 +147,7 @@ const dependencyNames = [
   "clipLine",
   "compactClipNote",
   "redactWidgetValue",
+  "isPromotedContainer",
 ];
 const graphQuery = new Function(
   ...dependencyNames,
@@ -165,6 +178,7 @@ const graphQuery = new Function(
   clipLine,
   compactClipNote,
   redactWidgetValue,
+  isPromotedContainer,
 );
 
 function detailRows(result) {
@@ -191,6 +205,59 @@ test("#1681 shipped graph_query keeps default detail at 2048 and raises one expl
   assert.equal(Object.keys(defaultRow).join(","), Object.keys(raisedRow).join(","), "detail row shape is unchanged");
 });
 
+test("#2436 shipped graph_query keeps is_subgraph on an oversized-node stub", () => {
+  // High-fan-in slots are what capSummaryWidgets does not touch, so the fully-capped
+  // detail still overflows max_chars and fitDetailLine degrades the row. That stub
+  // used to drop is_subgraph, which made the node unwritable.
+  const wide = {
+    id: 43,
+    type: "KSampler (Efficient)",
+    title: "KSampler (Efficient)",
+    widgets: [{ name: "sampler_name", value: "euler" }],
+    inputs: Array.from({ length: 4000 }, (_, i) => ({ name: `in${i}`, type: "INT" })),
+    outputs: [],
+  };
+  graph._nodes.push(wide);
+  try {
+    const row = detailRows(query({ ids: [43], fields: "detail", max_chars: 300 }))[0];
+    assert.ok(row.detail_omitted, "the row must have degraded to the stub");
+    assert.equal(typeof row.is_subgraph, "boolean", "a boolean is what the classifier requires");
+    assert.equal(row.is_subgraph, false);
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
+test("#1941 pinpoint structured nodes row stays bounded on a wide root node", () => {
+  // The orchestrator's ordinary-root fast path reads `result.nodes[0]`, not the
+  // survey text. That structured row used to be the uncapped summary, so a
+  // VHS_VideoCombine-shaped node could time out the probe and fall through to
+  // an indeterminate graph_get_subgraph refusal.
+  const wide = {
+    id: 74,
+    type: "VHS_VideoCombine",
+    title: "VHS_VideoCombine",
+    widgets: [{ name: "filename_prefix", value: "video/ComfyUI" }],
+    inputs: Array.from({ length: 4000 }, (_, i) => ({ name: `in${i}`, type: "INT" })),
+    outputs: [],
+  };
+  graph._nodes.push(wide);
+  try {
+    const result = query({ ids: [74], fields: "detail", max_chars: 300 });
+    const row = result.nodes?.[0];
+    assert.ok(row, "pinpoint detail must publish a structured nodes row");
+    assert.equal(row.id, 74);
+    assert.equal(typeof row.is_subgraph, "boolean");
+    assert.equal(row.is_subgraph, false);
+    assert.ok(
+      JSON.stringify(row).length <= 300,
+      `structured row must respect max_chars; got ${JSON.stringify(row).length}`,
+    );
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
 test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => {
   const ordinary = detailRows(query({ ids: [78], fields: "detail" }))[0];
   assert.equal(ordinary.is_subgraph, false);
@@ -206,8 +273,63 @@ test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => 
   };
   graph._nodes.push(promoted);
   try {
-    const row = detailRows(query({ ids: [83], fields: "detail" }))[0];
+    const result = query({ ids: [83], fields: "detail" });
+    const row = detailRows(result)[0];
     assert.equal(row.is_subgraph, true);
+    assert.equal(result.nodes?.[0]?.is_subgraph, true, "#1925 pinpoint detail must publish a structured subgraph row");
+    assert.equal(result.nodes?.[0]?.id, 83);
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
+test("#2478 one-ID compact probes publish a bounded identity-bearing witness", () => {
+  const node = {
+    id: 84,
+    type: "PrimitiveStringMultiline",
+    title: "Prompt",
+    widgets: [{ name: "text", value: "new" }],
+    inputs: [],
+    outputs: [],
+  };
+  graph._nodes.push(node);
+  try {
+    const result = query({ ids: [84], fields: "compact", max_chars: 500 });
+    const expectedIdentity = nodeInstanceIdentity(node);
+    assert.match(result.text, /#84 PrimitiveStringMultiline/);
+    assert.deepEqual(result.nodes, [
+      {
+        id: 84,
+        type: "PrimitiveStringMultiline",
+        node_identity: expectedIdentity,
+        is_subgraph: false,
+      },
+    ]);
+    assert.ok(JSON.stringify(result.nodes).length <= 500, "identity witness must remain bounded");
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
+test("#2006 a root PrimitiveNode stays is_subgraph:false even with leftover live subgraph", () => {
+  const node = {
+    id: 198,
+    type: "PrimitiveNode",
+    title: "prompt",
+    isVirtualNode: true,
+    widgets: [{ name: "value", value: "a MiniMax prompt" }],
+    inputs: [],
+    outputs: [],
+    subgraph: { _nodes: [{ id: 1, type: "CLIPTextEncode" }], getNodeById() { return null; } },
+  };
+  graph._nodes.push(node);
+  try {
+    const result = query({ ids: [198], fields: "detail" });
+    const row = detailRows(result)[0];
+    assert.equal(row.is_subgraph, false);
+    assert.equal(result.nodes?.[0]?.is_subgraph, false);
+    assert.equal(result.nodes?.[0]?.type, "PrimitiveNode");
+    assert.equal(result.viewing?.scope, "root");
   } finally {
     graph._nodes.pop();
   }

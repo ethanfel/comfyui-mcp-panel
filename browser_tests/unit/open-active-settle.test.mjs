@@ -4,13 +4,31 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
   settleOpenedWorkflowActive,
+  settleOwnedOpenedTmpRoutingKey,
   settleOwnedOpenedWorkflowActive,
 } from "../../web/js/lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "../../web/js/lib/settle-open-readable.js";
-import { graphMutationReconnectGate } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  graphMutationReconnectGate,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
+} from "../../web/js/lib/reconnect-recovery.js";
 import { activeWorkflowPossiblyStale } from "../../web/js/lib/reconnect-staleness.js";
 import { classifyPinnedTarget } from "../../web/js/lib/workflow-chat-identity.js";
+import {
+  decideLiveCanvasCapture,
+  installActivePointerWatch,
+  POINTER_WATCH_UNAVAILABLE_NOTICE,
+} from "../../web/js/lib/live-canvas-capture-gate.js";
+import {
+  graphRootMatchesState,
+  graphRootStructureExtendsActiveWorkflow,
+  graphRootWorkflowUuidMatches,
+  graphRootWorkflowUuidMismatches,
+} from "../../web/js/lib/graph-binding.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -81,6 +99,31 @@ function balancedFrom(src, marker, openAt = null) {
 }
 
 const PINIA_STORE_HELPER_SOURCE = balancedFrom(SRC, "function getPiniaStore(id)");
+const LIVE_CANVAS_BINDING_SOURCE = balancedFrom(SRC, "function describeLiveCanvasBinding(wf)");
+
+function productionDescribeLiveCanvasBinding(environment) {
+  const factory = new Function(
+    "app",
+    "workflowObjectUuid",
+    "workflowStableUuid",
+    "graphRootWorkflowUuidMatches",
+    "graphRootWorkflowUuidMismatches",
+    "workflowOwnsRootUuidTag",
+    "WORKFLOW_META_NAMESPACE",
+    "WORKFLOW_UUID_FIELD",
+    `${LIVE_CANVAS_BINDING_SOURCE}\nreturn describeLiveCanvasBinding;`,
+  );
+  return factory(
+    environment.app,
+    environment.workflowObjectUuid,
+    environment.workflowStableUuid,
+    environment.graphRootWorkflowUuidMatches ?? graphRootWorkflowUuidMatches,
+    environment.graphRootWorkflowUuidMismatches ?? graphRootWorkflowUuidMismatches,
+    environment.workflowOwnsRootUuidTag,
+    environment.WORKFLOW_META_NAMESPACE,
+    environment.WORKFLOW_UUID_FIELD,
+  );
+}
 
 // Execute a shipped executor body with the shipped reload guard and proof helper.
 // The frontend-facing services are supplied by each lifecycle test, but the operation
@@ -100,7 +143,25 @@ function productionExecutor(methodName, environment) {
       `return { method: ${methodName}, guard: () => activeWorkflowReloadGuard(), ` +
       `proofs: () => ({ active: activeWorkflowResyncEpoch, post: postReconnectBindingProofEpoch }) };\n}`,
   );
-  const scope = new Proxy(environment, {
+  // Shipped #1911 helpers are the default so a production open eval drives the
+  // same gate the panel imports. A test may still override them.
+  const sandbox = {
+    decideLiveCanvasCapture,
+    installActivePointerWatch,
+    POINTER_WATCH_UNAVAILABLE_NOTICE,
+    workflowOpenReadinessRefusalError,
+    readWorkflowOpenReadinessRefusal,
+    graphRootMatchesState,
+    graphRootWorkflowUuidMatches,
+    graphRootWorkflowUuidMismatches,
+    describeLiveCanvasBinding: productionDescribeLiveCanvasBinding(environment),
+    isUnsavedTmpOpenSelector,
+    appliedTmpOpenShouldFailClosed,
+    settleOwnedOpenedTmpRoutingKey,
+    readExistingWorkflowTabId: (wf) => (wf?.path ? `wf:${wf.path}` : null),
+    ...environment,
+  };
+  const scope = new Proxy(sandbox, {
     has: () => true,
     get(target, key) {
       if (key === Symbol.unscopables) return undefined;
@@ -110,7 +171,11 @@ function productionExecutor(methodName, environment) {
   return factory(scope);
 }
 
-function productionReadableOpenEnvironment({ readableAfterRetry, readableButMismatched = false }) {
+function productionReadableOpenEnvironment({
+  readableAfterRetry,
+  readableButMismatched = false,
+  mismatchOnlyFirstLoad = false,
+}) {
   const previous = { path: "workflows/previous.json" };
   const target = {
     path: "workflows/target.json",
@@ -137,11 +202,12 @@ function productionReadableOpenEnvironment({ readableAfterRetry, readableButMism
     loadGraphData: async (state) => {
       loads += 1;
       root.extra = state.extra;
+      const mismatched = readableButMismatched && (!mismatchOnlyFirstLoad || loads === 1);
       root._nodes = [
         {
           id: 1,
           type: "KSampler",
-          widgets_values: [readableButMismatched ? "stale-value" : "target-value"],
+          widgets_values: [mismatched ? "stale-value" : "target-value"],
         },
       ];
     },
@@ -358,6 +424,59 @@ test("#1898 settles a readable outline after one normalization retry", async () 
   assert.equal(settleCalls, 4, "identity is settled before retry and after the final probe");
 });
 
+test("#1898 retries when a readable outline still lacks the final content proof", async () => {
+  const target = { path: "workflows/target.json" };
+  let outlineCalls = 0;
+  let settleCalls = 0;
+  let retries = 0;
+
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => {
+      settleCalls += 1;
+      return { status: "settled", active: target };
+    },
+    readGraphOutline: async () => {
+      outlineCalls += 1;
+      return { node_count: 8, outline: "8 nodes", detail_level: "full" };
+    },
+    shouldRetryNormalization: () => true,
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "settled-readable");
+  assert.equal(result.retried, true);
+  assert.equal(retries, 1, "a readable but unproven graph gets one bounded retry");
+  assert.equal(outlineCalls, 2, "the graph is re-probed after the retry");
+  assert.equal(settleCalls, 4, "identity is settled before and after the retry, then at return");
+});
+
+test("#1898 a readable outline does not retry when the caller declines", async () => {
+  const target = { path: "workflows/target.json" };
+  let retries = 0;
+  let outlineCalls = 0;
+
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => ({ status: "settled", active: target }),
+    readGraphOutline: async () => {
+      outlineCalls += 1;
+      return { node_count: 8, outline: "8 nodes", detail_level: "full" };
+    },
+    shouldRetryNormalization: () => false,
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "settled-readable");
+  assert.equal(result.retried, false);
+  assert.equal(retries, 0, "leftover-source or already-proven content must not reload");
+  assert.equal(outlineCalls, 1, "a declined retry keeps the first readable probe");
+});
+
 test("#1898 keeps an unreadable or unproven graph outcome unknown", async () => {
   const target = { path: "workflows/target.json" };
   let retries = 0;
@@ -558,6 +677,25 @@ test("#1898 production workflow_open accepts a settled readable outline after no
   assert.equal(panel.guard(), null, "the readable outcome releases the production reload guard");
 });
 
+test("#1898 production workflow_open retries a readable graph whose content is still normalizing", async () => {
+  const { target, counters, environment } = productionReadableOpenEnvironment({
+    readableAfterRetry: false,
+    readableButMismatched: true,
+    mismatchOnlyFirstLoad: true,
+  });
+  const panel = productionExecutor("workflow_open", environment);
+
+  const result = await panel.method({ path: target.path, rid: "readable-content-race" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.deepEqual(
+    counters(),
+    { loads: 2, outlines: 2, contentProofs: 2 },
+    "a readable first outline still gets one bounded content-normalization retry",
+  );
+  assert.equal(panel.guard(), null, "the recovered outcome releases the production reload guard");
+});
+
 test("#1898 production workflow_open keeps a readable but mismatched graph unknown", async () => {
   const { target, counters, environment } = productionReadableOpenEnvironment({
     readableAfterRetry: false,
@@ -568,8 +706,8 @@ test("#1898 production workflow_open keeps a readable but mismatched graph unkno
   await assert.rejects(panel.method({ path: target.path, rid: "mismatched-readable-race" }), /content could not be verified/);
   assert.deepEqual(
     counters(),
-    { loads: 1, outlines: 1, contentProofs: 2 },
-    "readability cannot replace the final normalized node/value content proof",
+    { loads: 2, outlines: 2, contentProofs: 2 },
+    "a persistent mismatch remains unknown after the one bounded normalization retry",
   );
   assert.equal(panel.guard(), null, "the unknown outcome releases the production reload guard");
 });
@@ -836,6 +974,580 @@ test("#1639 production workflow_open preserves proven-bound capture after a legi
   assert.equal(captures, 1, "a proven-bound canvas still captures node-written values after a tab move");
   assert.equal(subscribers.length, 0, "the synchronous pointer watch is cleaned up after the open");
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open does not capture a still-mounted previous canvas with an uncaptured SOURCE node addition", async () => {
+  const sourceUuid = "source-c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const previousState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
+  };
+  let active;
+  let captured = 0;
+  let captureDecisionInput;
+  let loadedValue;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    // The outgoing tab has a live, manually-added node that its tracker has not
+    // captured yet. The exact #1951 source proof must therefore be false even
+    // though this is still visibly the outgoing canvas.
+    _nodes: [
+      { id: 1, type: "KSampler", widgets_values: ["previous-value"] },
+      { id: 566, type: "PreviewImage", widgets_values: [] },
+    ],
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    extra: root.extra,
+  });
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(previousState) },
+  };
+  active = previous;
+  const target = {
+    path: "workflows/target.json",
+    filename: "target.json",
+    isModified: false,
+    changeTracker: {
+      activeState: structuredClone(targetState),
+      checkState() {
+        captured += 1;
+        this.activeState = structuredClone(previousState);
+      },
+    },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async (state) => {
+      loadedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      root.extra = state.extra;
+      root._nodes = state.nodes.map((node) => ({ ...node }));
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    decideLiveCanvasCapture: (input) => {
+      captureDecisionInput = input;
+      return decideLiveCanvasCapture(input);
+    },
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: ({ rootGraph, activeWorkflowUuid }) =>
+      rootGraph?.extra?.comfyui_mcp?.workflow_uuid === activeWorkflowUuid,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => ({
+      proven:
+        rootGraph?._nodes?.length === state?.nodes?.length &&
+        rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+      presentationOnly: false,
+      normalizedOnly: false,
+    }),
+    graphRootStructureExtendsActiveWorkflow,
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 1, outline: "1 KSampler", detail_level: "full" }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => targetUuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  const result = await panel.method({ path: "target.json", rid: "still-mounted-source" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, false, "the production TARGET classifier must see SOURCE's root as foreign");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, true, "the production SOURCE classifier must reach the capture decision");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted && captureDecisionInput.pointerMovedThisOpen, true);
+  assert.equal(captured, 0, "a source edit that the tracker missed is not proof the visible root belongs to TARGET");
+  assert.equal(loadedValue, "target-value", "the repaint must use TARGET's tracker, not the previous canvas");
+  assert.equal(root._nodes[0].widgets_values[0], "target-value");
+  assert.equal(root._nodes.some((node) => node.id === 566), false, "the previous tab's added node must not reach TARGET");
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open does not treat a TARGET graph containing SOURCE plus an added node as SOURCE", async () => {
+  const sourceUuid = "source-9a9b1c2d-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-9a9b1c2d-6a89-4b9f-a58c-ff48a2eb7e95";
+  const sourceState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  const targetState = {
+    nodes: [
+      { id: 1, type: "KSampler", widgets_values: ["target-value"] },
+      { id: 566, type: "PreviewImage", widgets_values: [] },
+    ],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
+  };
+  let active;
+  let captures = 0;
+  let captureDecisionInput;
+  let loadedValue;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    // This is a valid TARGET graph: it contains all SOURCE nodes and one additional
+    // node, but its target identity must prevent the SOURCE-containment heuristic.
+    _nodes: targetState.nodes.map((node) => ({ ...node })),
+    extra: targetState.extra,
+  };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    extra: root.extra,
+  });
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(sourceState) },
+  };
+  const target = {
+    path: "workflows/target-with-addition.json",
+    filename: "target-with-addition.json",
+    isModified: false,
+    changeTracker: {
+      activeState: structuredClone(targetState),
+      checkState() {
+        captures += 1;
+        this.activeState = structuredClone(targetState);
+      },
+    },
+  };
+  active = previous;
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async (state) => {
+      loadedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      root.extra = state.extra;
+      root._nodes = state.nodes.map((node) => ({ ...node }));
+      // A completed TARGET restore can normalize a widget while retaining its
+      // valid node set. This must not be called leftover SOURCE state.
+      root._nodes[0].widgets_values[0] = "frontend-normalized";
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target with addition",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    decideLiveCanvasCapture: (input) => {
+      captureDecisionInput = input;
+      return decideLiveCanvasCapture(input);
+    },
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: ({ rootGraph, activeWorkflowUuid }) =>
+      rootGraph?.extra?.comfyui_mcp?.workflow_uuid === activeWorkflowUuid,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => {
+      const sameShape = rootGraph?._nodes?.length === state?.nodes?.length;
+      const sameWidget = rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0];
+      const exact = sameShape && sameWidget;
+      return {
+        proven: exact,
+        presentationOnly: false,
+        normalizedOnly: sameShape && !sameWidget,
+        normalizedFields: sameShape && !sameWidget ? ["widgets_values"] : [],
+      };
+    },
+    graphRootStructureExtendsActiveWorkflow,
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 2, outline: "1 KSampler, 566 PreviewImage", detail_level: "full" }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => targetUuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  const result = await panel.method({ path: target.path, rid: "target-plus-source-addition" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, true, "the production TARGET classifier must see TARGET's root as bound");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, false, "the SOURCE proof must not reject a valid TARGET graph");
+  assert.equal(captures, 1, "a target-tagged graph must not bypass TARGET checkState on SOURCE containment alone");
+  assert.equal(loadedValue, "target-value");
+  assert.equal(root._nodes[0].widgets_values[0], "frontend-normalized");
+  assert.equal(root._nodes.some((node) => node.id === 566), true, "the valid TARGET addition must survive the open");
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open does not capture a SOURCE root carrying the TARGET UUID", async () => {
+  const sourceUuid = "source-3b5f6d7e-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-3b5f6d7e-6a89-4b9f-a58c-ff48a2eb7e95";
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const sourceState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["source-value"] }],
+    links: [],
+    groups: [],
+    last_node_id: 1,
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    last_node_id: 1,
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
+  };
+  const source = {
+    path: "workflows/source.json",
+    changeTracker: { activeState: structuredClone(sourceState) },
+  };
+  let active = source;
+  let captures = 0;
+  let captureDecisionInput;
+  const subscribers = [];
+  target.activeState = structuredClone(targetState);
+  target.changeTracker = {
+    activeState: structuredClone(targetState),
+    checkState() {
+      captures += 1;
+    },
+  };
+  const root = environment.app.graph;
+  root._nodes = [
+    { id: 1, type: "KSampler", widgets_values: ["source-value"] },
+    { id: 566, type: "PreviewImage", widgets_values: [] },
+  ];
+  root.extra = { comfyui_mcp: { workflow_uuid: targetUuid } };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    last_node_id: 566,
+    extra: root.extra,
+  });
+  environment.document = workflowPiniaDocument({
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  });
+  environment.activeWorkflowRef = () => active;
+  environment.workflowObjectUuid = (workflow) => (workflow === source ? sourceUuid : targetUuid);
+  environment.workflowStableUuid = (workflow) => (workflow === source ? sourceUuid : targetUuid);
+  delete environment.describeLiveCanvasBinding;
+  delete environment.graphRootWorkflowUuidMatches;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {
+    active = target;
+  };
+  environment.getGraphCtx = () => ({ graph: root, rootGraph: root });
+  environment.decideLiveCanvasCapture = (input) => {
+    captureDecisionInput = input;
+    return decideLiveCanvasCapture(input);
+  };
+  environment.graphRootReproducesStateContent = ({ rootGraph, state }) => ({
+    // The mounted SOURCE has a user edit beyond the source tracker, so the exact
+    // source-content proof is intentionally unavailable; identity must still fail closed.
+    proven: rootGraph?._nodes?.length === state?.nodes?.length &&
+      rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+    presentationOnly: false,
+    normalizedOnly: false,
+  });
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "target-tagged-source-root" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, false, "a TARGET tag on SOURCE is not independent capture proof");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, false, "the stale root must reach the fail-closed gate");
+  assert.equal(captures, 0, "the stale SOURCE root must never be serialized into TARGET");
+  assert.equal(environment.app.graph._nodes[0].widgets_values[0], "target-value");
+  assert.equal(environment.app.graph._nodes.some((node) => node.id === 566), false);
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open refuses when the load leaves the previous tab's widgets on the canvas", async () => {
+  const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const previousState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  let active;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    _nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(previousState) },
+  };
+  active = previous;
+  const target = {
+    path: "workflows/target.json",
+    filename: "target.json",
+    isModified: false,
+    changeTracker: { activeState: structuredClone(targetState), checkState() {} },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async () => {
+      // Related-workflow merge: same ids/types, previous widgets survive.
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: () => uuid,
+    workflowStableUuid: () => uuid,
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    describeLiveCanvasBinding: () => "bound",
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: () => true,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => {
+      const liveValue = rootGraph?._nodes?.[0]?.widgets_values?.[0];
+      const requestedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      const proven = liveValue === requestedValue;
+      return {
+        proven,
+        presentationOnly: false,
+        normalizedOnly: !proven,
+        normalizedFields: proven ? [] : ["widgets_values"],
+      };
+    },
+    describeGraphStateDifference: () => ({
+      comparable: true,
+      surfaces: ["nodes"],
+      accountedSurfaces: [],
+      nodeDifference: { comparable: true, sameNodeSet: true, fields: ["widgets_values"] },
+    }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => null },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => uuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  await assert.rejects(
+    panel.method({ path: "target.json", rid: "leftover-source-widgets" }),
+    /content could not be verified/,
+    "normalizedOnly must not publish TARGET's fence over the previous tab's widgets",
+  );
+  assert.equal(root._nodes[0].widgets_values[0], "previous-value", "the leftover canvas is still SOURCE");
+  assert.equal(panel.guard(), null, "the refused open still releases its reload guard");
 });
 
 test("#1639 production workflow_open remembers a switch-away-and-back during an awaited open step", async () => {
@@ -1120,4 +1832,202 @@ test("#887 workflow_open wires the settle probe before releasing its guards", ()
     /rebindFailed = new Error\([\s\S]*active canvas/,
     "an unstable result follows the fail-closed rebind path",
   );
+});
+
+test("#1911 production workflow_open without $subscribe captures already-current and discloses", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => target;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {};
+  environment.describeLiveCanvasBinding = () => "bound";
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "no-subscribe-already-current" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    captures,
+    1,
+    "already-current without a watcher still captures via the pre-watch proof — silent skip is the bug",
+  );
+  assert.equal(result.pointer_watch_unavailable, POINTER_WATCH_UNAVAILABLE_NOTICE);
+  assert.equal(panel.guard(), null);
+});
+
+test("#1215 production workflow_open captures an already-current untagged canvas", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  let captureDecisionInput;
+  const subscribers = [];
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => target;
+  environment.document = workflowPiniaDocument({
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  });
+  environment.decideLiveCanvasCapture = (input) => {
+    captureDecisionInput = input;
+    return decideLiveCanvasCapture(input);
+  };
+  // Use the shipped classifier with an untagged root. The fixture's default
+  // matcher is bound-oriented for the older lifecycle cases; the production
+  // graph-binding matcher correctly answers false for this root, yielding unknown.
+  environment.graphRootWorkflowUuidMatches = graphRootWorkflowUuidMatches;
+  environment.graphRootWorkflowUuidMismatches = graphRootWorkflowUuidMismatches;
+  delete environment.describeLiveCanvasBinding;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {};
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "already-current-untagged" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.pointerMovedThisOpen, false);
+  assert.equal(captureDecisionInput.pointerProof, true, "the active pointer watch proves the target stayed current");
+  assert.equal(
+    captureDecisionInput.captureSourceProof,
+    true,
+    "an untagged but already-current canvas remains eligible for live capture",
+  );
+  assert.equal(captures, 1, "unknown binding must not revert node-written values to activeState");
+  assert.equal(subscribers.length, 0, "the production pointer watch is cleaned up after the open");
+  assert.equal(result.pointer_watch_unavailable, undefined);
+  assert.equal(panel.guard(), null);
+});
+
+test("#1215 production workflow_open discloses an unknown stale canvas when the pointer watch is unavailable", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const staleValue = "stale-untagged-canvas";
+  let captures = 0;
+  let captureDecisionInput;
+  environment.app.graph._nodes = [{ id: 1, type: "KSampler", widgets_values: [staleValue] }];
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+      const capturedState = {
+        ...structuredClone(this.activeState),
+        nodes: [{ ...this.activeState.nodes[0], widgets_values: [staleValue] }],
+      };
+      this.activeState = capturedState;
+      target.activeState = structuredClone(capturedState);
+    },
+  };
+  environment.activeWorkflowRef = () => target;
+  // No document or service subscription is supplied, so production cannot install
+  // its synchronous pointer watch. Use the shipped classifier against the untagged
+  // stale root; it must remain unknown rather than being treated as current by drift.
+  environment.graphRootWorkflowUuidMatches = graphRootWorkflowUuidMatches;
+  environment.graphRootWorkflowUuidMismatches = graphRootWorkflowUuidMismatches;
+  environment.graphRootReproducesStateContent = ({ rootGraph, state }) => ({
+    proven: rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+    presentationOnly: false,
+    normalizedOnly: false,
+  });
+  delete environment.describeLiveCanvasBinding;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {};
+  environment.decideLiveCanvasCapture = (input) => {
+    captureDecisionInput = input;
+    return decideLiveCanvasCapture(input);
+  };
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "unknown-stale-no-watch" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.pointerMovedThisOpen, false);
+  assert.equal(captureDecisionInput.pointerProof, false, "no watcher must not become pointer proof");
+  assert.equal(captureDecisionInput.captureSourceProof, false, "unknown binding needs positive proof");
+  assert.equal(captures, 0, "an unknown stale canvas must never be serialized into the target");
+  assert.equal(result.pointer_watch_unavailable, POINTER_WATCH_UNAVAILABLE_NOTICE);
+  assert.equal(environment.app.graph._nodes[0].widgets_values[0], "target-value");
+  assert.equal(panel.guard(), null);
+});
+
+test("#1911 production workflow_open without $subscribe skips switch capture, still flushes SOURCE, and discloses", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  let flushed = 0;
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+      throw new Error("switch capture without a watcher would be the #1215 poison");
+    },
+  };
+  environment.flushSourceCanvasBeforeSwitch = async () => {
+    flushed += 1;
+  };
+  environment.describeLiveCanvasBinding = () => "bound";
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "no-subscribe-switch" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    flushed,
+    1,
+    "#1295 SOURCE flush must still run when the watcher cannot be installed",
+  );
+  assert.equal(
+    captures,
+    0,
+    "a tab switch without a pointer watch must not capture TARGET from SOURCE's canvas",
+  );
+  assert.equal(result.pointer_watch_unavailable, POINTER_WATCH_UNAVAILABLE_NOTICE);
+  assert.equal(panel.guard(), null);
+});
+
+test("#1911 production workflow_open uses the workflow service as $subscribe fallback", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const previous = { path: "workflows/previous.json" };
+  let active = previous;
+  let captures = 0;
+  const subscribers = [];
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => active;
+  environment.describeLiveCanvasBinding = () => "bound";
+  environment.app.extensionManager.workflow.$subscribe = (subscriber) => {
+    subscribers.push(subscriber);
+    return () => {
+      const index = subscribers.indexOf(subscriber);
+      if (index >= 0) subscribers.splice(index, 1);
+    };
+  };
+  environment.app.extensionManager.workflow.openWorkflow = async () => {
+    active = target;
+  };
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "service-subscribe-fallback" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    captures,
+    1,
+    "the workflow service $subscribe is a proven watch when Pinia lookup misses",
+  );
+  assert.equal(result.pointer_watch_unavailable, undefined);
+  assert.equal(subscribers.length, 0, "the fallback watch is cleaned up after the open");
+  assert.equal(panel.guard(), null);
 });

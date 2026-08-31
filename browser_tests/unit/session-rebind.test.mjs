@@ -265,6 +265,19 @@ test("#296: resume rides the hello only when present", () => {
   assert.equal(buildHelloPayload({ tabId: "t", resume: "sess-1" }).resume, "sess-1");
 });
 
+test("#1925: hello carries a parseable current-view witness when the canvas is known", () => {
+  const viewing = {
+    scope: "root",
+    workflow_uuid: "e14c8786-dbbd-49ee-b19f-84c0032bb9bc",
+    graph_identity: "graph:f157b6b5-0ed3-4e58-a4b7-52619cb9150e",
+  };
+  const frame = buildHelloPayload({ tabId: "t", viewing });
+  assert.deepEqual(frame.viewing, viewing);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t" }), false);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t", viewing: { scope: "other" } }), false);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t", viewing: null }), false);
+});
+
 test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orchestrator can safely allow graph edits", () => {
   // A current build fences at dispatch AND immediately before an async graph write.
   // Both flags must ride every hello (not gated behind optional fields), so the
@@ -272,6 +285,7 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp_at_write, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_expected_node_type_at_write, true);
+  assert.equal(buildHelloPayload({ tabId: "t" }).enforces_expected_node_identity_at_write, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).publishes_promoted_terminal_witnesses, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_promoted_parent_rail_at_write, true);
   assert.equal(
@@ -284,6 +298,10 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   );
   assert.equal(
     buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_expected_node_type_at_write,
+    true,
+  );
+  assert.equal(
+    buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_expected_node_identity_at_write,
     true,
   );
 });

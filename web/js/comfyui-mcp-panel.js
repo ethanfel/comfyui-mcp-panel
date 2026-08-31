@@ -70,6 +70,9 @@ import {
   promotedInputAliases,
   resolvePromotedInnerTarget,
 } from "./lib/widget-write.js";
+import { missingWidgetMessage } from "./lib/missing-widget.js";
+import { freeVramSuccessResult, readVramOccupancy } from "./lib/vram-occupancy.js";
+import { nodeInstanceIdentity } from "./lib/node-identity.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
@@ -88,7 +91,11 @@ import {
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
 import { createChatScrollStabilizer } from "./lib/chat-scroll-stabilizer.js";
-import { createChatScrollIntentTracker, updateChatStickiness } from "./lib/chat-scroll-intent.js";
+import {
+  createChatScrollIntentTracker,
+  isLeavingBottomScrollIntent,
+  updateChatStickiness,
+} from "./lib/chat-scroll-intent.js";
 import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   mergeRunCompletionMetadata,
@@ -106,9 +113,14 @@ import {
   PANEL_EXTENSION_NAME,
 } from "./lib/duplicate-panel-guard.js";
 import { tryRegisterWhenReady } from "./lib/resolve-comfy-app.js";
-import { pressableWidgetHint } from "./lib/pressable-widget.js";
-import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { looksLikeApiWorkflow, apiWorkflowPayload, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
+import {
+  DEFAULT_RENDER_STALL_SECONDS,
+  normalizeRenderStallSeconds,
+  RENDER_STALL_SECONDS_MAX,
+  RENDER_STALL_SECONDS_MIN,
+} from "./lib/render-stall-config.js";
 import {
   installNodeConfigureIsolation,
   retryNodeRestores,
@@ -232,6 +244,18 @@ import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import {
+  UPDATE_NOTICE_DISMISS_KEY,
+  decideUpdateNoticeAffordance,
+  dismissToken,
+  fetchPublishedPanelVersions,
+  isDismissed,
+  readBrowserClientContext,
+  resolveUpdateState,
+  shouldOfferHostMutation,
+  shouldSurfaceUpdateNotice,
+  summarizePendingVersions,
+} from "./lib/update-notify.js";
+import {
   scanComboAvailability,
   comboAvailabilityNote,
   uncheckedNodesNote,
@@ -281,6 +305,7 @@ import {
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
+import { isGenericManagerInstallError, readInstallTraceback } from "./lib/manager-install-traceback.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
@@ -304,6 +329,7 @@ import { refreshMissingAssetTrust } from "./lib/missing-asset-refresh.js";
 import {
   NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
+  describeStaleBundleRefresh,
   describeRefreshGraphLoss,
   restoredLiveNodesNote,
 } from "./lib/node-def-refresh.js";
@@ -320,7 +346,19 @@ import { recordSkillFromGraph, persistRecordedSkill } from "./lib/record-skill.j
 // 1.7MB panel IIFE.
 import { makeCommandBudget } from "./lib/command-budget.js";
 import { fetchImageForMcp } from "./lib/fetch-image.js";
-import { fetchComfyUIReadForMcp } from "./lib/fetch-comfyui-read.js";
+import { dispatchFetchComfyUIReadForMcp } from "./lib/fetch-comfyui-read.js";
+import {
+  closeSidePanelHandle,
+  dismissLiveA2uiCard,
+  dismissAllLiveA2uiCards,
+  unloadChatMediaCards,
+} from "./lib/resident-ui-close.js";
+import {
+  readCivitaiPaneHandle,
+} from "./lib/pane-read.js";
+import {
+  setSidePanelDocked,
+} from "./lib/pane-lifecycle.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -344,13 +382,15 @@ import {
   snapshotAuthorizationNote,
   noBackendAnswerEstablished,
 } from "./lib/object-info-snapshot.js";
-import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
+import { fetchTypeScopedObjectInfo } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,
   waitForReconnectHandshakeBeforeOpen,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
   graphMutationReconnectGate,
   reconnectRefusalError,
   readReconnectRefusal,
@@ -358,6 +398,11 @@ import {
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
+import {
+  shouldReregisterWorkflowTabChannel,
+  watchReconnectTabChannel,
+  ensureWorkflowTabChannel,
+} from "./lib/reconnect-tab-channel.js";
 import { describeHttpFailure } from "./lib/http-failure.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -385,7 +430,12 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
-import { reconcileFreshDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
+import {
+  reconcileFreshDynamicWidgets,
+  reconcileGraphDynamicWidgets,
+  installGraphToPromptDynamicReconcile,
+} from "./lib/dynamic-widget-reconcile.js";
+import { serializeLiveGraph } from "./lib/graph-serialize-capture.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -432,6 +482,7 @@ import {
   outlineFloorRefusal,
   outlineValueClipNote,
   clipOutlineTitle,
+  isPromotedContainer,
 } from "./lib/graph-read.js";
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
@@ -444,6 +495,7 @@ import {
   subgraphSaveCollisionAction,
   withBlueprintOverwriteConfirm,
 } from "./lib/subgraph-blueprint-overwrite.js";
+import { prepareSubgraphProxyWidgetsForPublish } from "./lib/subgraph-proxy-widgets.js";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
@@ -451,7 +503,13 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
-import { findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks } from "./lib/rail-slot.js";
+import {
+  findExistingRailSlot,
+  resolveRailSlotForRemoval,
+  countHostRailLinks,
+  reindexHostRailLinks,
+  refuseConnectToRawRail,
+} from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
@@ -536,9 +594,18 @@ import {
 import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
+  ensureControlAfterGenerateQueueHooks,
 } from "./lib/control-after-generate.js";
-import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import {
+  autoMatchSlots,
+  slotDiagnostic,
+  loopbackRefusalReason,
+  unresolvedWildcardPairReason,
+  isWildcardSlotType,
+} from "./lib/connect-match.js";
+import {
+  snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   isLinkPersisted,
   removePhantomLink,
   isWidgetBackedInput,
@@ -550,7 +617,16 @@ import {
   isRailLinkPersisted,
   landedAfterThrowWarning,
   readStoredLink,
+  verifyConnect,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "./lib/connect-verify.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "./lib/dynamic-slot-reconcile.js";
 import {
   captureNodeTitles,
   describeTitleRewrites,
@@ -575,10 +651,23 @@ import {
   trackerCaptureSuppressed,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
+import {
+  decideLiveCanvasCapture,
+  installActivePointerWatch,
+  POINTER_WATCH_UNAVAILABLE_NOTICE,
+} from "./lib/live-canvas-capture-gate.js";
+import { decideBoundRestart, normalizeBoundOrigin } from "./lib/bound-restart-witness.js";
+import { decideDesktopRestartRestore, resolveDesktopRestore } from "./lib/desktop-restart-restore.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
-import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
+import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
+  settleOwnedOpenedTmpRoutingKey,
+  settleOwnedOpenedWorkflowActive,
+} from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
+import { generatedImageMediaItems, generatedImageRemainderText } from "./lib/generated-image.js";
 import {
   applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
@@ -677,6 +766,7 @@ import {
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
+import { createMutationReceiptStore, resolveLateMutationReply } from "./lib/mutation-receipt.js";
 import {
   canvasFileDivergence,
   canvasFileDivergenceNote,
@@ -716,10 +806,15 @@ import {
   reRegisterExhaustedHint,
 } from "./lib/command-liveness.js";
 import {
+  malformedToolNameException,
+  readMalformedToolName,
+} from "./lib/command-name.js";
+import {
   classifyInteractiveCard,
   refusedInteractiveCardError,
 } from "./lib/interactive-card-fence.js";
 import { revealInteractiveCard } from "./lib/interactive-card-reveal.js";
+import { waitForAdultConsentAnswer } from "./lib/adult-consent-wait.js";
 import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
@@ -733,6 +828,10 @@ import {
   validateWorkflowSubfolder,
 } from "./lib/workflow-save.js";
 import { describeSaveBackendSocket } from "./lib/save-transport-failure.js";
+import {
+  noteRestartConfirmTimeout,
+  rebindSameOriginSaveRoute,
+} from "./lib/save-route-retry.js";
 import {
   WORKFLOW_SAVE_COMMAND_BUDGET_MS,
   runBoundedWorkflowSave,
@@ -754,6 +853,7 @@ import {
   storyboardSampleTimes,
 } from "./lib/media-duration.js";
 import { videoPreviewsEnabled } from "./lib/video-previews.js";
+import { chatMediaEnabled } from "./lib/chat-media-inflow.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
@@ -763,10 +863,12 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  graphRootStructureExtendsActiveWorkflow,
   applySavedNodePresentation,
   describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
+  staleReadMayFollowLiveCanvas,
   MUTATION_BINDING_BAR,
   graphBindingRefusalMessage,
   resolveGraphBindingVerdict,
@@ -786,9 +888,15 @@ import {
   contentProofExclusiveAmongOpen,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
-import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
+import { honestRunAck } from "./lib/delivery-ack.js";
+import {
+  createRunFetchInterceptor,
+  dispatchScopedRun,
+  invokeQueuePromptWithBrowserStack,
+} from "./lib/run-scope-guard.js";
 import { prunedRetryNote } from "./lib/partial-run-prune.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
+import { collectNodeOutputMedia } from "./lib/node-output-media.js";
 import {
   normalizeModels,
   presentableModels,
@@ -811,6 +919,7 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
+import { shouldJoinInFlightGraphReply, ledgerReplyIsInFlight } from "./lib/graph-rpc-liveness.js";
 /** #1095 — control frames that must arrive AFTER the hello that establishes their route,
  *  and whose senders ignore the return value. Those two properties together are what makes
  *  a frame queueable: a queued frame's outcome is not yet known, so it may only be queued
@@ -1052,6 +1161,12 @@ let activeWorkflowResyncEpoch = 0;
 let postReconnectBindingProofEpoch = 0;
 // Supersede token for the settle watch — a newer reconnect retires the older watch.
 let postReconnectWatchToken = 0;
+// #2030 — last reconnect epoch whose workflow command channel has a landed hello.
+// Stale while this is behind backendReconnectEpoch: the orchestrator still waits
+// for a newer generation (`tab_reconnected:false`) even though the backend
+// is up. The watchdog re-hellos THIS tab; it never reloads the in-memory graph.
+let tabChannelReadyEpoch = 0;
+let tabChannelWatchToken = 0;
 // #646: ComfyUI's own backend socket is DOWN between its "reconnecting" and
 // "reconnected" events (a null "status" payload is the same lost-connection
 // signal). A graph mutation dispatched in that gap can be applied and then wiped
@@ -1597,6 +1712,41 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
+/**
+ * #2027 — compare the running PANEL_VERSION to the installed pack marker.
+ * A stale tab must not attempt the whole-schema refresh: the on-disk pack may
+ * already have the large-/object_info budget this cached bundle lacks, and a
+ * miss used to retire last-known combo lists the next widget write still needed.
+ * Fail-open on an unreadable probe (same rule as the startup heal).
+ */
+async function refuseStaleBundleRefresh() {
+  try {
+    let installed = null;
+    if (typeof api?.fetchApi === "function") {
+      let timer = null;
+      const probe = (async () => {
+        const res = await api.fetchApi("/comfyui_mcp_panel/version", { cache: "no-store" });
+        if (!res || !res.ok) return null;
+        const body = await res.json().catch(() => null);
+        return typeof body?.version === "string" ? body.version : null;
+      })();
+      try {
+        installed = await Promise.race([
+          probe,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(null), 2000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    return describeStaleBundleRefresh({ running: PANEL_VERSION, installed });
+  } catch {
+    return null;
+  }
+}
+
 async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
@@ -1667,22 +1817,42 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       ? runOpts.runBudgetMs
       : NODE_DEFS_RUN_BUDGET_MS;
   let runDeadline = monotonicNow() + runBudgetMs;
-  // #716 — drop the widget-write burst cache at the START of this run, not after it
-  // succeeds (codex). This function runs on exactly the events that change the schema —
-  // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
-  // when the schema is most likely to have moved. Invalidating only on success would leave
-  // the pre-change map authorizing writes for the rest of the TTL, where the old code would
-  // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
-  // be wrong in the dangerous direction.
-  objectInfoCache.invalidate();
-  // #2249 — fence the last-observed snapshot while this replacement is unresolved, but do
-  // not destroy it before the new whole map succeeds. If both whole routes fail, the old
-  // membership-only map is still the only usable evidence for an existing scalar widget;
-  // object-info-snapshot.js re-binds it to the post-invalidation generation only after this
-  // run has conclusively failed. Reconnect handlers still clear it outright because a new
-  // backend process is the one event that can change the type set.
-  objectInfoSnapshot.beginReplacement?.();
-  if (typeof verifiedNodeDefCache !== "undefined") verifiedNodeDefCache.clear();
+  // Whole-schema start-of-run effects. A one-class payload from graph_add_node is not a
+  // type-set replacement (#2050): fencing the last-observed snapshot and then running
+  // refreshComboInNodes() would re-fetch the same dump that just missed its budget, and
+  // beginReplacement would bump the generation so the add could not file the per-class
+  // proof it just verified.
+  if (replacementMayReplaceWholeSnapshot) {
+    // #2027 — a stale browser bundle must not fence or clear last-known schema.
+    // Ask before invalidate/beginReplacement so a large-/object_info miss on an
+    // older tab cannot worsen the next widget edit.
+    const staleBundle = await refuseStaleBundleRefresh();
+    if (staleBundle) return staleBundle;
+    // #716 — drop the widget-write burst cache at the START of this run, not after it
+    // succeeds (codex). This function runs on exactly the events that change the schema —
+    // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
+    // when the schema is most likely to have moved. Invalidating only on success would leave
+    // the pre-change map authorizing writes for the rest of the TTL, where the old code would
+    // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
+    // be wrong in the dangerous direction.
+    objectInfoCache.invalidate();
+    // #2249 — fence the last-observed snapshot while this replacement is unresolved, but do
+    // not destroy it before the new whole map succeeds. If both whole routes fail, the old
+    // membership-only map is still the only usable evidence for an existing scalar widget;
+    // object-info-snapshot.js re-binds it to the post-invalidation generation only after this
+    // run has conclusively failed. Reconnect handlers still clear it outright because a new
+    // backend process is the one event that can change the type set.
+    objectInfoSnapshot.beginReplacement?.();
+    // #1709 — fence verified per-class proofs the same way. A timeout here is not evidence
+    // the type set moved; destroying them at refresh start turned a busy /object_info into a
+    // #458 refusal of a class this session already added on this connection. Generation still
+    // advances, so an in-flight probe cannot reuse or repopulate under the new fence.
+    if (typeof verifiedNodeDefCache?.beginReplacement === "function") {
+      verifiedNodeDefCache.beginReplacement();
+    } else if (typeof verifiedNodeDefCache !== "undefined") {
+      verifiedNodeDefCache.clear();
+    }
+  }
   // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
   // can never be filed under post-restart provenance.
@@ -1690,8 +1860,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   const runStartedAtGeneration = verifiedNodeDefCache.generation();
   // A refresh is not authoritative while any of its frontend mutation work is still
   // outstanding. Consumers such as collectMissingAssets must fail closed during that
-  // window, even if an earlier run had established trust.
-  nodeDefsRefreshConfirmed = false;
+  // window, even if an earlier run had established trust. A one-class registration is
+  // not that replacement, so it must not drop combo trust the last whole run earned.
+  if (replacementMayReplaceWholeSnapshot) nodeDefsRefreshConfirmed = false;
   let thrown = null;
   // #608 — what EACH transport did in the fetch phase, in order, when none of them produced
   // a payload. The verdict appends it, so a refusal names the routes that were actually
@@ -2099,6 +2270,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       // `{}` or an unreadable object is an authoritative non-schema response for this
       // refresh, not a failed replacement that can resurrect the prior membership map.
       if (!snapshotRecorded) objectInfoSnapshot.clear();
+      // The new whole map is authority for every class. Drop per-class proofs without
+      // advancing generation again — this run is still current.
+      verifiedNodeDefCache.acceptReplacement?.();
     }
     // #1275 — snapshot the live graph BEFORE the first mutating phase. Everything
     // from here to the combo phase calls into frontend and extension code
@@ -2166,7 +2340,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
-    if (comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true) {
+    if (!replacementMayReplaceWholeSnapshot) {
+      // #2050 — this run registered one class from `/object_info/<Type>`. The frontend
+      // combo refresh re-fetches the whole `/object_info` document, which is the dump
+      // that just could not land. Skip it; the add's own def already carries this class's
+      // combo lists, and sibling combos stay whatever the last whole run left them.
+      phase = "done";
+    } else if (comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true) {
       // #1736 — reapplyDefsToLiveNodes() has already rebuilt every live combo from
       // this run's authoritative payload. Calling refreshComboInNodes() here would
       // re-fetch the same schema and can remain pending behind concurrent downloads,
@@ -2395,6 +2575,20 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
         socketDown: comfyBackendSocketDown,
       });
     }
+    // #1709 — a timeout-starved refresh is not an authoritative type-set change. Restore
+    // per-class proofs so a later add of a class this session already verified can reuse
+    // them after both live routes go silent. A successful whole answer already called
+    // acceptReplacement, so this only runs when the replacement never landed.
+    if (
+      typeof verifiedNodeDefCache?.retainAfterReplacementFailure === "function" &&
+      verifiedNodeDefCache.isReplacementPending?.() === true
+    ) {
+      verifiedNodeDefCache.retainAfterReplacementFailure({
+        epoch: backendReconnectEpoch,
+        generation: verifiedNodeDefCache.generation(),
+        socketDown: comfyBackendSocketDown,
+      });
+    }
     // Trust the live combos for suppressing missing-asset candidates ONLY when BOTH an
     // authoritative /object_info payload was actually obtained this call AND the combo
     // lists were refreshed from it. refreshComboInNodes resolving alone is not proof —
@@ -2429,12 +2623,14 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       !comfyBackendSocketDown &&
       runStartedAtEpoch === backendReconnectEpoch &&
       runStartedAtGeneration === verifiedNodeDefCache.generation();
-    nodeDefsRefreshConfirmed =
-      runIsCurrent &&
-      !comboCompletionPending &&
-      !didThrow &&
-      !!defs &&
-      (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
+    if (replacementMayReplaceWholeSnapshot) {
+      nodeDefsRefreshConfirmed =
+        runIsCurrent &&
+        !comboCompletionPending &&
+        !didThrow &&
+        !!defs &&
+        (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
+    }
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -2761,6 +2957,11 @@ function setupListeners() {
       // The watch runs only the same safe heals a graph command runs lazily;
       // it never repaints the canvas from serialized state (#604).
       kickPostReconnectSettleWatch(backendReconnectEpoch);
+      // #2030: re-register THIS tab's workflow command channel after the backend
+      // cycle. Distinct from the settle watch: that re-proves canvas binding; this
+      // re-hellos the existing tab so workflow_list answers instead of timing out.
+      // Does not open or load the workflow — unsaved in-memory edits stay.
+      kickReconnectTabChannelWatch(backendReconnectEpoch);
       // #1636: drop the remembered subgraph owner and re-pin viewing/mutation scope.
       clearAutoLayoutScope();
       noteReconnectScopeFence();
@@ -2803,7 +3004,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.113";
+const PANEL_VERSION = "0.15.149";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -3820,16 +4021,28 @@ function captureWasSuppressed(tracker) {
   }
 }
 
-function activeWorkflowRef() {
+// #2125 — the ONE read of the active workflow, tagged with whether it actually
+// RAN. `activeWorkflowRef()` collapses "the frontend exposes no active workflow"
+// and "the lookup threw" into the same `null`, which is fine for every caller
+// that only wants the object, and NOT fine for a caller asking whether anything
+// changed: two throws would otherwise witness "absent, then absent" for a tab
+// that moved underneath them. `readable:false` means "I did not find out".
+function probeActiveWorkflow() {
   try {
-    return (
-      window.comfyAPI?.app?.app?.extensionManager?.workflow?.activeWorkflow ||
-      (typeof app !== "undefined" && app?.extensionManager?.workflow?.activeWorkflow) ||
-      null
-    );
+    return {
+      workflow:
+        window.comfyAPI?.app?.app?.extensionManager?.workflow?.activeWorkflow ||
+        (typeof app !== "undefined" && app?.extensionManager?.workflow?.activeWorkflow) ||
+        null,
+      readable: true,
+    };
   } catch {
-    return null;
+    return { workflow: null, readable: false };
   }
+}
+
+function activeWorkflowRef() {
+  return probeActiveWorkflow().workflow;
 }
 
 function savedWorkflowPath(wf = activeWorkflowRef()) {
@@ -4159,6 +4372,22 @@ function installCreateBoundaryFork(appRef) {
         // Never let disclosure bookkeeping break a graph load either.
       }
       const result = orig(graphData, clean, restoreView, workflow, options);
+      // #1931 — SaveVideo (and any other nested DynamicCombo) can land from a saved
+      // workflow already carrying a bare orphan next to the real dotted child
+      // (`codec` AND `format.codec`). add_node and load share the same materialiser;
+      // run it after the graph is live. `typeof` keeps extracted-fork tests, which
+      // do not bind this helper, from throwing on an unresolved identifier.
+      const reconcileLoaded = () => {
+        try {
+          if (typeof reconcileGraphDynamicWidgets === "function") {
+            reconcileGraphDynamicWidgets(appRef?.graph);
+          }
+        } catch {
+          // Post-load dynamic-widget cleanup must never break a graph load.
+        }
+      };
+      if (result && typeof result.then === "function") result.then(reconcileLoaded, () => {});
+      else reconcileLoaded();
       if (ownerlessStampUuid) {
         // #349 r3/r6 P0 — a creation-minted tag must NEVER float ownerless when
         // its receiving tab can be PROVEN — but registration must never guess.
@@ -4878,6 +5107,16 @@ function workflowTabId(wf = activeWorkflowRef()) {
   return id;
 }
 
+// #2022 — READ, never mint. Post-open routing-key settle must not invent a
+// fresh tmp: handle on a restored object; that would look like a different tab
+// and fail a switch that already applied.
+function readExistingWorkflowTabId(wf = activeWorkflowRef()) {
+  if (!wf) return null;
+  const saved = savedWorkflowPath(wf);
+  if (saved) return savedWorkflowHandle(saved);
+  return tempWorkflowInstanceId(wf) || priorTempWorkflowId(wf) || null;
+}
+
 // #640 — the BRIDGE ROUTE for a workflow: the `tab_id` this panel puts on the
 // wire, and the key ui-bridge keeps exactly ONE connection under.
 //
@@ -5176,10 +5415,31 @@ function readRouteRegistrationReadinessRefusal(error) {
 // replacement-socket handoff. Wait for the live route before starting the
 // global, otherwise-safe refresh; if the bridge is down entirely, preserve the
 // local refresh path and let its existing backend readiness handling decide.
+// #2026 — a ready route is not enough: its workflow UUID must still be the
+// command-bound instance. Accepting a stale object identity here lets
+// refresh_nodes answer refreshed:true with another UUID on the same graph.
 const ROUTE_REGISTRATION_WAIT_STEPS_MS = Object.freeze([100, 250, 500, 1000, 2000]);
-async function awaitActiveRouteRegistration() {
+function routeWorkflowUuidDiffers(expectedWorkflowUuid) {
+  if (typeof expectedWorkflowUuid !== "string" || expectedWorkflowUuid.length === 0) return false;
+  let liveUuid;
+  try {
+    liveUuid = workflowStableUuid();
+  } catch {
+    return true;
+  }
+  return liveUuid !== expectedWorkflowUuid;
+}
+
+async function awaitActiveRouteRegistration(expectedWorkflowUuid) {
   const client = liveBridgeClient;
   if (!client || client.isConnected?.() !== true) return;
+  const refuseStaleUuid = () => {
+    if (!routeWorkflowUuidDiffers(expectedWorkflowUuid)) return;
+    throw routeRegistrationReadinessRefusalError(
+      "the active route reports a different workflow instance than the command-bound canvas",
+    );
+  };
+  refuseStaleUuid();
   if (client.isRouteReady?.() === true) return;
   const ready =
     typeof client.waitForRouteReady === "function"
@@ -5188,6 +5448,7 @@ async function awaitActiveRouteRegistration() {
   if (ready !== true || liveBridgeClient !== client || client.isRouteReady?.() !== true) {
     throw routeRegistrationReadinessRefusalError();
   }
+  refuseStaleUuid();
 }
 
 // Per-tab agent session id + which thread this tab is showing. sessionStorage
@@ -5734,7 +5995,13 @@ const SETTING_PROMPT_ASSIST_HTTP = "comfyui-mcp.promptAssist.httpProviders";
 // screen. On by default; off paints a metadata-only placeholder (first frame +
 // filename) and leaves the full decode to the lightbox. Read at PAINT time, so
 // it needs no live-apply hook — cards already in the log are untouched.
+// This is NOT the hide-cards switch; that is SETTING_CHAT_MEDIA (#2034).
 const SETTING_VIDEO_PREVIEWS = "comfyui-mcp.videoPreviews";
+// #2034 — auto-paint generated image/video/audio cards into the chat log. On
+// by default; off keeps the transcript text-only. Agent-visible inlineImages /
+// videos / storyboard / completion frames are untouched. Read per executed
+// completion so a toggle applies to the next output without a reload.
+const SETTING_CHAT_MEDIA = "comfyui-mcp.chatMedia";
 // RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
 // boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
 // conversation is always panel-owned now; stored values under these ids are
@@ -6106,12 +6373,11 @@ function triggerSecret(envKey, friendly) {
 
 // Stall-warning threshold (seconds) from the panel setting, clamped to a sane
 // range — sent on connect so the orchestrator (COMFYUI_MCP_STALL_S) warns the
-// agent once a render has made no progress for this long. null when unset/invalid
-// (the orchestrator then keeps its own 180s default).
+// agent once a render has made no progress for this long. An unset/invalid value
+// uses the Panel's 600s long-node-safe default rather than falling back to the
+// orchestrator's shorter 180s default.
 function stallSettingSeconds() {
-  const v = Number(getSetting(SETTING_STALL_S));
-  if (!Number.isFinite(v) || v <= 0) return null;
-  return Math.min(3600, Math.max(15, Math.round(v)));
+  return normalizeRenderStallSeconds(getSetting(SETTING_STALL_S));
 }
 
 // Optional remote ComfyUI URL (panel setting). Blank → drive the local ComfyUI.
@@ -6771,14 +7037,28 @@ function panelSettingsList() {
       },
     },
     {
-      id: SETTING_VIDEO_PREVIEWS,
-      name: "Video previews in chat",
-      get category() { return cat(tr("panel.general", "General"), "Video previews in chat"); },
+      id: SETTING_CHAT_MEDIA,
+      name: "Generated media in chat",
+      get category() { return cat(tr("panel.general", "General"), "Generated media in chat"); },
       sortOrder: 150,
       tooltip:
+        "Show generated images, videos, and audio as cards in the chat transcript. Turn off to keep the " +
+        "transcript text-only; the agent still receives the outputs (including storyboards and completion frames). " +
+        "Applies to media generated after the change. Cards already in the chat stay; suppressed cards are not " +
+        "saved and will not reappear after a reload.",
+      type: "boolean",
+      defaultValue: true,
+    },
+    {
+      id: SETTING_VIDEO_PREVIEWS,
+      name: "Inline video playback in chat",
+      get category() { return cat(tr("panel.general", "General"), "Inline video playback in chat"); },
+      sortOrder: 151,
+      tooltip:
         "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with " +
-        "its first frame and filename, and clicking it opens the full video in the lightbox. Applies to videos " +
-         "generated after the change; cards already in the chat keep their player.",
+        "its first frame and filename, and clicking it opens the full video in the lightbox. This does not hide " +
+        "videos from the chat — use Generated media in chat for that. Applies to videos generated after the change; " +
+        "cards already in the chat keep their player.",
       type: "boolean",
       defaultValue: true,
     },
@@ -6867,11 +7147,11 @@ function panelSettingsList() {
       tooltip:
         "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
         "(e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps " +
-        "are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator " +
+        "are legitimately slow, so keep this generous. Default 600s; range 15–3600. Applies when the orchestrator " +
         "next starts — Disconnect then Connect (or /restart) to change it for a running agent.",
       type: "number",
-      attrs: { min: 15, max: 3600, step: 5 },
-      defaultValue: 180,
+      attrs: { min: RENDER_STALL_SECONDS_MIN, max: RENDER_STALL_SECONDS_MAX, step: 5 },
+      defaultValue: DEFAULT_RENDER_STALL_SECONDS,
       onChange: () => {
         if (suppressSettingOnChange || !settingsArmed) return;
         // Push the new threshold to a live orchestrator (set_config) so it applies
@@ -7546,6 +7826,14 @@ async function programmaticSave(name) {
         flaggedDown: comfyBackendSocketDown,
         socketReadyState: comfyBackendSocketReadyState(),
       }),
+    // #1757 — after a restart confirmation expires without rebooting, point the
+    // userdata write back at this page's origin before retrying the same-origin
+    // save. Evaluated at failure time so it describes the host that is live now.
+    rebindSaveRoute: () =>
+      rebindSameOriginSaveRoute({
+        api,
+        origin: globalThis.location?.origin,
+      }),
   });
   if (details.mode === "in-place" && typeof clearWorkflowGraphProvenanceUnknown === "function") {
     clearWorkflowGraphProvenanceUnknown(expectWf);
@@ -8101,7 +8389,7 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
     // the LEGACY transport, i.e. the very rung the ladder falls back TO.
     if (err?.name === "AbortError") throw err;
     throw markManagerUnreachable(
-      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+      new Error(managerFetchFailureMessage(route, err, { prefix: "/" }), { cause: err }),
     );
   }
   if (!res) {
@@ -8646,8 +8934,18 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne, budg
       listError = true;
     }
   }
+  // #2012 — Manager's do_install records only "Installation failed" (plus an
+  // optional node spec) and prints the real traceback / res.msg to the server
+  // log. When the stored reason is that generic sentence, fetch the log and
+  // attach the traceback so the tool result is the evidence, not a pointer to
+  // it. A specific Manager exception already in the task record does not pay
+  // for a log read.
+  let traceback;
+  if (taskFailure && isGenericManagerInstallError(taskFailure)) {
+    traceback = await readInstallTraceback(target, api);
+  }
   return classifyInstallOutcome({
-    target, dialect, status, installed, listError, batchFailed, renameProne, taskFailure,
+    target, dialect, status, installed, listError, batchFailed, renameProne, taskFailure, traceback,
   });
 }
 
@@ -9343,6 +9641,51 @@ function postReconnectBindingSettleWindow() {
 // been observed to pass — never a weaker proxy. The watch performs no canvas
 // repaint and no workflow mutation; when the restore never settles it simply
 // stops, and the binding refusals keep their existing remedies.
+function kickReconnectTabChannelWatch(epoch) {
+  const token = ++tabChannelWatchToken;
+  const restartLength = shouldReadvertiseAfterComfyRestart({
+    bridgeConnected: liveBridgeClient?.isConnected?.() === true,
+    outageMs: comfyBackendOutage.outageMs(),
+    helloLandedSinceOutage: landedHelloCount > comfyBackendOutage.helloBaseline(),
+    alreadyReadvertised: false,
+  });
+  const rebootPending = !!ssGet(REBOOT_KEY);
+  if (!restartLength && !rebootPending) {
+    // Benign WS blip: the existing hello still names this tab. Do not mint a
+    // second one — that is the #1138 false-nudge harm.
+    tabChannelReadyEpoch = epoch;
+    return;
+  }
+  if (
+    !shouldReregisterWorkflowTabChannel({
+      serverReady: !comfyBackendIsDown(),
+      bridgeConnected: liveBridgeClient?.isConnected?.() === true,
+      channelReadyForEpoch: tabChannelReadyEpoch === epoch,
+    })
+  ) {
+    // No live socket: the socket-open hello owns recovery.
+    return;
+  }
+  const outageSeq = comfyBackendOutage.seq();
+  void watchReconnectTabChannel({
+    isCurrent: () => token === tabChannelWatchToken && epoch === backendReconnectEpoch,
+    serverReady: () => !comfyBackendIsDown(),
+    channelReady: () => tabChannelReadyEpoch === epoch,
+    reregister: () =>
+      comfyRestartReadvertise.attempt({
+        outageSeq: outageSeq > 0 ? outageSeq : epoch,
+        reconnectEpoch: epoch,
+        isCurrent: () =>
+          epoch === backendReconnectEpoch &&
+          (outageSeq === 0 || outageSeq === comfyBackendOutage.seq()),
+        send: () => liveBridgeClient?.rehello?.(),
+      }),
+  }).catch(() => {
+    // Best-effort: a failed watch leaves the pre-#2030 behavior (channel stays
+    // stale until a manual refresh).
+  });
+}
+
 function kickPostReconnectSettleWatch(epoch) {
   const token = ++postReconnectWatchToken;
   void watchPostReconnectSettle({
@@ -9372,11 +9715,27 @@ function assertGraphBoundToActiveWorkflow(
     // `graphCommandBindingBar`. Gating the stale-tag bypass on the absence of the
     // mutation flag would be default-permit (codex).
     staleTagReadBypass = false,
+    // #2125 (gate r2 P1) — the caller's OWN observation of the active workflow, when
+    // it already made one as part of proving nothing changed. See below.
+    workflowProbe = null,
   } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
-  const activeWorkflow = activeWorkflowRef();
+  // #2125 (gate r2 P1) — DECIDE ON THE CALLER'S OBSERVATION, not a fresh one.
+  //
+  // `revalidateGraphMutationContext` admits an absent workflow only when its probe
+  // PROVED the absence (it ran and found nothing), never when the probe threw. A
+  // bare re-read here would be a third, independent sample of the same surface, and
+  // `activeWorkflowRef()` reports a throw as `null` — which every predicate below
+  // reads as "no workflow service — legacy availability". So the gate could admit on
+  // a proven absence and this layer could then permit the write on an UNREADABLE one,
+  // re-introducing one line down exactly the conflation the gate exists to prevent.
+  //
+  // One observation, one decision. Callers that did not probe (every read path, and
+  // the direct mutation paths that have no preflight to straddle) pass nothing and
+  // get the original read, unchanged.
+  const activeWorkflow = workflowProbe ? workflowProbe.workflow : activeWorkflowRef();
   // Every caller, including direct CivitAI graph_load and local snapshot restore,
   // must establish the active object identity before relying on a dirty-tab
   // relaxation. workflowStableUuid is root-blind when this object has no cache:
@@ -9657,13 +10016,92 @@ function getPiniaStore(id) {
  *  promote/demote/isPromoted) — the state that exposes an inner subgraph widget
  *  on the parent SubgraphNode. Frontend >= 1.48 removed this store: value
  *  widgets promote via linked subgraph inputs, and preview widgets use
- *  `previewExposure` instead. */
+ *  `previewExposure` instead.
+ *
+ *  1.41 `promote`/`demote` take four strings
+ *  `(graphId, subgraphNodeId, interiorNodeId, widgetName)`. Passing a source
+ *  object as the third argument wrote `properties.proxyWidgets[n] = [object, null]`,
+ *  which the load validator rejects (#2002). */
 function getPromotionStore() {
   const store = getPiniaStore("promotion");
   if (!store || typeof store.promote !== "function") {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
   }
   return store;
+}
+
+/** Canvas-only callback widgets (`control_after_generate` and similar): both
+ *  `serialize:false` and `canvasOnly:true`. They have no connectable input slot,
+ *  so the link-only path cannot promote them, and the legacy store used to persist
+ *  an unloadable `proxyWidgets` entry for them (#2002). */
+function isCanvasOnlyCallbackWidget(widget) {
+  if (!widget) return false;
+  const opts = widget.options ?? {};
+  const serializeFalse = widget.serialize === false || opts.serialize === false;
+  const canvasOnly = widget.canvasOnly === true || opts.canvasOnly === true;
+  return serializeFalse && canvasOnly;
+}
+
+/** Frontend load schema for `properties.proxyWidgets`: `[string, string][]`. */
+function isValidProxyWidgetPair(entry) {
+  return (
+    Array.isArray(entry) &&
+    entry.length >= 2 &&
+    typeof entry[0] === "string" &&
+    entry[0].length > 0 &&
+    typeof entry[1] === "string" &&
+    entry[1].length > 0
+  );
+}
+
+/** Drive the 1.41 promotion store with string ids, then rebuild both the store
+ *  and `properties.proxyWidgets` from the union of valid name pairs so serialize
+ *  cannot persist the object/null shape the old 3-arg call wrote (#2002). */
+function applyLegacyPromotionStore(store, action, parent, rootGraph, source) {
+  const rootGraphId = parent.rootGraph?.id ?? rootGraph?.id;
+  const interiorNodeId = String(source.sourceNodeId ?? "");
+  const widgetName = String(source.sourceWidgetName ?? "");
+  if (!interiorNodeId || !widgetName) {
+    throw new Error("legacy promotion requires a string node id and widget name");
+  }
+  store[action](rootGraphId, parent.id, interiorNodeId, widgetName);
+
+  const seen = new Set();
+  const pairs = [];
+  const addPair = (id, name) => {
+    if (typeof id !== "string" || !id || typeof name !== "string" || !name) return;
+    const key = `${id}\0${name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push([id, name]);
+  };
+  const raw = Array.isArray(parent.properties?.proxyWidgets) ? parent.properties.proxyWidgets : [];
+  for (const entry of raw) {
+    if (isValidProxyWidgetPair(entry)) addPair(entry[0], entry[1]);
+  }
+  if (typeof store.getPromotions === "function") {
+    for (const entry of store.getPromotions(rootGraphId, parent.id) ?? []) {
+      addPair(entry?.interiorNodeId, entry?.widgetName);
+    }
+  }
+  const wantedKey = `${interiorNodeId}\0${widgetName}`;
+  let next;
+  if (action === "demote") {
+    next = pairs.filter(([id, name]) => `${id}\0${name}` !== wantedKey);
+  } else {
+    addPair(interiorNodeId, widgetName);
+    next = pairs;
+  }
+
+  const props = parent.properties ?? (parent.properties = {});
+  props.proxyWidgets = next;
+  if (typeof store.setPromotions === "function") {
+    store.setPromotions(
+      rootGraphId,
+      parent.id,
+      next.map(([id, name]) => ({ interiorNodeId: id, widgetName: name })),
+    );
+  }
 }
 
 /** Reach ComfyUI's PREVIEW-widget exposure store (id "previewExposure"; methods
@@ -9999,7 +10437,7 @@ function promotedTerminalWitnesses(subgraphNode) {
       terminal?.cycle ||
       terminal?.error ||
       terminal?.terminalVirtual ||
-      terminalNode.subgraph ||
+      isPromotedContainer(terminalNode) ||
       terminal?.depth === undefined ||
       !Number.isSafeInteger(terminal.depth) ||
       terminal.depth < 0 ||
@@ -10191,6 +10629,64 @@ function describeActiveGraph(graph) {
   return withLiveIdentity({ scope: "root" });
 }
 
+/** #1925 — a parseable current-view witness for the orchestrator's promoted-write
+ *  cache. Malformed `viewing` is recorded as known:false ("scope became
+ *  unverifiable"); omit rather than send that. A successful graph command that
+ *  never published `viewing` also left the cache cold after hello/reconnect. */
+function parseableViewingWitness(viewing) {
+  if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) return null;
+  if (viewing.scope !== "root" && viewing.scope !== "subgraph") return null;
+  const rawOwner = viewing.owner_node_id;
+  if (rawOwner !== undefined && rawOwner !== null) {
+    if (
+      (typeof rawOwner !== "number" || !Number.isSafeInteger(rawOwner)) &&
+      (typeof rawOwner !== "string" || rawOwner.length === 0)
+    ) {
+      return null;
+    }
+  }
+  const rawWorkflowUuid = viewing.workflow_uuid;
+  if (
+    rawWorkflowUuid !== undefined &&
+    (typeof rawWorkflowUuid !== "string" || rawWorkflowUuid.length === 0)
+  ) {
+    return null;
+  }
+  const rawGraphIdentity = viewing.graph_identity;
+  if (
+    rawGraphIdentity !== undefined &&
+    (typeof rawGraphIdentity !== "string" ||
+      rawGraphIdentity.length === 0 ||
+      rawGraphIdentity.length > 256)
+  ) {
+    return null;
+  }
+  return viewing;
+}
+
+function liveParseableViewingWitness() {
+  try {
+    return parseableViewingWitness(describeActiveGraph(getGraphCtx().graph));
+  } catch {
+    return null;
+  }
+}
+
+function withViewingWitness(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const existing = Object.prototype.hasOwnProperty.call(result, "viewing")
+    ? parseableViewingWitness(result.viewing)
+    : null;
+  if (existing) return result;
+  const live = liveParseableViewingWitness();
+  if (!live) {
+    if (!Object.prototype.hasOwnProperty.call(result, "viewing")) return result;
+    const { viewing: _dropped, ...rest } = result;
+    return rest;
+  }
+  return { ...result, viewing: live };
+}
+
 /** #2314 — validate the promoted receiver at the synchronous mutation boundary.
  * The MCP-side graph_query is only a classification read; navigation can replace
  * the viewed graph before the write resumes. The expected scope is therefore an
@@ -10203,14 +10699,27 @@ function canonicalExpectedPromotedOwner(value) {
   return Number.isSafeInteger(parsed) ? String(parsed) : null;
 }
 
+function findLiveSubgraphInstance(current, ownerId) {
+  if (!ownerId) return null;
+  const seen = new Set();
+  for (const graph of [current?.graph, current?.rootGraph]) {
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (canonicalExpectedPromotedOwner(node?.id) === ownerId && node?.subgraph) return node;
+    }
+  }
+  return null;
+}
+
 function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
   if (expectedScope === undefined) return;
   if (!expectedScope || typeof expectedScope !== "object" || Array.isArray(expectedScope)) {
     throw new Error("graph_set_widget expected_scope must be a structured subgraph witness");
   }
   const expected = expectedScope;
-  if (expected.scope !== "subgraph") {
-    throw new Error("graph_set_widget expected_scope.scope must be \"subgraph\"");
+  if (expected.scope !== "subgraph" && expected.scope !== "root") {
+    throw new Error("graph_set_widget expected_scope.scope must be \"subgraph\" or \"root\"");
   }
   const expectedOwner = canonicalExpectedPromotedOwner(expected.owner_node_id);
   if (!expectedOwner) {
@@ -10231,20 +10740,49 @@ function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
   }
 
   const liveViewing = describeActiveGraph(current.graph);
-  const liveOwner = findSubgraphOwner(current.rootGraph, current.graph);
-  const liveOwnerId = canonicalExpectedPromotedOwner(liveOwner?.id);
-  if (
+  const liveOwnerFromView = findSubgraphOwner(current.rootGraph, current.graph);
+  const liveOwnerIdFromView = canonicalExpectedPromotedOwner(liveOwnerFromView?.id);
+  const workflowMatches =
+    expected.workflow_uuid === undefined || liveViewing.workflow_uuid === expected.workflow_uuid;
+  const describeLiveOwner = () =>
+    liveOwnerIdFromView ??
+    (liveViewing.scope === "root" ? "root (no subgraph owner)" : "missing subgraph owner");
+  const describeLive = () =>
+    `${liveViewing.scope} owner ${describeLiveOwner()}` +
+    `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}` +
+    `${liveViewing.graph_identity ? ` graph ${liveViewing.graph_identity}` : ""}`;
+
+  let liveOwner = liveOwnerFromView;
+  if (liveViewing.scope === "root" && workflowMatches) {
+    // #1925 — a promoted write addressed at a subgraph INSTANCE is issued from
+    // the verified-stable root (the wrapper is on the root canvas). The
+    // expected envelope still names that instance as owner; expected.graph_identity
+    // is the CHILD graph, so it must not be compared to the live ROOT identity.
+    const instance = findLiveSubgraphInstance(current, expectedOwner);
+    if (!instance) {
+      throw new Error(
+        `graph_set_widget promoted receiver changed before dispatch: expected subgraph instance owner ${expectedOwner}` +
+          `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""} on the live root, ` +
+          `found ${describeLive()}. Nothing was applied.`,
+      );
+    }
+    if (expected.scope === "root" && liveViewing.graph_identity !== expected.graph_identity) {
+      throw new Error(
+        `graph_set_widget promoted receiver changed before dispatch: expected root graph ${expected.graph_identity}, ` +
+          `found ${describeLive()}. Nothing was applied.`,
+      );
+    }
+    liveOwner = { id: instance.id, node: instance, title: instance.title };
+  } else if (
     liveViewing.scope !== "subgraph" ||
-    liveOwnerId !== expectedOwner ||
-    (expected.workflow_uuid !== undefined && liveViewing.workflow_uuid !== expected.workflow_uuid) ||
+    liveOwnerIdFromView !== expectedOwner ||
+    !workflowMatches ||
     liveViewing.graph_identity !== expected.graph_identity
   ) {
     throw new Error(
       `graph_set_widget promoted receiver changed before dispatch: expected subgraph owner ${expectedOwner}` +
         `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""}, ` +
-        `found ${liveViewing.scope} owner ${liveOwnerId ?? "unverifiable"}` +
-        `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}. ` +
-      "Nothing was applied.",
+        `found ${describeLive()}. Nothing was applied.`,
     );
   }
 
@@ -10296,7 +10834,9 @@ function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
       (expectedRail.widget_id !== undefined && liveWidgetId !== expectedRail.widget_id)
     ) {
       throw new Error(
-        "graph_set_widget promoted parent rail changed or became unverifiable before dispatch. Nothing was applied.",
+        ownerNode
+          ? "graph_set_widget promoted parent rail changed or became unverifiable before dispatch. Nothing was applied."
+          : "graph_set_widget promoted parent rail is missing: the subgraph instance owner is not on the live canvas. Nothing was applied.",
       );
     }
   }
@@ -12063,9 +12603,12 @@ async function revertGraphSnapshotByMid(mid) {
 }
 
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
- *  values, and input link sources. Deliberately NOT the full serialization
- *  (positions, colors, internal state) to keep token cost low. */
+ *  values, input link sources, and the presentation fields panel_edit_node
+ *  can write (mode always; pinned/shape/collapsed when not default).
+ *  Deliberately NOT the full serialization (positions, colors, internal
+ *  state beyond those) to keep token cost low. */
 function summarizeNode(node) {
+  const nodeIdentity = nodeInstanceIdentity(node);
   const widgets = {};
   for (const w of node.widgets ?? []) {
     if (w && typeof w.name === "string") widgets[w.name] = redactWidgetValue(w.name, w.value);
@@ -12170,15 +12713,32 @@ function summarizeNode(node) {
   }
   const summary = {
     id: node.id,
+    // #2478 — this is an opaque identity of THIS live node object, not a
+    // serialized node field. The MCP preflight carries it to graph_set_widget
+    // so same-id, same-type replacement cannot satisfy a stale write.
+    ...(nodeIdentity ? { node_identity: nodeIdentity } : {}),
     type: node.type,
     title: node.title,
     pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
     size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
     ...(fullHeight != null ? { full_height: fullHeight } : {}),
     ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
-    // Execution mode — only emitted when NOT active so bypassed/muted nodes are
-    // clearly visible to the agent (LiteGraph: 2 = mute, 4 = bypass, 0 = active).
-    ...(node.mode ? { mode: { 2: "mute", 4: "bypass" }[node.mode] ?? `mode_${node.mode}` } : {}),
+    ...(node.flags && node.flags.pinned ? { pinned: true } : {}),
+    // Execution mode — ALWAYS emitted, including "active". Omitted-as-default
+    // for mode 0 made every ordinary node look like the field did not exist
+    // (#1957). LiteGraph: 0 = active, 2 = mute, 4 = bypass.
+    mode: { 0: "active", 2: "mute", 4: "bypass" }[Number(node.mode) || 0] ?? `mode_${node.mode}`,
+    // Shape is writeable via panel_edit_node; emit the named form when set so a
+    // round-trip does not require a screenshot. Numeric LiteGraph constants
+    // (BOX=1 ROUND=2 CIRCLE=3 CARD=4) map to the same names the write path
+    // accepts; unset/"default"/0 is omitted like collapsed:false.
+    ...(() => {
+      const s = node.shape;
+      if (s == null || s === "" || s === "default" || s === 0) return {};
+      if (s === "box" || s === "round" || s === "card" || s === "circle") return { shape: s };
+      const named = { 1: "box", 2: "round", 3: "circle", 4: "card" }[s];
+      return named ? { shape: named } : {};
+    })(),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
     // OUTPUT nodes (SaveImage/PreviewImage/SaveVideo/…) are the only valid
@@ -12209,10 +12769,17 @@ function summarizeNode(node) {
   };
   // Subgraphs summarize SHALLOWLY — boundary slots + widgets only, plus an
   // inner node count. Drill in with graph_get_subgraph when needed.
-  if (node.subgraph) {
+  // #2006 — same live-container predicate as graph_get_subgraph / pinpoint
+  // is_subgraph: leftover `.subgraph` on a PrimitiveNode is not a container.
+  if (isPromotedContainer(node)) {
     summary.is_subgraph = true;
-    summary.subgraph_node_count =
-      node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
+    let innerCount = 0;
+    try {
+      innerCount = node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
+    } catch {
+      innerCount = 0;
+    }
+    summary.subgraph_node_count = innerCount;
   }
   return summary;
 }
@@ -12943,24 +13510,21 @@ function widenSocketProofBudget(deadlineMs) {
  * #1413 — `graph_set_widget`'s whole-command deadline, taken on the handler's first line.
  *
  * The fourth instance of the defect #1192 fixed for `graph_add_node` and #1404/#1409 for
- * `refresh_nodes`: a wait relayed inside the orchestrator's 30,000 ms window
- * (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` in comfyui-mcp's panel-tools.ts — the same relay
- * constant add_node is measured against) that never took a command budget. Here it is the
- * stale-combo recovery's `refreshComfyNodeDefs()` fallback: a plain join of a run someone
- * else started, under a deadline this command never stated. One run is ~14.5 s of wall
- * clock (NODE_DEFS_RUN_BUDGET_MS deliberately stops its clock across
- * registerNodesFromDefs/reapplyDefsToLiveNodes), and the recovery is reached only AFTER
- * the authorization /object_info has already spent part of the window — so an unbounded
- * join can outlive the relay even with every other step on the path bounded, and the
- * reply is then the bare `did not reply to "graph_set_widget" within 30000 ms` that names
- * nothing, instead of the worded, retryable refusal below.
+ * `refresh_nodes`: a wait relayed inside the orchestrator's schema-command window
+ * (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` in comfyui-mcp's panel-tools.ts) that never took a
+ * command budget. Here it is the stale-combo recovery's `refreshComfyNodeDefs()` fallback:
+ * a plain join of a run someone else started, under a deadline this command never stated.
+ * One run is ~14.5 s of wall clock (NODE_DEFS_RUN_BUDGET_MS deliberately stops its clock
+ * across registerNodesFromDefs/reapplyDefsToLiveNodes), and the recovery is reached only
+ * AFTER the authorization /object_info has already spent part of the window — so an
+ * unbounded join can outlive the relay even with every other step on the path bounded, and
+ * the reply is then the bare `did not reply to "graph_set_widget"` that names nothing,
+ * instead of the worded, retryable refusal below.
  *
- * 25,000 ms, mirroring ADD_NODE_COMMAND_BUDGET_MS against the same 30,000 ms window for
- * the same reason: 5,000 ms of slack for composing the reply, serialising it, and the
- * websocket hop. Mirrored rather than derived for the same reason too — the relay
- * constant lives in the OTHER repo, and a derived copy here could not be kept true.
+ * 80,000 ms leaves 10,000 ms against the schema command's 90,000 ms relay for composing
+ * the reply, serialising it, and the websocket hop.
  */
-const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
+const SET_WIDGET_COMMAND_BUDGET_MS = 80000;
 
 /**
  * #1565 — `graph_run` was the one mutating command on this list with NO command budget at
@@ -13152,7 +13716,13 @@ async function awaitRequiredCustomWidgetRegistration(
 
 function captureGraphMutationContext() {
   const context = getGraphCtx();
-  return { ...context, workflow: activeWorkflowRef() };
+  // #2125 — carry the READABILITY of the workflow probe alongside its result. The
+  // comparison below admits an absent workflow, and it may only do so when both
+  // ends PROVED the absence; a probe that threw returns the same `null` and
+  // proves nothing. One probe call per capture, so the flag cannot disagree with
+  // the value it describes.
+  const probe = probeActiveWorkflow();
+  return { ...context, workflow: probe.workflow, workflowReadable: probe.readable };
 }
 
 function revalidateGraphMutationContext(captured) {
@@ -13169,7 +13739,11 @@ function revalidateGraphMutationContext(captured) {
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
   if (reconnectGate) throw reconnectRefusalError(reconnectGate);
-  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
+  // getGraphCtx FIRST, then the workflow probe — the same order as the capture, so
+  // the two contexts are built from the same sequence of reads (#2125).
+  const currentGraphCtx = getGraphCtx();
+  const currentProbe = probeActiveWorkflow(); // #2125 — see captureGraphMutationContext
+  const current = { ...currentGraphCtx, workflow: currentProbe.workflow, workflowReadable: currentProbe.readable };
   if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
     throw new Error(
       "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
@@ -13177,6 +13751,11 @@ function revalidateGraphMutationContext(captured) {
   }
   assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
     ...MUTATION_BINDING_BAR,
+    // #2125 (gate r2 P1) — the binding decision must be about the workflow this
+    // function just PROVED unchanged, not about a third sample of the same surface
+    // taken microseconds later. Without this the comparison above and the binding
+    // bar below can disagree about whether the workflow was readable at all.
+    workflowProbe: currentProbe,
   });
   return current;
 }
@@ -13213,16 +13792,21 @@ let repaintHistoryList = null;
  * two were different.
  *
  * The panel is the one component that knows this for certain: it runs INSIDE the
- * ComfyUI it reboots. `comfyuiUrlForAgent()` is deliberately the SAME value handed to
- * the orchestrator in `hello`, so the identity a caller compares against its own
- * target cannot drift from the one it was told to target.
+ * ComfyUI it reboots. #1913: the host it names is the bound canvas origin (the
+ * page that is about to go down), NOT the hello / Remote-URL override — that
+ * override is what the orchestrator should *talk to*, and naming it on a reboot
+ * of a different origin is a confident wrong answer (panel 8189, boot 8188).
  *
  * A plain function, NOT a method on the executors table: dispatch invokes
  * `executor(msg)` with no receiver, so `this` is undefined in a module and a method
  * call here would throw instead of rebooting.
  */
+function rebootBoundOrigin() {
+  return normalizeBoundOrigin(pageComfyOrigin());
+}
+
 /**
- * The same identity, for prose (#851).
+ * The same identity, for prose (#851 / #1913).
  *
  * `target` is for a caller comparing hosts; these strings are what a HUMAN reads,
  * and "could not reach any reboot endpoint" that cannot say WHICH server it failed
@@ -13230,12 +13814,12 @@ let repaintHistoryList = null;
  * unknown, rather than naming a blank one.
  */
 function rebootTargetLabel(prefix) {
-  const target = comfyuiUrlForAgent();
+  const target = rebootBoundOrigin();
   return target ? prefix + " on " + target : prefix;
 }
 
 function rebootTargetFields() {
-  const target = comfyuiUrlForAgent();
+  const target = rebootBoundOrigin();
   return target ? { target } : {};
 }
 
@@ -13286,6 +13870,10 @@ function rememberLateWorkflowSave(rid, raw, cmd = "workflow_save") {
 function lateWorkflowSaveReceipts() {
   pruneLateSaveReceipts();
   return Array.from(lateSaveReceipts.values()).map((receipt) => ({ ...receipt }));
+}
+
+function lateMutationReceiptList() {
+  return lateMutationReceipts.list();
 }
 
 /**
@@ -13380,7 +13968,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // The operation-to-path mapping and same-origin/credential checks live in the
   // helper; no caller-supplied URL, path, target, or origin reaches fetch().
   fetch_comfyui_read(args = {}) {
-    return fetchComfyUIReadForMcp(args, { api });
+    return dispatchFetchComfyUIReadForMcp(args, { api });
   },
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
   // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly
@@ -13408,7 +13996,23 @@ const GRAPH_TOOL_EXECUTORS = {
     // #1787 — a stale explicit tab_id can still reach this executor during a
     // replacement-socket handoff. Do not let the global refresh run until the
     // bridge has registered the current active route.
-    await awaitActiveRouteRegistration();
+    // #2026 — snapshot the established identity of the canvas this command is
+    // about to refresh. The reply witness is attached after we return and can
+    // re-read a stale workflow-object UUID for the same graph. Publish the
+    // identity we actually refreshed; if the live route moves to another
+    // instance, refuse instead of refreshed:true with another UUID.
+    const liveViewing = liveParseableViewingWitness();
+    let boundUuid = liveViewing?.workflow_uuid;
+    try {
+      const established = workflowStableUuid();
+      if (typeof established === "string" && established.length > 0) boundUuid = established;
+    } catch {
+      // keep the viewing uuid when the established identity cannot be read
+    }
+    const boundIdentity = liveViewing && boundUuid
+      ? { ...liveViewing, workflow_uuid: boundUuid }
+      : liveViewing;
+    await awaitActiveRouteRegistration(boundUuid);
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinInFlight: true,
@@ -13429,6 +14033,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // installs it exists for. See REFRESH_NODES_RUN_BUDGET_MS for the measurement.
       runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,
     });
+    const liveIdentity = liveParseableViewingWitness();
+    if (
+      boundIdentity?.workflow_uuid &&
+      liveIdentity?.workflow_uuid &&
+      liveIdentity.workflow_uuid !== boundIdentity.workflow_uuid &&
+      !(
+        boundIdentity.graph_identity &&
+        liveIdentity.graph_identity &&
+        boundIdentity.graph_identity === liveIdentity.graph_identity
+      )
+    ) {
+      throw routeRegistrationReadinessRefusalError(
+        "the active route changed to a different workflow instance while node definitions were refreshing",
+      );
+    }
+    const viewing = boundIdentity ? { viewing: boundIdentity } : {};
     // #1404 — a NAMED verdict, before the generic branch below can call it "unknown".
     //
     // NOTHING FAILED and nothing was left half-done: the coalescer does not cancel the run
@@ -13464,6 +14084,7 @@ const GRAPH_TOOL_EXECUTORS = {
           "it settles pays for one refresh instead of two, which is normally enough; if it " +
           "keeps reporting this, the refresh itself is slower than the budget and reloading " +
           "the ComfyUI tab is the fallback that remains.",
+        ...viewing,
       };
     }
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
@@ -13474,13 +14095,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // consumers rather than assuming the verdict flowed through.
     // `ok` stays true and `refreshed` stays true: the refresh did what it claims. The
     // reload flag is advisory, about the canvas, not a failure of the refresh.
-    const stale = verdict != null && typeof verdict === "object" && verdict.requires_reload
-      ? {
-          requires_reload: true,
-          stale_placeholders: verdict.stale_placeholders,
-          stale_placeholders_note: verdict.stale_placeholders_note,
-        }
-      : {};
+    const stale = {
+      ...viewing,
+      ...(verdict != null && typeof verdict === "object" && verdict.requires_reload
+        ? {
+            requires_reload: true,
+            stale_placeholders: verdict.stale_placeholders,
+            stale_placeholders_note: verdict.stale_placeholders_note,
+          }
+        : {}),
+    };
     // #1172 — forwarded through the SAME hole #981 fell into. The `refreshed: true` branch
     // below returns a fixed object literal, so a field the verdict carries but this whitelist
     // does not name is silently dropped on exactly the successful path where the disclosure
@@ -13531,13 +14155,18 @@ const GRAPH_TOOL_EXECUTORS = {
         "The refresh did not complete and the panel could not determine why. Retry; if it persists, reload the ComfyUI tab.",
     };
   },
-  // Full-fidelity capture of the live canvas — the ROOT graph's serialized UI
-  // JSON (the same shape ComfyUI writes to disk on save), so the orchestrator
-  // can strip/slice/save what the user ACTUALLY has open without asking them to
-  // save to a file first. Read-only; subgraph defs ride along in `definitions`.
+  // Full-fidelity capture of the live canvas — ONE JSON object
+  // `{ workflow, node_count }` (the same UI-graph shape ComfyUI writes to disk
+  // on save). Not two blocks (summary then graph): this command is the capture
+  // panel_strip_workflow converts; that tool's own structuredContent.graph is
+  // the combined summary+graph form, not a second block from here. Read-only;
+  // subgraph defs ride along in workflow.definitions. #1996 extra schema fields
+  // stay; capturedWidgetValues rides along for positional-schema skew.
   graph_serialize() {
     const { rootGraph } = getGraphCtx();
-    const workflow = rootGraph.serialize();
+    const workflow = serializeLiveGraph(rootGraph, {
+      reconcile: (graph) => reconcileGraphDynamicWidgets(graph),
+    });
     return { workflow, node_count: workflow?.nodes?.length ?? 0 };
   },
 
@@ -13992,23 +14621,25 @@ const GRAPH_TOOL_EXECUTORS = {
      */
     const fmtVal = (v, node, widgetName) => {
       const safeValue = redactWidgetValue(widgetName, v);
-      const s = String(typeof safeValue === "string" ? safeValue : JSON.stringify(safeValue) ?? "").replace(/\s+/g, " ");
-      let clipped = s;
-      if (s.length > 60) {
+      // #2003 — clipCompactValue refuses to JSON.stringify ImageData / typed arrays /
+      // canvas elements, which is how a PreviewImage widget edit stalled this read.
+      const clippedValue = clipCompactValue(safeValue, COMPACT_VALUE_CLIP);
+      if (clippedValue.clipped) {
         outlineClipped++;
         // #1748: a clipped NOTE value is lost instructions, not a re-queryable detail —
         // remember the node so the footer can name it (the row's own 60-char clip reads
         // as the whole note otherwise).
         if (NOTE_NODE_TYPES.has(node?.type) && !outlineClippedNoteIds.includes(node.id))
           outlineClippedNoteIds.push(node.id);
-        clipped = s.slice(0, 57) + "…";
       }
+      const clipped = clippedValue.text;
       if (!/[[\]]/.test(clipped)) return clipped;
       // Escape backslashes first, then quotes, so the escape introduced for a quote is
       // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
       return `"${clipped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     };
-    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const modeTag = (n) =>
+      ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "") + (n.flags && n.flags.pinned ? " [pinned]" : "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
 
     // #809: render the node block at ONE rung of the detail ladder. Every rung emits a
@@ -14559,7 +15190,8 @@ const GRAPH_TOOL_EXECUTORS = {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
       return s.length > n ? s.slice(0, n - 1) + "…" : s;
     };
-    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const modeTag = (n) =>
+      ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "") + (n.flags && n.flags.pinned ? " [pinned]" : "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
     const header =
       `${matched.length} match(es) of ${candidates.length} in scope (viewing: ${total} nodes)` +
@@ -14596,14 +15228,14 @@ const GRAPH_TOOL_EXECUTORS = {
           // #2314 — MCP must distinguish a definitive ordinary node from an
           // older Panel whose detail projection cannot classify promotion.
           // Positive-only emission made missing capability look like false.
-          is_subgraph: !!n.subgraph,
+          is_subgraph: isPromotedContainer(n),
         };
         line = JSON.stringify(summary);
         // Final guard: if the fully-capped detail STILL exceeds max_chars (a node with
         // very many/large slots, which capSummaryWidgets doesn't touch), degrade the
         // protected line to a bounded valid-JSON stub so it's never dropped yet can't
         // flood — every rendered detail line ends up ≤ max_chars.
-        line = fitDetailLine(line, { id: summary.id, type: summary.type, title: summary.title }, maxChars);
+        line = fitDetailLine(line, { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph }, maxChars);
       } else {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
@@ -14667,12 +15299,71 @@ const GRAPH_TOOL_EXECUTORS = {
       truncatedBy = "max_chars";
       text = assemble();
     }
+    // #1925/#2478 — a pinpoint read is the orchestrator's promoted-scope and
+    // node-incarnation probe. That classifier prefers a structured `nodes` row
+    // with a boolean `is_subgraph` and, for current panels, the opaque
+    // `node_identity`; `text` alone is a legacy fallback. Publish a minimal
+    // bounded witness for an explicit one-ID compact read too. Broad compact
+    // reads keep their historical text-only shape and never expose a large
+    // structured summary for every node.
+    // #1941 — fit the structured row the same way as the survey line. An
+    // uncapped VHS/high-fan-in summary used to dwarf `max_chars` while the
+    // text stub stayed bounded; a timed-out/truncated probe then fell through
+    // to graph_get_subgraph and refused a root node as an unclassifiable
+    // promoted container.
+    const pinpointNodes = (() => {
+      if (!(pinpoint && (proj === "detail" || proj === "compact") && shown === 1 && matched[0])) return null;
+      const summarized = summarizeNode(matched[0]);
+      const summary =
+        proj === "compact"
+          ? {
+              id: summarized.id,
+              type: summarized.type,
+              ...(typeof summarized.node_identity === "string"
+                ? { node_identity: summarized.node_identity }
+                : {}),
+              is_subgraph: isPromotedContainer(matched[0]),
+            }
+          : {
+              ...capSummaryWidgets(summarized, detailWidgetCap, maxChars),
+              is_subgraph: isPromotedContainer(matched[0]),
+            };
+      const fitted = fitDetailLine(
+        JSON.stringify(summary),
+        proj === "compact"
+          ? {
+              id: summary.id,
+              type: summary.type,
+              ...(typeof summary.node_identity === "string"
+                ? { node_identity: summary.node_identity }
+                : {}),
+              is_subgraph: summary.is_subgraph,
+            }
+          : { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph },
+        maxChars,
+      );
+      try {
+        return [JSON.parse(fitted)];
+      } catch {
+        return [
+          {
+            id: summary.id,
+            type: summary.type,
+            ...(typeof summary.node_identity === "string"
+              ? { node_identity: summary.node_identity }
+              : {}),
+            is_subgraph: isPromotedContainer(matched[0]),
+          },
+        ];
+      }
+    })();
     return {
       ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
       // #809: expose the CAUSE structurally too, so a caller that reads fields rather
       // than prose still learns which lever applies.
       truncated_by: truncatedBy,
       text,
+      ...(pinpointNodes ? { nodes: pinpointNodes } : {}),
     };
   },
 
@@ -14710,9 +15401,14 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       const response = await fetch("/prompt_director/inspection");
       if (response.ok) runtimePayload = await response.json();
-      else addObservation("warning", "inspection_unavailable", `Prompt Director inspection returned HTTP ${response.status}.`);
+      else if (directorNodes.length) {
+        // #1956 — HTTP 404 is expected when the graph has zero director nodes.
+        addObservation("warning", "inspection_unavailable", `Prompt Director inspection returned HTTP ${response.status}.`);
+      }
     } catch (error) {
-      addObservation("warning", "inspection_unavailable", String(error?.message ?? error));
+      if (directorNodes.length) {
+        addObservation("warning", "inspection_unavailable", String(error?.message ?? error));
+      }
     }
     const runtimeByNode = new Map(
       (runtimePayload.inspections ?? []).map((item) => [String(item.node_id), item]),
@@ -15067,8 +15763,22 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_get_subgraph({ node_id }) {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // #1941 — MCP's promoted-write probe treats anything other than this exact
+    // "is not a subgraph" line as indeterminate and refuses the write. A root
+    // node is not a promoted container: only a live inner graph (nodes list or
+    // getNodeById) is one. A truthy leftover `subgraph` used to skip the throw
+    // and look like an unclassifiable container. Nested parentheses in `type`
+    // also made the orchestrator miss its own definitive form, so flatten them.
+    // #2006 — a root PrimitiveNode is never a container, even when leftover
+    // `.subgraph` looks live or its getter throws a non-definitive error.
+    if (!isPromotedContainer(node)) {
+      const rawType = typeof node.type === "string" ? node.type : "";
+      const type = rawType.replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
+      throw new Error(
+        type ? `Node ${node.id} (${type}) is not a subgraph` : `Node ${node.id} is not a subgraph`,
+      );
+    }
     const sub = node.subgraph;
-    if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
     const promotedTerminals = promotedTerminalWitnesses(node);
     // #1729 — provenance is a second structured-read path: its raw instance_widgets
@@ -15209,12 +15919,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // "ghost" nodes appeared — the adds landed after the timeout had already
         // been reported as a failure.
         //
-        // GATED ON ALREADY-REGISTERED, and not for speed. The resolver hands
-        // `freshDefs` to refreshComfyNodeDefs() when a type still needs
+        // GATED ON ALREADY-REGISTERED for the first attempt, and not for speed. The
+        // resolver hands `freshDefs` to refreshComfyNodeDefs() when a type still needs
         // registering, and a single-class payload reaching a whole-schema refresh
         // could deregister everything else. When the type is already registered
         // that branch is unreachable, so the hazard is removed by construction
-        // rather than by remembering not to trip it.
+        // rather than by remembering not to trip it. #2050 asks this route again
+        // after the whole dump is silent, and that path marks the payload
+        // single-class so refresh must not treat it as a type-set replacement.
         //
         // The fast path only ever CONFIRMS or establishes explicit absence. Any doubt — a
         // non-200, an older build without the route, an unparseable body, or a timeout —
@@ -15312,6 +16024,48 @@ const GRAPH_TOOL_EXECUTORS = {
             freshDefs = { [class_type]: cachedDef };
             freshDefsAreSingleClass = true;
             currentDef = cachedDef;
+            return freshDefs;
+          }
+        }
+        const wholeUsable =
+          whole != null &&
+          whole !== NODE_DEFS_NO_ANSWER &&
+          typeof whole === "object" &&
+          !Array.isArray(whole);
+        if (
+          !wholeUsable &&
+          !isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)
+        ) {
+          // #2050 — the whole dump missed its budget (or never ran) on a large install
+          // while ComfyUI is healthy and GET /object_info/<Type> still answers. Ask
+          // about this class before refusing. A stale whole cache is not consulted:
+          // membership comes from this live per-class read, or from #1709's
+          // same-connection verified proof above.
+          const scopedIssued = {
+            generation: verifiedNodeDefCache.generation(),
+            epoch: backendReconnectEpoch,
+          };
+          const one = await withTimeout(
+            fetchSingleNodeInfo(class_type, (route) => api?.fetchApi?.(route)),
+            budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS),
+            () => null,
+          );
+          if (schemaProbeIsCurrent(scopedIssued) && one?.kind === "absent") {
+            freshDefs = recordObjectInfoTypes({});
+            freshDefsAreSingleClass = true;
+            currentDef = undefined;
+            return freshDefs;
+          }
+          if (schemaProbeIsCurrent(scopedIssued) && one?.kind === "present") {
+            // Do not invalidate() here: that advances the schema generation and would
+            // make a still-held whole snapshot unusable for set_widget. This class had
+            // no verified proof (the lookup above missed) and the last whole map is
+            // not evidence about it either.
+            verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
+            verifiedSchemaWriteEpoch = scopedIssued.epoch;
+            freshDefs = recordObjectInfoTypes(one.body);
+            freshDefsAreSingleClass = true;
+            currentDef = snapshotBackendDef(freshDefs, class_type);
             return freshDefs;
           }
         }
@@ -15446,9 +16200,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // render-induced probe timeout reproduced the refusal this issue exists to remove.
     //
     // `freshDefsAreSingleClass` is the panel's OWN record of which question it asked, so it
-    // is the honest wholeness claim; the single-class fast path is only taken for an
-    // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
-    // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
+    // is the honest wholeness claim. The per-class route is taken for an already-registered
+    // type, and also as a last resort when the whole dump cannot land (#2050). Mutation by
+    // a beforeRegisterNodeDef hook (#700) is irrelevant here because `record` copies out
+    // only the type NAMES.
     if (
       freshDefs &&
       !freshDefsAreSingleClass &&
@@ -15681,9 +16436,10 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.add(node);
       // COMFY_DYNAMICCOMBO_V3 first runs its value setter while LG.createNode is still
       // detached from a graph. Replay it after registration so the widget-value store and
-      // dynamic rows match the fresh node. A schema-verified stale path such as
-      // `format.codec` is routed through the current `codec` root so the frontend's own
-      // widget/store cleanup removes it.
+      // dynamic rows match the fresh node. Nested children stay on their dotted path
+      // (`format.codec`); a bare name that duplicates one (`codec`) and a schema-verified
+      // stale dotted residue are routed through the current dynamic root so the frontend's
+      // own widget/store cleanup removes them.
       const dynamicReconciliation = reconcileFreshDynamicWidgets(node, currentDef);
       if (dynamicReconciliation.failures.length) {
         const storeCleanup = dynamicReconciliation.cleanupStore?.() ?? { cleaned: true };
@@ -15716,6 +16472,18 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange();
     }
+    // #2029 — LG.createNode can leave a control_after_generate combo showing
+    // "randomize" without afterQueued/linkedWidgets, so the ordinary Queue button
+    // never rolls the seed until a tab reload rebuilds the node.
+    ensureControlAfterGenerateQueueHooks(node, {
+      getControlMode: () => {
+        try {
+          return comfyApp?.ui?.settings?.getSettingValue?.("Comfy.WidgetControlMode");
+        } catch {
+          return undefined;
+        }
+      },
+    });
     // #1709 — only a node that reached the live graph earns reuse. The definition is already
     // detached by snapshotBackendDef, and the epoch/context fence prevents it crossing a
     // reconnect or workflow/graph switch.
@@ -16026,7 +16794,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // node classes, so widget/link separation is done by the nodes themselves
     // rather than by a converter guessing from /object_info.
     if (!Array.isArray(data.nodes)) {
-      if (looksLikeApiWorkflow(data)) {
+      // panel#2011 — a path like graph.api.json is the bare API map; some exporters
+      // wrap the same map as `{prompt: {…}}`. Import either. A UI `nodes` array
+      // above already excluded this branch.
+      const apiData = apiWorkflowPayload(data);
+      if (apiData) {
         if (typeof app.loadApiJson !== "function") {
           throw new Error(
             "workflow is in API/prompt format and this frontend has no app.loadApiJson to " +
@@ -16034,7 +16806,7 @@ const GRAPH_TOOL_EXECUTORS = {
               "or open the API JSON in the ComfyUI tab by hand.",
           );
         }
-        const apiClone = JSON.parse(JSON.stringify(data));
+        const apiClone = JSON.parse(JSON.stringify(apiData));
         // #1478 (defect 1) — CAPTURE THE TARGET BEFORE THE LOAD. This is the path the
         // reporter was on (`{loaded:true, format:"api", node_count:59}`) and it is the
         // path where the fence provably goes stale, so the identity has to be reported
@@ -16054,6 +16826,11 @@ const GRAPH_TOOL_EXECUTORS = {
         // canvas too, and must be as undoable as any other graph edit this turn.
         captureGraphSnapshot(null, "before loading an API-format workflow");
         await app.loadApiJson(apiClone, "graph_load.json");
+        try {
+          reconcileGraphDynamicWidgets(app?.graph);
+        } catch {
+          // Post-load dynamic-widget cleanup must never break a graph load.
+        }
         if (typeof markWorkflowGraphProvenanceUnknown === "function") {
           markWorkflowGraphProvenanceUnknown(apiTargetWorkflow);
         }
@@ -16217,6 +16994,13 @@ const GRAPH_TOOL_EXECUTORS = {
         "graph_load target workflow changed while restore retry was settling; the retry was skipped",
       );
     }
+    // #1931 — a saved SaveVideo can restore both `format.codec` and a bare `codec`.
+    // Run after the configure retry so a late-built widget set is cleaned too.
+    try {
+      reconcileGraphDynamicWidgets(app?.graph);
+    } catch {
+      // Post-load dynamic-widget cleanup must never break a graph load.
+    }
     // #874 remaining load path — SubgraphNode.configure seeds host rails from
     // INNER definition widgets, so a saved subgraph host lands at defaults
     // (prompt, dimensions, length, selectors) while the file still holds the
@@ -16274,163 +17058,156 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
-    // -10/-20 or alias "input"/"output"/..), route to the boundary I/O logic
-    // instead of throwing "No node with id". Normal node-to-node connect below
-    // is unchanged.
+    // -10/-20 or alias "input"/"output"/..), route to the EXISTING-slot I/O
+    // logic instead of throwing "No node with id". A raw rail id with no
+    // matching slot REFUSES rather than auto-exposing (#1953) — that is
+    // panel_expose_subgraph_output / panel_expose_subgraph_input. Normal
+    // node-to-node connect below is unchanged.
     const fromRail = resolveRail(graph, from_node_id);
     const toRail = resolveRail(graph, to_node_id);
 
     if (toRail?.rail === "output") {
-      // internal node OUTPUT -> subgraph OUTPUT rail.
-      const node = resolveNode(graph, from_node_id);
-      const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
-      const outputSlot = node.outputs[outIdx];
+      // internal node OUTPUT -> existing subgraph OUTPUT rail slot.
       const existing = isEmptyRailSlotRef(to_input)
         ? null
         : findExistingRailSlot(graph.outputs, to_input);
-      if (existing && typeof existing.connect === "function") {
-        // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
-        // pre-dated this call can never be credited to it on the throw path below.
-        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
-        graph.beforeChange?.();
-        let link;
-        let railConnectErr = null;
-        try {
-          link = existing["connect"](outputSlot, node);
-        } catch (err) {
-          // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
-          // linkIds and the node output's links, and only THEN calls
-          // node.onConnectionsChange. So a throw carries no information about
-          // whether the wire exists. This is the issue's SECOND repro
-          // (to_node_id: -20): it threw, and panel_graph_outline then showed the
-          // link. Decide on the observed post-state instead of on the exception.
-          railConnectErr = err;
-        } finally {
-          graph.afterChange?.();
-        }
-        graph.setDirtyCanvas?.(true, true);
-        // #397 adopted at THIS call site — it had only ever been applied to the
-        // node-to-node branch, so this branch reported success on LiteGraph's
-        // truthy return alone. Ask the live graph on BOTH paths: with the link
-        // connect() returned when there is one, by scanning the rail slot for a
-        // NEW link when it threw instead.
-        const railLanded = railConnectErr
-          ? findLandedRailLink(graph, existing, node, outIdx, "output", railLinkIdsBefore)
-          : isRailLinkPersisted(graph, existing, node, outIdx, "output", link)
-            ? { linkId: String(link.id) }
-            : null;
-        if (!railLanded) {
-          if (railConnectErr) {
-            throw new Error(
-              `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
-                `output "${existing.name}" threw and NOTHING landed (#1272): ` +
-                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `this call left no new link from that output on the rail slot. Re-read with ` +
-                `panel_graph_outline ` +
-                `before retrying.`,
-            );
-          }
-          if (!link) {
-            throw new Error(
-              `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
-                `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
-            );
-          }
+      if (!(existing && typeof existing.connect === "function")) {
+        refuseConnectToRawRail(to_node_id, "output");
+      }
+      const node = resolveNode(graph, from_node_id);
+      const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
+      const outputSlot = node.outputs[outIdx];
+      // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
+      // pre-dated this call can never be credited to it on the throw path below.
+      const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
+      graph.beforeChange?.();
+      let link;
+      let railConnectErr = null;
+      try {
+        link = existing["connect"](outputSlot, node);
+      } catch (err) {
+        // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
+        // linkIds and the node output's links, and only THEN calls
+        // node.onConnectionsChange. So a throw carries no information about
+        // whether the wire exists. This is the issue's SECOND repro
+        // (to_node_id: -20): it threw, and panel_graph_outline then showed the
+        // link. Decide on the observed post-state instead of on the exception.
+        railConnectErr = err;
+      } finally {
+        graph.afterChange?.();
+      }
+      graph.setDirtyCanvas?.(true, true);
+      // #397 adopted at THIS call site — it had only ever been applied to the
+      // node-to-node branch, so this branch reported success on LiteGraph's
+      // truthy return alone. Ask the live graph on BOTH paths: with the link
+      // connect() returned when there is one, by scanning the rail slot for a
+      // NEW link when it threw instead.
+      const railLanded = railConnectErr
+        ? findLandedRailLink(graph, existing, node, outIdx, "output", railLinkIdsBefore)
+        : isRailLinkPersisted(graph, existing, node, outIdx, "output", link)
+          ? { linkId: String(link.id) }
+          : null;
+      if (!railLanded) {
+        if (railConnectErr) {
           throw new Error(
-            `panel_connect reported no persisted link: node ${node.id} output ` +
-              `"${outputSlot?.name ?? outIdx}" (${outputSlot?.type}) → subgraph output ` +
-              `"${existing.name}" (${existing.type}). LiteGraph accepted the connection but the rail ` +
-              `slot does not carry it, so refusing to report a false success (#397).`,
+            `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
+              `output "${existing.name}" threw and NOTHING landed (#1272): ` +
+              `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+              `this call left no new link from that output on the rail slot. Re-read with ` +
+              `panel_graph_outline ` +
+              `before retrying.`,
           );
         }
-        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-        return {
-          connected: {
-            from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
-            to: { subgraph_output: existing.name },
-          },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
-        };
+        if (!link) {
+          throw new Error(
+            `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
+              `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
+          );
+        }
+        throw new Error(
+          `panel_connect reported no persisted link: node ${node.id} output ` +
+            `"${outputSlot?.name ?? outIdx}" (${outputSlot?.type}) → subgraph output ` +
+            `"${existing.name}" (${existing.type}). LiteGraph accepted the connection but the rail ` +
+            `slot does not carry it, so refusing to report a false success (#397).`,
+        );
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
-        from_node_id,
-        from_output,
-        name: typeof to_input === "string" && !isEmptyRailSlotRef(to_input) ? to_input : undefined,
-      });
+      findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+      return {
+        connected: {
+          from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
+          to: { subgraph_output: existing.name },
+        },
+        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+      };
     }
 
     if (fromRail?.rail === "input") {
-      // subgraph INPUT rail -> internal node INPUT.
-      const node = resolveNode(graph, to_node_id);
-      const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
-      const inputSlot = node.inputs[inIdx];
+      // subgraph INPUT rail slot -> internal node INPUT.
       const existing = isEmptyRailSlotRef(from_output)
         ? null
         : findExistingRailSlot(graph.inputs, from_output);
-      if (existing && typeof existing.connect === "function") {
-        // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
-        // excluded so the throw path cannot credit this call with someone else's wire.
-        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
-        graph.beforeChange?.();
-        let link;
-        let railConnectErr = null;
-        try {
-          link = existing["connect"](inputSlot, node);
-        } catch (err) {
-          // #1272 — SubgraphInput.connect has the same ordering as its output
-          // twin: the link is written to subgraph._links / linkIds / slot.link
-          // before node.onConnectionsChange runs, so a throw does not mean the
-          // wire is absent.
-          railConnectErr = err;
-        } finally {
-          graph.afterChange?.();
-        }
-        graph.setDirtyCanvas?.(true, true);
-        // #397 adopted at THIS call site too (see the output rail above).
-        const railLanded = railConnectErr
-          ? findLandedRailLink(graph, existing, node, inIdx, "input", railLinkIdsBefore)
-          : isRailLinkPersisted(graph, existing, node, inIdx, "input", link)
-            ? { linkId: String(link.id) }
-            : null;
-        if (!railLanded) {
-          if (railConnectErr) {
-            throw new Error(
-              `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
-                `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
-                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `this call left no new link to that input on the rail slot. Re-read with ` +
-                `panel_graph_outline ` +
-                `before retrying.`,
-            );
-          }
-          if (!link) {
-            throw new Error(
-              `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
-                `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
-            );
-          }
+      if (!(existing && typeof existing.connect === "function")) {
+        refuseConnectToRawRail(from_node_id, "input");
+      }
+      const node = resolveNode(graph, to_node_id);
+      const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
+      const inputSlot = node.inputs[inIdx];
+      // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
+      // excluded so the throw path cannot credit this call with someone else's wire.
+      const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
+      graph.beforeChange?.();
+      let link;
+      let railConnectErr = null;
+      try {
+        link = existing["connect"](inputSlot, node);
+      } catch (err) {
+        // #1272 — SubgraphInput.connect has the same ordering as its output
+        // twin: the link is written to subgraph._links / linkIds / slot.link
+        // before node.onConnectionsChange runs, so a throw does not mean the
+        // wire is absent.
+        railConnectErr = err;
+      } finally {
+        graph.afterChange?.();
+      }
+      graph.setDirtyCanvas?.(true, true);
+      // #397 adopted at THIS call site too (see the output rail above).
+      const railLanded = railConnectErr
+        ? findLandedRailLink(graph, existing, node, inIdx, "input", railLinkIdsBefore)
+        : isRailLinkPersisted(graph, existing, node, inIdx, "input", link)
+          ? { linkId: String(link.id) }
+          : null;
+      if (!railLanded) {
+        if (railConnectErr) {
           throw new Error(
-            `panel_connect reported no persisted link: subgraph input "${existing.name}" ` +
-              `(${existing.type}) → node ${node.id} input "${inputSlot?.name ?? inIdx}" ` +
-              `(${inputSlot?.type}). LiteGraph accepted the connection but the rail slot does not ` +
-              `carry it, so refusing to report a false success (#397).`,
+            `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
+              `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
+              `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+              `this call left no new link to that input on the rail slot. Re-read with ` +
+              `panel_graph_outline ` +
+              `before retrying.`,
           );
         }
-        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-        return {
-          connected: {
-            from: { subgraph_input: existing.name },
-            to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
-          },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
-        };
+        if (!link) {
+          throw new Error(
+            `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
+              `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
+          );
+        }
+        throw new Error(
+          `panel_connect reported no persisted link: subgraph input "${existing.name}" ` +
+            `(${existing.type}) → node ${node.id} input "${inputSlot?.name ?? inIdx}" ` +
+            `(${inputSlot?.type}). LiteGraph accepted the connection but the rail slot does not ` +
+            `carry it, so refusing to report a false success (#397).`,
+        );
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
-        to_node_id,
-        to_input,
-        name:
-          typeof from_output === "string" && !isEmptyRailSlotRef(from_output) ? from_output : undefined,
-      });
+      findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+      return {
+        connected: {
+          from: { subgraph_input: existing.name },
+          to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
+        },
+        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+      };
     }
 
     if (fromRail?.rail === "output") {
@@ -16514,6 +17291,25 @@ const GRAPH_TOOL_EXECUTORS = {
     // time. Captured alongside the titles, for the same reason: the rename
     // happens on the throw path and the success path alike.
     const slotsBefore = captureSlotNames([origin, target]);
+    // #2008 — name→link identity on the TARGET, captured BEFORE Autogrow can
+    // rebuild. Dotted children (`ref_images.ref_image_4`) are addressed by
+    // name; an onConnectionsChange insert that shifts later families must not
+    // steal those names' links or report them as rewrites.
+    const namedSlotsBefore = captureNamedSlotLinks(target);
+    const requestedSlotName =
+      typeof to_input === "string" ? to_input : target.inputs?.[inIdx]?.name ?? null;
+    const inputNamesBefore = snapshotInputSlotNames(graph);
+    // #2380 — the whole-graph state, captured BEFORE the wire is made. Every other
+    // check on this path is scoped to the two endpoints the command NAMED, so a
+    // connect that displaced wiring on a THIRD node returned a clean payload and the
+    // caller only found out in a later panel_query_graph. graph_disconnect has
+    // snapshotted for exactly this since #668, where a disconnect on a SubgraphNode
+    // deleted two unrelated nodes while reporting plain success; connect never did.
+    const graphBefore = snapshotGraphState(graph);
+    // #2380 — the node-side view too. The link store and the node slots are independent:
+    // a hook can leave every record byte-identical while repointing a bystander's
+    // inputs[i].link, and execution follows the SLOT.
+    const inputLinksBefore = snapshotInputSlotLinks(graph);
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16535,14 +17331,42 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
+    // #2008 — re-read the target AFTER onConnectionsChange, then put unrelated
+    // named links back (and the intended dotted slot's new wire) so a later
+    // name-based edit still addresses the same logical slots. Runs on both
+    // verdict paths: the hook that rebuilds fires before we know whether
+    // connect() threw.
+    const landedForReconcile = connectErr
+      ? findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore)
+      : null;
+    const reconciled = reconcileDynamicPrefixSlots({
+      graph,
+      node: target,
+      before: namedSlotsBefore,
+      intendedName: requestedSlotName,
+      intendedLinkId: landedForReconcile?.linkId ?? link?.id ?? null,
+      replacedLinkId: prevLinkId
+    });
     // #1855 — read the endpoints' titles back the moment the mutation is over,
     // BEFORE the verdict branches: the hook that renames runs on the throw path
     // and the success path alike, so computing this per-branch would report it on
     // one and drop it on the other.
     const titleRewrites = describeTitleRewrites(titlesBefore);
     // #1873 — read back in the SAME place as the titles, before the verdict
-    // branches, so a re-addressed node is disclosed on both of them.
+    // branches, so a re-addressed node is disclosed on both of them. #2008
+    // has already restored unrelated names, so an Autogrow insert that only
+    // shifted indices is silent here.
     const slotRewrites = describeSlotRewrites(slotsBefore);
+    const liveIntendedIndex = () => {
+      if (Number.isInteger(reconciled?.intendedIndex) && reconciled.intendedIndex >= 0) {
+        return reconciled.intendedIndex;
+      }
+      if (isDynamicPrefixSlotName(requestedSlotName)) {
+        const byName = findSlotIndexByName(target, requestedSlotName);
+        if (byName >= 0) return byName;
+      }
+      return inIdx;
+    };
     if (connectErr) {
       const landed = findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore);
       if (!landed) {
@@ -16575,6 +17399,24 @@ const GRAPH_TOOL_EXECUTORS = {
         );
       }
       const landedSlot = target.inputs?.[landed.inputIndex];
+      // #2380 — the link that actually landed can carry a DIFFERENT id than the one
+      // connect() returned, because a dynamic-input pack may re-slot it. Both are
+      // named as intended so neither is mistaken for collateral.
+      const landedVerdict = verifyConnect(graph, graphBefore, {
+        intendedLinkIds: [link?.id, landed.linkId],
+        replacedLinkId: prevLinkId,
+        beforeSlots: inputLinksBefore,
+        // Both the requested slot and the one a dynamic pack re-slotted onto. Without
+        // naming them the intended-id exemption is global, and the same id landing on an
+        // untargeted input would be hidden (gate P1).
+        intendedSlots: new Set([
+          `${target.id}#${inIdx}`,
+          `${target.id}#${landed.inputIndex}`,
+          `${target.id}#${liveIntendedIndex()}`,
+        ]),
+        beforeNames: inputNamesBefore,
+      });
+      const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
       return {
         connected: {
           from: {
@@ -16606,6 +17448,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // most likely to have been left re-addressed, so this path needs the
         // disclosure at least as much as the clean one.
         ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
+        ...(landedCollateral.length ? { collateral_changes: landedCollateral } : {}),
         warning: [
           landedAfterThrowWarning(
             connectErr,
@@ -16617,6 +17460,7 @@ const GRAPH_TOOL_EXECUTORS = {
           ),
           titleRewriteWarning(titleRewrites),
           slotRewriteWarning(slotRewrites),
+          landedCollateral.length ? connectCollateralWarning(landedCollateral) : "",
         ]
           .filter(Boolean)
           .join(" "),
@@ -16629,11 +17473,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // ("No input on node N accepts type X") is a FALSE type mismatch: the
       // refusal says nothing about the slots' types. Keep the full slot listing
       // but override the tail with the actual restriction.
+      // #2028: the same false tail fires when BOTH selected ports are still
+      // unresolved wildcards (`*`): LiteGraph has no concrete type to bind, so
+      // connect() returns null even though the listing shows `*` inputs. Keep
+      // the refusal; say the ports are unbound and a typed producer must land
+      // first. Loopback wins when both apply — connect() never reached types.
+      const outType = origin.outputs?.[outIdx]?.type;
+      const inType = target.inputs?.[inIdx]?.type;
       throw new Error(
         slotDiagnostic(origin, target, {
           from_output,
           to_input,
-          ...(origin === target ? { reason: loopbackRefusalReason(origin, outIdx, inIdx) } : {}),
+          ...(origin === target
+            ? { reason: loopbackRefusalReason(origin, outIdx, inIdx) }
+            : isWildcardSlotType(outType) && isWildcardSlotType(inType)
+              ? { reason: unresolvedWildcardPairReason(origin, target, outIdx, inIdx) }
+              : {}),
         }),
       );
     }
@@ -16645,10 +17500,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // persisted wire (the exact ImpactSwitch bug; the same Reroute→select on a real
     // socket like LatentSwitch does persist). Verify the link actually landed on the
     // live graph; if not, clean up the phantom and FAIL HONESTLY.
-    if (!isLinkPersisted(graph, target, inIdx, link)) {
+    let persistIdx = inIdx;
+    if (!isLinkPersisted(graph, target, persistIdx, link)) {
+      const byName = liveIntendedIndex();
+      if (byName !== persistIdx && isLinkPersisted(graph, target, byName, link)) {
+        persistIdx = byName;
+      }
+    }
+    if (!isLinkPersisted(graph, target, persistIdx, link)) {
       // Clean up ONLY the dangling remnant of THIS attempt — never a link a dynamic
       // node re-slotted to another input (removePhantomLink guards that internally).
-      removePhantomLink(graph, target, inIdx, link);
+      removePhantomLink(graph, target, persistIdx, link);
       graph.setDirtyCanvas(true, true);
       const inputSlot = target.inputs?.[inIdx];
       const widgetHint = isWidgetBackedInput(inputSlot)
@@ -16664,6 +17526,18 @@ const GRAPH_TOOL_EXECUTORS = {
           widgetHint,
       );
     }
+    // #2380 — the REPORTED case: a connect that fully succeeded on both endpoints it
+    // named, while an untargeted node was left re-wired. Disclose, never refuse — the
+    // mutation has already happened, and refusing after the fact is what invites the
+    // destructive retry #1272 exists to prevent.
+    const verdict = verifyConnect(graph, graphBefore, {
+      intendedLinkIds: [link?.id],
+      replacedLinkId: prevLinkId,
+      beforeSlots: inputLinksBefore,
+      intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${persistIdx}`, `${target.id}#${liveIntendedIndex()}`]),
+      beforeNames: inputNamesBefore,
+    });
+    const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
     return {
       connected: {
         from: {
@@ -16673,8 +17547,8 @@ const GRAPH_TOOL_EXECUTORS = {
         },
         to: {
           node_id: target.id,
-          input: target.inputs?.[inIdx]?.name ?? inIdx,
-          input_index: inIdx,
+          input: target.inputs?.[persistIdx]?.name ?? persistIdx,
+          input_index: persistIdx,
         },
         type: origin.outputs?.[outIdx]?.type,
         ...(autoMatched.length ? { auto_matched: autoMatched } : {}),
@@ -16690,11 +17564,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // behaviour of every dynamic-input node and is never reported, so an
       // ordinary connect's payload stays byte-identical to before.
       ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
-      // Both riders share the single `warning` key, so neither can drop the
-      // other's sentence when one connect does both at once.
-      ...(titleRewrites.length || slotRewrites.length
+      // #2380 — what moved on nodes this command never named. A third rider on the
+      // same key, for the same reason the first two share it.
+      ...(collateral.length ? { collateral_changes: collateral } : {}),
+      // All three riders share the single `warning` key, so none can drop the
+      // others' sentence when one connect does more than one at once.
+      ...(titleRewrites.length || slotRewrites.length || collateral.length
         ? {
-            warning: [titleRewriteWarning(titleRewrites), slotRewriteWarning(slotRewrites)]
+            warning: [
+              collateral.length ? connectCollateralWarning(collateral) : "",
+              titleRewriteWarning(titleRewrites),
+              slotRewriteWarning(slotRewrites),
+            ]
               .filter(Boolean)
               .join(" "),
           }
@@ -16977,7 +17858,28 @@ const GRAPH_TOOL_EXECUTORS = {
     // positional arguments.
     const expected_scope =
       arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_scope : undefined;
-    const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
+    const expected_node_identity =
+      arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_node_identity : undefined;
+    const { defer_until_idle, expected_value, defer_replay, clear } = arguments[0] ?? {};
+    if (clear !== undefined && clear !== true && clear !== false) {
+      throw new Error("graph_set_widget clear must be a boolean");
+    }
+    if (clear === true) {
+      if (value !== undefined && value !== null && value !== "") {
+        throw new Error("graph_set_widget cannot combine clear:true with a non-empty value");
+      }
+      value = "";
+    }
+    if (
+      expected_node_identity !== undefined &&
+      (typeof expected_node_identity !== "string" ||
+        expected_node_identity.length === 0 ||
+        expected_node_identity.length > 256)
+    ) {
+      throw new Error(
+        "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
+      );
+    }
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
     // exists for is the stale-combo recovery's refresh join below: reached only after
@@ -16985,10 +17887,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // unbounded until now.
     const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
+    // Capture the receiver scope before the authorization awaits. The bridge adds a
+    // viewing witness after the executor returns; re-reading the live canvas there can
+    // describe a subgraph the command never targeted if navigation/rebinding happens
+    // during the write. A mutation reply must identify the graph captured at dispatch,
+    // which is also the graph used to resolve `node` and to install the write hooks.
+    const commandViewing =
+      typeof describeActiveGraph === "function" ? describeActiveGraph(graph) : null;
     const node = resolveNode(graph, node_id);
-    // #1679 — keep derived MiniMax prompt writes refused before the first
-    // await, including when a caller asks for deferral. Deferral must never
-    // become a side door around an existing production safety refusal.
+    // #1679 / #1935 — keep derived MiniMax prompt / builder_state / timeline_data
+    // writes refused before the first await, including when a caller asks for
+    // deferral. Deferral must never become a side door around an existing
+    // production safety refusal. A successful timeline_data write is the #1935
+    // silent-stale: query_graph shows the new JSON while prompt stays old.
     if (classifyMiniMaxH3DirectorWrite(node, widget) === "derived") {
       throw new Error(miniMaxH3DirectorPromptRefusal(widget, node.id));
     }
@@ -17039,8 +17950,10 @@ const GRAPH_TOOL_EXECUTORS = {
           builder_state,
           expected_node_type: node.type,
           expected_scope,
+          ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
           expected_value,
           defer_replay: true,
+          ...(clear !== undefined ? { clear } : {}),
         });
       }
       const deferredGraph = graph;
@@ -17081,8 +17994,10 @@ const GRAPH_TOOL_EXECUTORS = {
             builder_state,
             expected_node_type: deferredNode.type,
             expected_scope,
+            ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
             expected_value,
             defer_replay: true,
+            ...(clear !== undefined ? { clear } : {}),
           }),
       });
     }
@@ -17132,6 +18047,114 @@ const GRAPH_TOOL_EXECUTORS = {
     // refresh and an upload probe between reading the schema and deciding, and a
     // classification computed before those awaits can be superseded during them.
     let setWidgetSchemaProvenance = () => "none";
+    // Every graph_set_widget mutation, including the custom editor routes below, must
+    // cross the same final synchronous boundary. Keep this callback in the handler scope
+    // so custom writers can invoke it after their undo envelope opens but immediately
+    // before their first graph/editor mutation. Optional witnesses remain optional for
+    // legacy callers; when present, all validation is fail-closed and identity is compared
+    // against the live object rather than a serialized node field.
+    const assertGraphSetWidgetTargetStillCurrent = () => {
+      assertActiveWorkflowCommandTarget({
+        cmd: "graph_set_widget",
+        [WORKFLOW_UUID_FIELD]: workflow_uuid,
+      });
+      if (
+        expected_scope === undefined &&
+        expected_node_type === undefined &&
+        expected_node_identity === undefined &&
+        !enforceDeferredExpected
+      ) return;
+      const current = getGraphCtx();
+      assertExpectedPromotedScope(current, expected_scope, () => {
+        let terminalNode = node;
+        let terminalWidget = node?.widgets?.find((candidate) => candidate?.name === widget) ?? null;
+        let depth = 0;
+        if (node?.subgraph) {
+          const resolved = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
+          if (!resolved?.promoted || !resolved.target) return null;
+          const reached = followPromotionToConcrete(resolved.target, sourceForSubgraphInput);
+          if (
+            !reached?.node ||
+            !reached.widget ||
+            reached.cycle ||
+            reached.error ||
+            reached.terminalVirtual ||
+            reached.node.subgraph
+          ) {
+            return null;
+          }
+          terminalNode = reached.node;
+          terminalWidget = reached.widget;
+          depth = reached.depth;
+        }
+        const inputs = terminalPromotionShape(terminalNode);
+        if (
+          !terminalNode ||
+          !terminalWidget ||
+          !inputs ||
+          (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
+          typeof terminalNode.type !== "string" ||
+          typeof terminalWidget.name !== "string"
+        ) {
+          return null;
+        }
+        return {
+          node_id: terminalNode.id,
+          type: terminalNode.type,
+          widget: terminalWidget.name,
+          inputs,
+          depth,
+        };
+      });
+      const liveTarget = resolveNode(current.graph, node_id);
+      if (
+        expected_node_type !== undefined &&
+        (typeof expected_node_type !== "string" || !expected_node_type)
+      ) {
+        throw new Error("graph_set_widget expected_node_type must be a non-empty string");
+      }
+      if (
+        expected_node_type !== undefined &&
+        (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type)
+      ) {
+        throw new Error(
+          `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
+            `found ${liveTarget?.type ?? "missing"}`,
+        );
+      }
+      if (
+        expected_node_identity !== undefined &&
+        (typeof expected_node_identity !== "string" ||
+          expected_node_identity.length === 0 ||
+          expected_node_identity.length > 256)
+      ) {
+        throw new Error(
+          "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
+        );
+      }
+      const liveIdentity =
+        expected_node_identity !== undefined ? nodeInstanceIdentity(liveTarget) : null;
+      if (expected_node_identity !== undefined && liveIdentity !== expected_node_identity) {
+        throw new Error(
+          `panel_set_widget target identity changed before dispatch: expected ${expected_node_identity}, ` +
+            `found ${liveIdentity ?? "missing"}`,
+        );
+      }
+      if (enforceDeferredExpected) {
+        const liveWidget = liveTarget?.widgets?.find((candidate) => candidate?.name === widget);
+        if (
+          !liveTarget ||
+          liveTarget !== node ||
+          !liveWidget ||
+          !sameDeferredWidgetValue(liveWidget.value, expected_value)
+        ) {
+          throw new Error(
+            `panel_set_widget deferred replay refused "${widget}" on node ${node_id}: ` +
+              "the widget changed before the write boundary; nothing was applied",
+          );
+        }
+      }
+    };
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -17151,6 +18174,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #506: the ComfyUI-PromptRelay "PromptRelayEncodeTimeline" node has the same shape of
@@ -17170,6 +18194,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #983: rgthree's Fast Groups Muter toggle rows are DERIVED READOUTS of whether the matched
@@ -17194,6 +18219,7 @@ const GRAPH_TOOL_EXECUTORS = {
           beforeChange: () => graph.beforeChange(),
           afterChange: () => graph.afterChange(),
           setDirty: () => graph.setDirtyCanvas(true, true),
+          assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
         });
       }
       throw new Error(ideogram4PromptBuilderRefusal(widget, node.id));
@@ -17209,6 +18235,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
@@ -17275,6 +18302,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // past the end of a very long argument.
     const setWidgetOpts = {
       registry: LG?.registered_node_types ?? {},
+      ...(clear !== undefined ? { clear } : {}),
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
       // the stale LiteGraph registry, which keeps a positive for an uninstalled pack
@@ -17387,6 +18415,7 @@ const GRAPH_TOOL_EXECUTORS = {
                   ? OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS
                   : OBJECT_INFO_DEADLINE_MS,
               ),
+              skipHttpAfterClientNoAnswer: true,
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -17531,10 +18560,9 @@ const GRAPH_TOOL_EXECUTORS = {
       //      class unanswered; the exact type-scoped route may establish it. An
       //      answered-unusable or thrown route remains refused, and an unwired or
       //      never-attempted oracle licenses nothing.
-      //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
-      //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
-      //      oracle deadline), so this takes `budget.bounded` like every other step and
-      //      cannot push the reply past the bridge's own timeout.
+      //   2. WHAT THE COMMAND HAS LEFT. The timed-out client request cannot be cancelled and
+      //      still owns ComfyUI's request lane, so this narrow check needs the full remainder
+      //      instead of another fixed cap.
       //
       // NEVER recorded into the #1223 snapshot — object-info-snapshot.js requires an explicit
       // `whole: true` claim precisely so a per-class payload cannot make every OTHER type read
@@ -17559,7 +18587,7 @@ const GRAPH_TOOL_EXECUTORS = {
         const scopedGeneration = verifiedNodeDefCache.generation();
         const scoped = await fetchTypeScopedObjectInfo(types, {
           fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
-          deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
+          deadlineMs: budget.remaining(),
         });
         // The per-class route is authoritative only for the backend connection that
         // answered it. A reconnect, schema invalidation, or a down socket during this await
@@ -17659,89 +18687,9 @@ const GRAPH_TOOL_EXECUTORS = {
           },
         };
       },
-      // #718: the first command-handler fence ran before awaitObjectInfoHistorySeed()
-      // and the fresh /object_info request. A user can switch workflows while either
-      // promise is pending, so re-read the ACTIVE uuid at the exact shared write
-      // boundary. runSetWidget calls this synchronously before every write path.
-      assertTargetStillCurrent: () => {
-        assertActiveWorkflowCommandTarget({
-          cmd: "graph_set_widget",
-          [WORKFLOW_UUID_FIELD]: workflow_uuid,
-        });
-        if (expected_scope === undefined && expected_node_type === undefined && !enforceDeferredExpected) return;
-        const current = getGraphCtx();
-        assertExpectedPromotedScope(current, expected_scope, () => {
-          let terminalNode = node;
-          let terminalWidget = node?.widgets?.find((candidate) => candidate?.name === widget) ?? null;
-          let depth = 0;
-          if (node?.subgraph) {
-            const resolved = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
-            if (!resolved?.promoted || !resolved.target) return null;
-            const reached = followPromotionToConcrete(resolved.target, sourceForSubgraphInput);
-            if (
-              !reached?.node ||
-              !reached.widget ||
-              reached.cycle ||
-              reached.error ||
-              reached.terminalVirtual ||
-              reached.node.subgraph
-            ) {
-              return null;
-            }
-            terminalNode = reached.node;
-            terminalWidget = reached.widget;
-            depth = reached.depth;
-          }
-          const inputs = terminalPromotionShape(terminalNode);
-          if (
-            !terminalNode ||
-            !terminalWidget ||
-            !inputs ||
-            (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
-            typeof terminalNode.type !== "string" ||
-            typeof terminalWidget.name !== "string"
-          ) {
-            return null;
-          }
-          return {
-            node_id: terminalNode.id,
-            type: terminalNode.type,
-            widget: terminalWidget.name,
-            inputs,
-            depth,
-          };
-        });
-        const liveTarget = resolveNode(current.graph, node_id);
-        if (
-          expected_node_type !== undefined &&
-          (typeof expected_node_type !== "string" || !expected_node_type)
-        ) {
-          throw new Error("graph_set_widget expected_node_type must be a non-empty string");
-        }
-        if (
-          expected_node_type !== undefined &&
-          (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type)
-        ) {
-          throw new Error(
-            `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
-              `found ${liveTarget?.type ?? "missing"}`,
-          );
-        }
-        if (enforceDeferredExpected) {
-          const liveWidget = liveTarget?.widgets?.find((candidate) => candidate?.name === widget);
-          if (
-            !liveTarget ||
-            liveTarget !== node ||
-            !liveWidget ||
-            !sameDeferredWidgetValue(liveWidget.value, expected_value)
-          ) {
-            throw new Error(
-              `panel_set_widget deferred replay refused "${widget}" on node ${node_id}: ` +
-                "the widget changed before the write boundary; nothing was applied",
-            );
-          }
-        }
-      },
+      // #718/#2478: the handler's one final workflow/scope/type/identity fence. Custom
+      // editor routes use the same callback at their own synchronous mutation boundary.
+      assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       // Stale-combo retry: reuse the /object_info already fetched for authorization
       // (passed by runSetWidget) to refresh THIS target's combo option lists in place
       // — a single fetch total (#458 P2). When a payload IS present we NEVER re-fetch,
@@ -17838,6 +18786,23 @@ const GRAPH_TOOL_EXECUTORS = {
           return false;
         }
       },
+      // #2025 — the remaining command budget bounds the write+ack. On timeout after
+      // delivery, awaitSetWidgetAck readbacks the live widget instead of hanging
+      // until the 90s relay reports outcome-unknown.
+      timeoutMs: budget.bounded(),
+      // #2109 — locating the enclosing SubgraphNode when this call addressed the
+      // inner promoted terminal (the subgraph is the current view).
+      rootGraph,
+      // #2116 — if the write lands after this bound, persist the receipt so
+      // retry_of can resolve the outcome without a duplicate mutation.
+      onLateSuccess: (result) => {
+        const requestId = arguments[0] && typeof arguments[0] === "object" ? arguments[0].rid : undefined;
+        if (typeof requestId !== "string" || !requestId) return;
+        lateMutationReceipts.remember(requestId, result, {
+          cmd: "graph_set_widget",
+          fingerprint: commandFingerprint(arguments[0]),
+        });
+      },
     };
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
@@ -17884,10 +18849,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // widget and the panel also GREW the node, which is a structural change to the graph;
     // reporting only the value write would hide it. Its own field, for the same reason the
     // #1223 provenance note has one: `warning` is single-slot and priority-ordered.
-    const withCreation = (r) =>
-      createdLoraRow !== null && r && typeof r === "object"
-        ? { ...r, created_widget: createdLoraRow }
-        : r;
+    const withCreation = (r) => {
+      const withViewing =
+        commandViewing && r && typeof r === "object" && !Array.isArray(r)
+          ? { ...r, viewing: commandViewing }
+          : r;
+      return createdLoraRow !== null && withViewing && typeof withViewing === "object"
+        ? { ...withViewing, created_widget: createdLoraRow }
+        : withViewing;
+    };
     if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
       return withCreation({ ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) });
     }
@@ -18435,7 +19405,9 @@ const GRAPH_TOOL_EXECUTORS = {
   // (unless dry_run) applies every position write in ONE beforeChange/afterChange
   // pair so a single Ctrl+Z restores the prior arrangement. Groups are re-fit
   // (preserve), moved rigidly (cluster), or left alone (ignore). Pinned nodes are
-  // never moved; the subgraph boundary rails (-10/-20) are excluded.
+  // never moved and are excluded from group re-fit so a skipped outlier cannot
+  // stretch the box over unrelated nodes. The subgraph boundary rails (-10/-20)
+  // are excluded.
   graph_auto_layout({
     node_ids,
     mode = "flow_horizontal",
@@ -18567,26 +19539,42 @@ const GRAPH_TOOL_EXECUTORS = {
     const predictGroupBounds = (memberIds) => {
       const members = memberIds
         .map((id) => nodeById.get(id))
-        .filter(Boolean)
-        .map((n) => {
-          const p = layout.positions.get(n.id);
-          return {
-            pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
-            size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
-          };
-        });
-      return boundsAroundNodes(members);
+        .filter(Boolean);
+      // Pinned members are skipped by layout; including them in the re-fit
+      // stretches the box across the skipped outlier and any nodes that box
+      // now geometrically swallows (#1957). If every member is pinned, nothing
+      // moved, so keep the existing membership footprint.
+      const movable = members.filter((n) => !(n.flags && n.flags.pinned));
+      const fit = (movable.length ? movable : members).map((n) => {
+        const p = layout.positions.get(n.id);
+        return {
+          pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
+          size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
+        };
+      });
+      return boundsAroundNodes(fit);
     };
     const groupResults =
       groups === "ignore"
         ? []
         : groupBoxes
             .filter((gb) => gb.memberIds.length)
-            .map((gb) => ({
-              group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
-              title: gb.g.title ?? "",
-              bounds: predictGroupBounds(gb.memberIds).map(Math.round),
-            }));
+            .map((gb) => {
+              const pinnedIds = gb.memberIds.filter((id) => {
+                const n = nodeById.get(id);
+                return n && n.flags && n.flags.pinned;
+              });
+              // Disclose only when the re-fit actually dropped a pinned member
+              // (a mixed group). An all-pinned group is a no-op footprint.
+              const excludedPinned =
+                pinnedIds.length && pinnedIds.length < gb.memberIds.length ? pinnedIds : [];
+              return {
+                group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
+                title: gb.g.title ?? "",
+                bounds: predictGroupBounds(gb.memberIds).map(Math.round),
+                ...(excludedPinned.length ? { re_fit_excluded_pinned: excludedPinned } : {}),
+              };
+            });
 
     if (dry_run) {
       return {
@@ -18904,6 +19892,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // pre-flight is itself graphToPrompt and must not be the one serialization that
     // can still hit a null widget or establish a reservation before the guard exists.
     installGraphToPromptNullSafety(app);
+    // #1931 — SaveVideo can grow a bare `codec` next to `format.codec` after add/load
+    // (set_widget, restore, restart). Clean it on the serializer itself so preflight
+    // and the deferred queue-loop serialize see the same nested set. Installed before
+    // the snapshot barrier so a cancelled queue item still throws synchronously.
+    installGraphToPromptDynamicReconcile(app);
     installGraphToPromptSnapshotBarrier(app);
     try {
       // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
@@ -19239,7 +20232,7 @@ const GRAPH_TOOL_EXECUTORS = {
         const queued = await withTimeout(
           Promise.resolve(
             queuePromptWithGraphToPromptSnapshot(app, promptSnapshotReservation, () =>
-              app.queuePrompt(0, batch, undefined),
+              invokeQueuePromptWithBrowserStack(app, 0, batch, undefined),
             ),
           ).then(
             (value) => ({ value }),
@@ -19554,7 +20547,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // dropped outputs, not a refusal of the whole prompt.
       acceptedPromptIds: queuedPromptIds,
     });
-    if (rejection) return rejection;
+    // #1995 — a minted prompt id is a queue receipt. Never rewrite that as a
+    // user-rejected tool result; a lost ack without an id is unknown, not refused.
+    if (rejection) return honestRunAck(rejection);
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.
@@ -19794,7 +20789,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* a diagnostic must never take down the run it describes */
     }
-    return accept;
+    return honestRunAck(accept);
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
@@ -20424,6 +21419,23 @@ const GRAPH_TOOL_EXECUTORS = {
   // Uses ComfyUI's workflow service. "New workflow" opens a NEW TAB and never
   // touches the current graph (graph_clear is ONLY for clearing the open one).
   async workflow_list() {
+    // #2030 — panel_set_workflow_target({mode:"current"}) uses this read to
+    // recover canvas identity after a ComfyUI restart. If the backend is up but
+    // this tab's command channel is still the pre-restart mapping, force a safe
+    // re-hello of THIS tab first. That does not reload or reopen the workflow,
+    // so unsaved in-memory edits stay on the canvas.
+    await ensureWorkflowTabChannel({
+      serverReady: () => !comfyBackendIsDown(),
+      bridgeConnected: () => liveBridgeClient?.isConnected?.() === true,
+      channelReady: () => tabChannelReadyEpoch === backendReconnectEpoch,
+      reregister: () =>
+        comfyRestartReadvertise.attempt({
+          outageSeq: comfyBackendOutage.seq() || backendReconnectEpoch,
+          reconnectEpoch: backendReconnectEpoch,
+          isCurrent: () => true,
+          send: () => liveBridgeClient?.rehello?.(),
+        }),
+    });
     // #1785 — panel_set_workflow_target({mode:"current"}) uses this read to
     // recover the live tab after a ComfyUI restart. A command can reach the
     // panel before the backend reconnect, node-definition refresh, and restored
@@ -20539,6 +21551,7 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       : null;
     const lateSaveReceipts = lateWorkflowSaveReceipts();
+    const lateMutationReceiptsList = lateMutationReceiptList();
     return {
       active: active
         ? {
@@ -20595,6 +21608,10 @@ const GRAPH_TOOL_EXECUTORS = {
       // orchestrator uses absence to recognize an older panel and presence to
       // fail closed when a current panel has no receipt for this save RID.
       late_save_receipts: lateSaveReceipts,
+      // #2116 — exact command-rid receipts for graph_set_widget writes that
+      // applied after the bounded acknowledgement. Always advertised, including
+      // an empty list, so the orchestrator can fail closed on a current panel.
+      late_mutation_receipts: lateMutationReceiptsList,
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
@@ -20980,6 +21997,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const activePointerHistory = [];
     let activePointerWatchStop = null;
     let activePointerWatchAvailable = false;
+    // #1911 — set the moment the watch cannot be installed, so a success reply
+    // cannot silently omit the missing-capability notice even if the later
+    // capture gate is skipped (loaded-from-disk, rebindFailed, …).
+    let pointerWatchUnavailable = false;
     const observeActivePointer = () => {
       let current;
       try {
@@ -21018,18 +22039,21 @@ const GRAPH_TOOL_EXECUTORS = {
       // The workflow service is a Pinia store, but it is also the strict
       // frontend-contract surface. Reach Pinia through the panel's supported
       // store lookup so `$subscribe` is not mistaken for a workflow-service
-      // member by the contract scanner.
-      const workflowPiniaStore = getPiniaStore("workflow");
-      if (typeof workflowPiniaStore?.$subscribe === "function") {
-        const stop = workflowPiniaStore.$subscribe(observeActivePointer, { detached: true, flush: "sync" });
-        if (typeof stop === "function") {
-          activePointerWatchStop = stop;
-          activePointerWatchAvailable = true;
-        }
+      // member by the contract scanner. If that lookup misses, the helper
+      // tries the service object itself (it IS the store) without the scanner
+      // seeing `s.$subscribe` (#1911).
+      const installed = installActivePointerWatch(observeActivePointer, [
+        getPiniaStore("workflow"),
+        s,
+      ]);
+      if (installed.available) {
+        activePointerWatchStop = installed.stop;
+        activePointerWatchAvailable = true;
       }
     } catch {
       // Older workflow stores may not expose a usable synchronous subscription.
     }
+    if (!activePointerWatchAvailable) pointerWatchUnavailable = true;
     // The outer try/finally below covers failed lookup, refresh, probe, handshake,
     // lock acquisition, and every later return. The watch must never outlive this open.
     let activePointerEpochAtOpen = null;
@@ -21178,10 +22202,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // no fence — so the orchestrator answers "FENCE: NOT cleared (active identity
     // UNCONFIRMED after reconnect handshake)". A retry a moment later succeeds
     // without changing the workflow. Wait here, BEFORE the freeze and the load,
-    // so the first open is the one that succeeds. If the handshake never lands
-    // the open still proceeds: it is the #646 recovery for a restore that never
-    // settles. Bounded (~2.9s); a healthy already-settled tab returns immediately.
-    await waitForReconnectHandshakeBeforeOpen({
+    // so the first open is the one that succeeds. Bounded (~2.9s); a healthy
+    // already-settled tab returns immediately.
+    //
+    // #1914 — if that bounded wait still times out, REFUSE. Proceeding is the
+    // timeout-after-delivered-open: the command was already handed to the tab,
+    // freeze/load never replies, and the orchestrator reports undetermined with
+    // no rid-correlated receipt. `applied: false` is true because this throw is
+    // still before freeze/load. After the settle window closes, `needsWait` is
+    // false, the waiter returns "ready", and the open proceeds as the #646
+    // recovery for a restore that never settles.
+    const readiness = await waitForReconnectHandshakeBeforeOpen({
       needsWait: () =>
         comfyBackendIsDown() ||
         postReconnectBindingSettleWindow() ||
@@ -21199,6 +22230,14 @@ const GRAPH_TOOL_EXECUTORS = {
         return true;
       },
     });
+    if (readiness === "timeout") {
+      const reason = comfyBackendIsDown()
+        ? "the backend socket is still reconnecting"
+        : nodeDefRefreshInFlight != null
+          ? "the post-reconnect node-definition refresh is still running"
+          : "the restored canvas binding is not yet proven";
+      throw failOpen(workflowOpenReadinessRefusalError(reason));
+    }
     } catch (err) {
       // The reload guard below owns the normal-operation cleanup. Before it is
       // acquired, however, lookup/probe/handshake failures still have to retire
@@ -21601,28 +22640,152 @@ const GRAPH_TOOL_EXECUTORS = {
           } catch {
             activeIdentityAtCapture = false;
           }
-          const activePointerProof =
-            activePointerWatchAvailable &&
+          // Pointer-stability proof WITHOUT the watch-available conjunct. #1911:
+          // folding "no watcher" into this flag made a missing `$subscribe` look
+          // like "the watcher saw a move" and skipped capture with no other branch.
+          const pointerProof =
             activePointerOpenTransitionProven &&
             activePointerEpochAtOpen !== null &&
             activePointerEpoch === activePointerEpochAtOpen &&
             activeIdentityAtCapture;
+          // A TARGET UUID on the root is not independent proof after a pointer move:
+          // the outgoing SOURCE can retain a stale/shared stamp while the source
+          // classifier correctly answers "foreign". In that shape, capturing would
+          // serialize SOURCE into TARGET. Keep the proven-bound recurrence, and admit
+          // the already-repainted TARGET only when its complete state matches the
+          // target tracker; an unproven or drifted root fails closed.
+          const sourceBinding = pointerMovedThisOpen
+            ? describeLiveCanvasBinding(activeBefore)
+            : "bound";
+          let targetContentProof = false;
+          if (pointerMovedThisOpen && sourceBinding === "foreign") {
+            try {
+              targetContentProof =
+                graphRootMatchesState({
+                  rootGraph: app?.graph,
+                  state: target?.changeTracker?.activeState ?? target?.activeState,
+                }) === true;
+            } catch {
+              targetContentProof = false;
+            }
+          }
+          // An untagged root is legitimately "unknown" on an already-current tab:
+          // the pointer proof says the canvas was not borrowed from another tab, so
+          // retain the #874 live-canvas capture for node-written values. After a tab
+          // switch, however, unknown remains insufficient; only a positive target
+          // binding plus independent source/target proof may authorize the write.
+          const targetBindingProof =
+            captureBinding === "bound"
+              ? true
+              : captureBinding === "unknown" && !pointerMovedThisOpen && pointerProof;
           const captureSourceProof =
-            captureBinding === "bound" || (captureBinding !== "foreign" && !pointerMovedThisOpen);
+            targetBindingProof &&
+            (!pointerMovedThisOpen || sourceBinding === "bound" || targetContentProof);
+          // #1575 — a state THIS command just read off disk is authoritative, and the
+          // canvas mounted behind it is whatever the closed tab left there. Serializing
+          // that over the fresh state is the #1215/#968 poisoning through a new entry
+          // point, and it can preserve nothing: nothing has run against a just-loaded
+          // tracker, so it holds no node-written values (#874) for the capture to save.
+          // A moved active pointer is the same uncertainty even when the stale root
+          // carries this target's UUID: that tag is not independent canvas proof. Use
+          // the target tracker's own state after a tab switch and fail closed on the
+          // unproven capture rather than turning the previous canvas into this tab's
+          // state (#1639).
+          //
+          // #1911 — `$subscribe` absence is not that unproven capture; it is no
+          // information. The helper either uses the pre-watch already-current proof
+          // or skips a switch capture and DISCLOSES. Silent skip is the remaining
+          // #1215 path (SOURCE widget values surviving onto TARGET).
+          // #1215 (2026-08-27 recurrence) — DISTINCT from #1911. The Pinia watch
+          // proves the POINTER moved; it does not prove the canvas swapped. A stale
+          // or shared root UUID still answers "bound" while app.graph is the outgoing
+          // tab, and checkState() then serializes that previous canvas into TARGET.
+          // Related workflows (same node ids/types, different widgets) are the shape
+          // that then publishes TARGET's fence over SOURCE's values.
+          // The source probe accepts proven/presentationOnly, plus the narrower
+          // additive-node containment case below: an uncaptured SOURCE edit can
+          // otherwise make the exact proof false while the root is still SOURCE.
+          // normalizedOnly would treat related graphs as a match, which is the
+          // silent serve this closes. This probe must run BEFORE
+          // decideLiveCanvasCapture: the production classifier correctly reports
+          // TARGET as foreign while the mounted root is SOURCE, so captureSourceProof
+          // cannot be the only route by which this fact reaches the decision.
+          const sourceStateForSwitch = pointerMovedThisOpen
+            ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
+            : null;
+          const liveCanvasStillSource = (rootGraph) => {
+            if (!pointerMovedThisOpen) return false;
+            if (!sourceStateForSwitch || !Array.isArray(sourceStateForSwitch.nodes)) return false;
+            try {
+              // Call through an alias so the presentation restore stays ahead of
+              // the content-proof call site (#1618).
+              const reproducesOutgoing = graphRootReproducesStateContent;
+              const proof = reproducesOutgoing({
+                rootGraph,
+                state: sourceStateForSwitch,
+              });
+              if (proof?.proven === true || proof?.presentationOnly === true) return true;
+              // A user edit can make SOURCE's live graph differ from its last
+              // ChangeTracker capture without making it cease to be SOURCE. In
+              // particular, an added node makes the exact proof above false; the
+              // old #1951 gate then allowed checkState() to copy that still-mounted
+              // graph into TARGET. Only take this fallback for the reported
+              // additive-node shape. Without that positive count increase,
+              // structural containment also matches a correctly-mounted TARGET
+              // whose widget values differ, and would regress #1639's proven-bound
+              // capture. A count-short graph is deliberately not a source proof
+              // because it could already have been rebuilt for TARGET.
+              // Containment is content evidence, not ownership evidence. Resolve both
+              // live workflow objects without consulting the mounted root, then require
+              // the production classifier to prove that the root belongs to SOURCE.
+              // The identities must also differ: a duplicate tab with a copied UUID is
+              // not an independent source proof, even if both objects are exposed.
+              const sourceWorkflowUuid = workflowObjectUuid(activeBefore) || workflowStableUuid(activeBefore, {
+                embed: false,
+                commit: false,
+              });
+              const targetWorkflowUuid = workflowObjectUuid(target) || workflowStableUuid(target, {
+                embed: false,
+                commit: false,
+              });
+              if (
+                typeof sourceWorkflowUuid !== "string" ||
+                !sourceWorkflowUuid ||
+                typeof targetWorkflowUuid !== "string" ||
+                !targetWorkflowUuid ||
+                sourceWorkflowUuid === targetWorkflowUuid ||
+                describeLiveCanvasBinding(activeBefore) !== "bound"
+              ) {
+                return false;
+              }
+              const liveNodes = rootGraph?._nodes;
+              const sourceNodeCount = Array.from(sourceStateForSwitch.nodes).length;
+              const liveNodeCount = Array.isArray(liveNodes) ? Array.from(liveNodes).length : 0;
+              if (sourceNodeCount === 0 || liveNodeCount <= sourceNodeCount) {
+                return false;
+              }
+              const sourceStructureContainsLive = graphRootStructureExtendsActiveWorkflow({
+                rootGraph,
+                activeWorkflow: activeBefore,
+              });
+              return sourceStructureContainsLive === true;
+            } catch {
+              return false;
+            }
+          };
+          const sourceCanvasStillMounted = liveCanvasStillSource(app?.graph);
+          const captureDecision = decideLiveCanvasCapture({
+            watchAvailable: activePointerWatchAvailable,
+            openLoaded: openSettled?.loaded === true,
+            captureSourceProof,
+            pointerProof,
+            pointerMovedThisOpen,
+            sourceCanvasStillMounted,
+          });
+          if (captureDecision.disclose) pointerWatchUnavailable = true;
           if (
-            // #1575 — a state THIS command just read off disk is authoritative, and the
-            // canvas mounted behind it is whatever the closed tab left there. Serializing
-            // that over the fresh state is the #1215/#968 poisoning through a new entry
-            // point, and it can preserve nothing: nothing has run against a just-loaded
-            // tracker, so it holds no node-written values (#874) for the capture to save.
-            // A moved active pointer is the same uncertainty even when the stale root
-            // carries this target's UUID: that tag is not independent canvas proof. Use
-            // the target tracker's own state after a tab switch and fail closed on the
-            // unproven capture rather than turning the previous canvas into this tab's
-            // state (#1639).
             openSettled?.loaded !== true &&
-            activePointerProof &&
-            captureSourceProof
+            captureDecision.capture
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -21899,6 +23062,17 @@ const GRAPH_TOOL_EXECUTORS = {
               // reply instead of vouching for them.
               const contentMatches =
                 contentProof.proven || contentProof.presentationOnly || contentProof.normalizedOnly;
+              // #1215 — normalizedOnly licenses widget-value drift on a completed load
+              // of THIS graph. After a tab switch it also licenses leftover widgets
+              // from the PREVIOUS graph (related workflows share ids/types). If the
+              // live root still reproduces SOURCE, that is not target normalization.
+              // Keep `contentMatches` as the three-ground expression the #721/#1623
+              // wiring pins; the SOURCE leftover is a separate admit.
+              const leftoverPreviousCanvas =
+                !contentProof.proven &&
+                !contentProof.presentationOnly &&
+                liveCanvasStillSource(rootGraph);
+              const contentAdmitted = contentMatches && !leftoverPreviousCanvas;
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
               }
@@ -21914,7 +23088,10 @@ const GRAPH_TOOL_EXECUTORS = {
               // contradiction #1623 was reported for. `proven` cannot collide: every branch
               // that returns it returns `normalizedOnly: false`.
               if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
-                openContentNormalized = contentProof.normalizedFields;
+                // #1215 — leftover SOURCE widgets are not target-graph normalization.
+                if (!leftoverPreviousCanvas) {
+                  openContentNormalized = contentProof.normalizedFields;
+                }
               }
               // panel#1283 (the 2026-08-21 recurrence) — the completed-load ground carried
               // this open over a `definitions` difference as well as a `nodes` one, so the
@@ -21929,21 +23106,22 @@ const GRAPH_TOOL_EXECUTORS = {
                 instanceStillTarget,
                 markerMatches,
                 identityMatches,
-                contentMatches,
+                contentMatches: contentAdmitted,
               });
               if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
                 // Only once something has already failed: this re-serializes the root,
                 // which is the expensive part of the whole proof. It feeds the MESSAGE
                 // only — it decides nothing.
-                const contentDiff = contentMatches
+                const contentDiff = contentAdmitted
                   ? { comparable: true, surfaces: [], accountedSurfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
                 // #1898 — a graph can still be normalizing after the store has
                 // switched identity and `loadGraphData` has resolved. If the
                 // requested identity is already proven, let a real graph_outline
-                // probe settle that race; an unreadable probe gets exactly one
+                // probe settle that race; an unreadable probe, or a readable
+                // probe whose content is still unproven, gets exactly one
                 // normalization retry. The probe remains fail-closed: identity,
-                // readability and the final active settlement must all be proven.
+                // readability and the final content proof must all be proven.
                 if (
                   verdict.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED &&
                   // #1283/#1089/#1215 — the readable-outline recovery is only
@@ -21973,6 +23151,12 @@ const GRAPH_TOOL_EXECUTORS = {
                         endStep: () => endWorkflowReloadStep(reloadGuardToken),
                       }),
                     readGraphOutline: () => GRAPH_TOOL_EXECUTORS.graph_outline({}),
+                    // A readable outline proves only that the graph is available. If the
+                    // first full content proof is still unproven, give the same bounded
+                    // normalization retry one opportunity even when the outline was
+                    // already readable. The final content proof below remains the gate,
+                    // so a persistent or structurally different graph still refuses.
+                    shouldRetryNormalization: () => !leftoverPreviousCanvas && !contentMatches,
                     retryNormalization: async () => {
                       if (!beginWorkflowReloadStep(reloadGuardToken)) return false;
                       try {
@@ -22002,9 +23186,14 @@ const GRAPH_TOOL_EXECUTORS = {
                         loadRanToCompletion,
                       });
                       const recoveredContentMatches =
-                        recoveredContentProof.proven ||
-                        recoveredContentProof.presentationOnly ||
-                        recoveredContentProof.normalizedOnly;
+                        (recoveredContentProof.proven ||
+                          recoveredContentProof.presentationOnly ||
+                          recoveredContentProof.normalizedOnly) &&
+                        !(
+                          !recoveredContentProof.proven &&
+                          !recoveredContentProof.presentationOnly &&
+                          liveCanvasStillSource(recoveredRootGraph)
+                        );
                       const recoveredActive = activeWorkflowRef();
                       const recoveredBindingMatches =
                         sameWorkflowObject(recoveredActive, target) &&
@@ -22374,11 +23563,38 @@ const GRAPH_TOOL_EXECUTORS = {
           ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
           endStep: () => endWorkflowReloadStep(reloadGuardToken),
         });
-        if (activeSettle.status !== "settled") {
+        // #2022 — after reconnect, an applied open of a listed tmp: tab can still
+        // look unproven: the restored object is briefly unreadable, or object
+        // identity has not caught up with the switch. Recheck the live routing
+        // key before treating that as a failed switch. A still-unknown result
+        // keeps the receipt (applied:true) rather than throwing a hard error.
+        let tmpRoutingSettle = null;
+        if (
+          activeSettle.status !== "settled" &&
+          isUnsavedTmpOpenSelector(path) &&
+          !openFailed
+        ) {
+          tmpRoutingSettle = await settleOwnedOpenedTmpRoutingKey({
+            requestedKey: path,
+            readActive: activeWorkflowRef,
+            workflowTabId: readExistingWorkflowTabId,
+            beginStep: () => beginWorkflowReloadStep(reloadGuardToken),
+            ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
+            endStep: () => endWorkflowReloadStep(reloadGuardToken),
+          });
+        }
+        const tmpOpenSettled = tmpRoutingSettle?.status === "settled";
+        const tmpOpenAppliedUnproven =
+          isUnsavedTmpOpenSelector(path) &&
+          !openFailed &&
+          activeSettle.status !== "settled" &&
+          !tmpOpenSettled &&
+          !appliedTmpOpenShouldFailClosed({ routingSettle: tmpRoutingSettle });
+        if (activeSettle.status !== "settled" && !tmpOpenSettled && !tmpOpenAppliedUnproven) {
           rebindFailed = new Error(
-            activeSettle.status === "different"
+            activeSettle.status === "different" || tmpRoutingSettle?.status === "different"
               ? "workflow_open did not leave the requested workflow as the stable active canvas"
-              : activeSettle.status === "superseded"
+              : activeSettle.status === "superseded" || tmpRoutingSettle?.status === "superseded"
                 ? "workflow_open lost ownership of its reload window while the active canvas was settling"
                 : "workflow_open could not prove that the requested workflow remained the stable active canvas",
           );
@@ -22389,9 +23605,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // gate for this reconnect epoch. Failed/unknown/superseded opens leave both
         // proofs invalidated below instead of allowing an immediate list or mutation to
         // trust a prior open's proof.
+        // #2022 — an applied tmp: open that is still racing its routing-key proof
+        // DID re-point `active`, so the list's `active_confirmed` window may close.
+        // The mutation gate stays closed until the binding is actually proven.
         if (!rebindFailed && backendReconnectEpoch === openedForEpoch) {
           activeWorkflowResyncEpoch = openedForEpoch;
-          postReconnectBindingProofEpoch = openedForEpoch;
+          if (!tmpOpenAppliedUnproven) postReconnectBindingProofEpoch = openedForEpoch;
         }
       }
       }
@@ -22514,8 +23733,19 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       })(),
     });
+    // #2022 — a tmp: request is not a filename alias. Reporting the native
+    // `path`/`filename` ("Unsaved Workflow", a leftover disk path on an
+    // unpersisted tab) makes the orchestrator corroborate it as a saved
+    // identity and fail the already-applied open when `active_confirmed` is
+    // still catching up. Keep those fields null for unsaved selectors; the
+    // routing key is the identity.
+    const openedForTmp = isUnsavedTmpOpenSelector(path);
     return {
-      opened: { path: target.path, filename: target.filename },
+      opened: {
+        path: openedForTmp ? null : target.path,
+        filename: openedForTmp ? null : target.filename,
+        ...(targetRoutingKeyAtReply ? { routing_key: targetRoutingKeyAtReply } : {}),
+      },
       routing_key: targetRoutingKeyAtReply,
       ...openActiveBinding,
       // #1325 — `panel_set_workflow_target({mode:"current"})` lands here and
@@ -22777,6 +24007,13 @@ const GRAPH_TOOL_EXECUTORS = {
               "you need to a NEW path first: a plain save would write the canvas over the " +
               "workflow you asked for, because the active identity already names that one.",
           }
+        : {}),
+      // #1911 — missing `$subscribe` is a capability gap, not "the watcher saw a
+      // move". Name it on the success reply the same way unproven_source_state
+      // names an untagged switch: a silent skip is how SOURCE widget values
+      // survive onto TARGET (#1215).
+      ...(pointerWatchUnavailable
+        ? { pointer_watch_unavailable: POINTER_WATCH_UNAVAILABLE_NOTICE }
         : {}),
     };
     } finally {
@@ -23360,6 +24597,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // slot may be gone anyway. The live rail below is the only reading.
       removeErr = err;
     } finally {
+      // #1969 — remaining host links keep the OLD origin_slot after a non-last
+      // splice. Re-point them inside the same change group; do not disconnect
+      // (#668 cascade). A canceled remove leaves the slot on the rail and skips.
+      if (!(subgraph.outputs ?? []).includes(slot)) {
+        reindexHostRailLinks(rootGraph, subgraph, "output", slotIndex);
+      }
       subgraph.afterChange?.();
     }
     // OBSERVED, not "the call returned": LGraph.removeOutput dispatches a
@@ -23384,6 +24627,7 @@ const GRAPH_TOOL_EXECUTORS = {
         slot: slotIndex,
         interior_links_dropped: interiorLinks,
         host_links_dropped: hostLinks,
+        host_links_reindexed: true,
       },
       ...(removeErr
         ? {
@@ -23415,6 +24659,11 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch (err) {
       removeErr = err;
     } finally {
+      // #1969 — same host-link shift as the output twin: remaining later
+      // target_slot values stay at the pre-splice index unless we re-point.
+      if (!(subgraph.inputs ?? []).includes(slot)) {
+        reindexHostRailLinks(rootGraph, subgraph, "input", slotIndex);
+      }
       subgraph.afterChange?.();
     }
     // See the output twin: a cancelable "removing-input" event means a clean
@@ -23438,6 +24687,7 @@ const GRAPH_TOOL_EXECUTORS = {
         slot: slotIndex,
         interior_links_dropped: interiorLinks,
         host_links_dropped: hostLinks,
+        host_links_reindexed: true,
       },
       ...(removeErr
         ? {
@@ -23575,6 +24825,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // verified afterwards instead of trusted. litegraph's unpackSubgraph silently
     // drops links whose targets are widget-converted or dynamic inputs and leaves
     // one-sided ghosts behind; a bare success over that is silent graph corruption.
+    // artokun/comfyui-mcp-panel#1938 — NORMALISE duplicate boundary link ids before
+    // anything reads them. The bundled anima-inpaint subgraph serialises link id 1883
+    // twice on one IMAGE output rail; the frontend's unpackSubgraph removes the link on
+    // its first visit and then dereferences the now-missing record on the duplicate,
+    // throwing "Cannot read properties of undefined (reading 'target_id')". The #405
+    // rollback below caught it, so the graph was never corrupted — the operation simply
+    // could not run at all on that workflow.
+    //
+    // Semantics-preserving by construction: a link id resolves to ONE record with one
+    // origin and one target, so two entries carrying the same id cannot be distinct
+    // edges. The panel never writes linkIds (it only reads them), so this normalises
+    // data that arrives already malformed rather than papering over our own mutation.
+    //
+    // Placed BEFORE snapshotExternalLinks so the #1665 verification and the unpack see
+    // the same state — a snapshot taken over the duplicates would expect a consumer
+    // count the unpack can never produce.
+    for (const slots of [node.subgraph?.inputs, node.subgraph?.outputs]) {
+      for (const slot of slots ?? []) {
+        if (!Array.isArray(slot?.linkIds) || slot.linkIds.length < 2) continue;
+        const deduped = [...new Set(slot.linkIds)];
+        if (deduped.length !== slot.linkIds.length) slot.linkIds = deduped;
+      }
+    }
     const externalLinks = snapshotExternalLinks(graph, node);
     try {
       graph.unpackSubgraph(node, { skipMissingNodes: true });
@@ -23681,6 +24954,12 @@ const GRAPH_TOOL_EXECUTORS = {
         throw new Error(`node_ids not found in the current graph: ${missing.join(", ")}`);
       }
       const ns = resolved.map((r) => r.node);
+      // #2004: some frontends' selectItems is additive, so leftover nodes/groups
+      // would otherwise stay selected and be serialized with the explicit ids.
+      canvas.selectedItems?.clear?.();
+      if (canvas.selected_nodes && typeof canvas.selected_nodes === "object") {
+        for (const id of Object.keys(canvas.selected_nodes)) delete canvas.selected_nodes[id];
+      }
       if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
       else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
     }
@@ -23753,8 +25032,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   // Paste the litegraph clipboard onto the CURRENT graph. Snapshots node ids
-  // before/after so the freshly-pasted node ids can be returned. connect_inputs
-  // false (default) drops a disconnected copy; pos places the paste anchor.
+  // before/after so the freshly-pasted node ids can be returned. Internal wires
+  // among the copied nodes are preserved. connect_inputs:false (default) drops
+  // only external feeds from nodes outside the copied set; pass true to also
+  // reconnect those. pos places the paste anchor.
   graph_paste_nodes({ pos, connect_inputs } = {}) {
     const { graph, canvas, LG } = getGraphCtx();
     if (!canvas) throw new Error("canvas unavailable");
@@ -23861,6 +25142,9 @@ const GRAPH_TOOL_EXECUTORS = {
       pasted,
       copied_groups: layout.groups.length,
       pasted_groups: groupsNow.length,
+      connect_inputs: connect_inputs === true,
+      note:
+        "Internal wires among the copied nodes are preserved. connect_inputs:false (default) drops only external feeds; pass true to also reconnect those.",
       ...(auxIdSanitizedCount ? { aux_id_sanitized: auxIdSanitizedCount } : {}),
     };
     if (groupsNow.length) {
@@ -23915,6 +25199,10 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     const finalName =
       typeof name === "string" && name.trim() ? name.trim() : target.title || "Subgraph";
+    // #2005 — the publisher validates properties.proxyWidgets as string
+    // tuples. A legacy-store promote leaves [object, null] entries the
+    // schema rejects. Rewrite them first, or refuse with a repair action.
+    prepareSubgraphProxyWidgetsForPublish(target);
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
     const fullType = `${prefix}${finalName}`;
     // #636: the collision preflight must not depend on reconstructing the store's own
@@ -25333,13 +26621,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const widgets = node.widgets ?? [];
     const w = widgets.find((x) => x && x.name === widget);
     if (!w) {
-      const names = widgets.map((x) => x?.name).filter(Boolean);
-      throw new Error(
-        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}` +
-          // #757 — same disclosure as the widget-write path: a button the panel
-          // cannot press may be what creates the missing slot.
-          pressableWidgetHint(node, widget),
-      );
+      throw new Error(missingWidgetMessage(node, widget));
     }
     // The parent SubgraphNode instance(s) embedding this subgraph. For a nested
     // subgraph (root → node 142 → node 133), walk ALL graphs in the hierarchy
@@ -25393,6 +26675,18 @@ const GRAPH_TOOL_EXECUTORS = {
           // Don't mask why the primary path failed — that message is the useful
           // one. The legacy store is gone on frontend >= 1.48; if it is also
           // missing here, surface BOTH errors rather than only "no promotion store".
+          // Canvas-only callback widgets (control_after_generate) have no slot
+          // and must not fall through: the 3-arg object call used to append
+          // [object, null] to properties.proxyWidgets and the saved workflow
+          // would not load (#2002).
+          if (!demote && isCanvasOnlyCallbackWidget(w)) {
+            throw new Error(
+              `${linkErr?.message ?? linkErr}. Widget "${w.name}" is a canvas-only callback ` +
+                `widget and cannot be promoted — the legacy store would write unloadable ` +
+                `properties.proxyWidgets. Set it on the inner node, or promote a connectable ` +
+                `value widget instead.`,
+            );
+          }
           strategy = "legacy-store";
           let store;
           try {
@@ -25401,8 +26695,7 @@ const GRAPH_TOOL_EXECUTORS = {
             throw new Error(`${linkErr?.message ?? linkErr} (and ${storeErr.message})`);
           }
           for (const p of parents) {
-            const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
-            store[action](rootGraphId, p.id, source);
+            applyLegacyPromotionStore(store, action, p, rootGraph, source);
           }
         }
       }
@@ -25432,10 +26725,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // (no-/v2) legacy route on an unreachable/404 signal (a legacy-UI pip build
     // or real 3.x Manager can serve /customnode/getmappings while the /v2 route
     // 404s — or detectManagerDialect's /v2 probe fails). When BOTH are
-    // unreachable it falls back to an INSTALLED-node search over the connected
-    // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
-    // usable, already-installed matches; on a miss it returns the structured
-    // {supported:false,…} capability result.
+    // unreachable OR the command budget expires (#2099) it falls back to an
+    // INSTALLED-node search over the connected ComfyUI's /object_info (#426) so
+    // a stalled/legacy/disabled Manager still returns usable already-installed
+    // matches (DaSiWa_SeedControl); a timeout miss is a retryable named reason
+    // rather than an empty hang, and local hits are never dressed as Manager
+    // catalogue rows. A browser-origin transport wrap (#2024) is kept as the
+    // message so it is not a bare Failed to fetch.
     const budgetSignal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
     return searchNodesVia(managerGet, managerCall, {
       query,
@@ -26037,6 +27333,24 @@ const GRAPH_TOOL_EXECUTORS = {
   async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
+    // #1913 — route through the origin bound to THIS canvas. A live bridge
+    // (this command arrived on it) or an open backend socket is the instance
+    // witness; without one, bound ≠ boot is not dispatched. The POST below
+    // stays relative to the page host, never the boot URL.
+    const boundDecision = decideBoundRestart({
+      boundOrigin: rebootBoundOrigin(),
+      bootTarget: remoteUrlSetting(),
+      bridgeConnected: true,
+      witnessAlive: comfyBackendSocketReadyState() === 1,
+    });
+    if (boundDecision.kind !== "reboot_bound") {
+      return {
+        rebooting: false,
+        refused: true,
+        ...rebootTargetFields(),
+        error: boundDecision.note,
+      };
+    }
     // GUARD: a reboot ABORTS any in-progress/queued generation. Don't silently kill
     // a render the user is waiting on — check the queue first and refuse (with a
     // clear message the agent relays) unless force:true.
@@ -26063,6 +27377,54 @@ const GRAPH_TOOL_EXECUTORS = {
         // Queue probe failed (ComfyUI unreachable / no /queue) — fall through and
         // reboot; don't block a needed restart on a flaky probe.
       }
+    }
+    // #1999 — Desktop Manager reboot can stop the Python backend without
+    // Desktop bringing it back. A proven Electron restore (restartCore
+    // stops AND starts; restartApp / relaunchApp relaunch the app) is
+    // the recoverable path. Without one, refuse while the server is still
+    // up — a Manager POST here is a stop that nothing in this tab undoes.
+    const desktopBridge =
+      (typeof window !== "undefined" &&
+        (window.electronAPI ?? window.comfyAPI?.electron ?? window.api ?? window.__comfyDesktop2)) ||
+      null;
+    const desktopRestore = resolveDesktopRestore(desktopBridge);
+    const desktopDecision = decideDesktopRestartRestore({
+      desktopShell: isEmbeddedDesktopShell({
+        electronBridge: desktopBridge,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+      }),
+      restore: desktopRestore,
+    });
+    if (desktopDecision.kind === "refuse") {
+      return {
+        rebooting: false,
+        refused: true,
+        ...rebootTargetFields(),
+        error: desktopDecision.note,
+      };
+    }
+    if (desktopDecision.kind === "desktop_restore" && desktopRestore) {
+      try {
+        await desktopRestore.restore();
+      } catch (err) {
+        if (!comfyBackendIsDown()) {
+          return {
+            rebooting: false,
+            refused: true,
+            ...rebootTargetFields(),
+            error:
+              `ComfyUI Desktop ${desktopRestore.name} failed before the backend went down` +
+              (err && err.message ? `: ${err.message}` : "") +
+              ". ComfyUI was NOT restarted.",
+          };
+        }
+      }
+      return {
+        rebooting: true,
+        via: desktopRestore.name,
+        ...rebootTargetFields(),
+        note: desktopDecision.note,
+      };
     }
     // Fire the reboot. IMPORTANT: a "successful" reboot usually looks like a
     // FAILED fetch. The bundled Desktop Manager handler calls exit(0) the instant
@@ -26152,6 +27514,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // Unload all resident models + free cached VRAM via ComfyUI's standard /free
     // endpoint (the same one the "Unload Models"/"Free memory" menu uses). Used to
     // unwedge a stuck/OOM ComfyUI when a cancel left memory pinned — no restart.
+    // Occupancy is best-effort: a /system_stats miss must not fail a /free that
+    // already landed (#1956).
+    const before = await readVramOccupancy((path, init) => api.fetchApi(path, init));
     const res = await api.fetchApi("/free", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -26188,7 +27553,8 @@ const GRAPH_TOOL_EXECUTORS = {
         }),
       );
     }
-    return { freed: true, unload_models: true, free_memory: true };
+    const after = await readVramOccupancy((path, init) => api.fetchApi(path, init));
+    return freeVramSuccessResult({ before, after });
   },
 };
 
@@ -26516,6 +27882,9 @@ function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
   ]);
 }
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
+// #2116 — rid-correlated receipts for graph_set_widget mutations that applied
+// after the caller timeout. retry_of reads these instead of executing again.
+const lateMutationReceipts = createMutationReceiptStore();
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
 // observation after the fact, which is why three reports of `bound` + wrong-graph have not
@@ -26562,7 +27931,7 @@ function noteActiveWorkflowMove() {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onUiDismiss, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -27245,6 +28614,30 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             retryOfHit = true;
           }
         }
+        // #2116 — a graph_set_widget that applied after the caller timeout still
+        // has a rid-correlated receipt. Prefer it over a ledger timeout/unknown
+        // and over joining a hung original: the mutation already landed, so
+        // retry_of must resolve that outcome without a second write.
+        const lateMutation = resolveLateMutationReply(lateMutationReceipts, msg, fingerprint);
+        if (lateMutation) {
+          priorRidReply = lateMutation.reply;
+          retryOfHit = lateMutation.retryOfHit;
+        }
+        // #2003 — a hung READ must not pin retries. The ledger joins an in-flight
+        // original so a mutation cannot land twice (#517/#694). graph_outline cannot
+        // double-apply, and after a manual canvas edit the original may never settle
+        // inside the 20s window; joining it is how every retry_of stays silent.
+        // Settled replies still join. Mutations still join.
+        if (
+          priorRidReply !== undefined &&
+          !shouldJoinInFlightGraphReply({
+            cmd: msg.cmd,
+            priorInFlight: ledgerReplyIsInFlight(priorRidReply),
+          })
+        ) {
+          priorRidReply = undefined;
+          retryOfHit = false;
+        }
         if (priorRidReply !== undefined) {
           // #1095 — THIS PATH WAITS, AND THEN REPLIES, so it holds the route exactly like an
           // executing command does and must be marked exactly like one.
@@ -27330,6 +28723,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         let visibleMutationTarget = null;
         try {
           let result;
+          // #1297 — truncated / concatenated / nested-router names are a
+          // validation miss, not an unknown command. Refuse before any
+          // executor lookup so nothing is applied.
+          const malformedName = malformedToolNameException(msg.cmd);
+          if (malformedName) throw malformedName;
           if (msg.cmd === "ask_user") {
             // Not a graph executor — render an interactive question card in the
             // chat (UI scope) and block on the user's pick. The chosen string
@@ -27346,6 +28744,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the reply AND `settleRid` runs: without this the ledger keeps an
             // un-evictable in-flight entry whose replay would await a promise that can
             // never resolve, and answer nothing at all.
+            if (isAbandonedInteractive(result)) noteRestartConfirmTimeout();
             if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
@@ -27414,7 +28813,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (
             msg.cmd === "civitai_results" || msg.cmd === "civitai_highlight" ||
             msg.cmd === "civitai_clear_highlight" || msg.cmd === "civitai_switch_tab" ||
-            msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox"
+            msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox" ||
+            msg.cmd === "civitai_close" || msg.cmd === "civitai_read" ||
+            msg.cmd === "civitai_set_dock"
           ) {
             // Agent DRIVES the already-open CivitAI browser. onCivitaiCmd throws
             // an honest "civitai browser not open" when the modal isn't live, which
@@ -27424,7 +28825,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (
             msg.cmd === "open_training" || msg.cmd === "training_get_state" ||
             msg.cmd === "training_set_field" || msg.cmd === "training_goto_step" ||
-            msg.cmd === "training_set_target" || msg.cmd === "training_highlight"
+            msg.cmd === "training_set_target" || msg.cmd === "training_highlight" ||
+            msg.cmd === "training_close" || msg.cmd === "training_set_dock"
           ) {
             if (!onTrainingCmd) throw new Error("This panel build can't drive the training wizard.");
             result = await onTrainingCmd(msg);
@@ -27436,6 +28838,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (msg.cmd === "ui_update") {
             if (!onUiUpdate) throw new Error("This panel build can't render UI cards.");
             result = await onUiUpdate(msg);
+          } else if (msg.cmd === "ui_dismiss") {
+            if (!onUiDismiss) throw new Error("This panel build can't dismiss UI cards.");
+            result = await onUiDismiss(msg);
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -27517,15 +28922,31 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // the case this issue is hunting.
               noteActiveWorkflowMove();
               noteWorkflowInstanceMismatch();
-              throw new Error(
-                workflowInstanceMismatchMessage({
+              // #2007 — a classified READ whose stamp names a previous instance of
+              // this tab. The command can only inspect the live canvas, so refusing
+              // it withholds a graph read and demands a re-target round-trip for no
+              // write-safety. Mutations stay fail-closed until an explicit rebind.
+              if (
+                staleReadMayFollowLiveCanvas({
+                  cmd: msg.cmd,
                   commandUuid: dispatchCommandUuid,
                   activeUuid: dispatchActiveUuid,
-                  // #968 — what last moved the active workflow, if anything did. This is the
-                  // refusal a caller actually sees when a binding has gone stale.
-                  movedNote: activeWorkflowMoves.describeLast(),
-                }),
-              );
+                })
+              ) {
+                if (typeof dispatchActiveUuid === "string" && dispatchActiveUuid) {
+                  msg[WORKFLOW_UUID_FIELD] = dispatchActiveUuid;
+                }
+              } else {
+                throw new Error(
+                  workflowInstanceMismatchMessage({
+                    commandUuid: dispatchCommandUuid,
+                    activeUuid: dispatchActiveUuid,
+                    // #968 — what last moved the active workflow, if anything did. This is the
+                    // refusal a caller actually sees when a binding has gone stale.
+                    movedNote: activeWorkflowMoves.describeLast(),
+                  }),
+                );
+              }
             }
             // #349: UUID fencing proves the command was issued for the active
             // workflow SERVICE object, but graph executors operate on LiteGraph's
@@ -27574,15 +28995,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 });
                 if (reconnectGate) throw reconnectRefusalError(reconnectGate);
               }
-              // comfyui-mcp#1723 — a successful command defers its tracker snapshot
-              // past the reply (#581); a back-to-back command from the same burst
+              const { graph, rootGraph, canvas } = getGraphCtx();
+              // comfyui-mcp#1723 — a successful MUTATION defers its tracker snapshot
+              // past the reply (#581); a back-to-back write from the same burst
               // reaches the fence on the stale pre-command fingerprint and refuses
               // the RIGHT canvas. Flush the capture already committed to (same
               // tracker only — a different active tracker means the tab moved).
-              flushPendingChangeTrackerSnapshot(
-                app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
-              );
-              const { graph, rootGraph, canvas } = getGraphCtx();
+              // #2003 — reads must not flush; captureCanvasState can miss the 20s window.
+              if (graphCommandMayMutateWorkflow(msg.cmd)) {
+                flushPendingChangeTrackerSnapshot(
+                  app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
+                );
+              }
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
               if (graphCommandMayMutateWorkflow(msg.cmd)) {
                 visibleMutationTarget = { graph, canvas, rootGraph };
@@ -27663,7 +29087,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // from the INNER widget, which clears instance STRING overrides.
             // Snapshot the parent rails before the mutation and write them back
             // after (rail only — never the shared inner widget).
+            //
+            // #2109 — graph_set_widget is the exception. A promoted inner write
+            // must be allowed to update the enclosing instance rail (the
+            // serialization source). Restoring the pre-write snapshot would put
+            // the OLD parent value back and report applied while the container
+            // stayed stale. add/rewire still wrap; a widget-value write does not
+            // reconfigure sibling instances.
             if (
+              msg.cmd !== "graph_set_widget" &&
               visibleMutationTarget?.graph &&
               visibleMutationTarget.rootGraph &&
               visibleMutationTarget.graph !== visibleMutationTarget.rootGraph
@@ -27702,11 +29134,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // until after the correlated reply is delivered (#581).
             changeTrackerToSnapshot = app.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null;
           }
-          reply = { rid: msg.rid, ok: true, result };
+          reply = { rid: msg.rid, ok: true, result: withViewingWitness(result) };
         } catch (err) {
           const reconnectRefusal = readReconnectRefusal(err);
           const workflowListReadiness = readWorkflowListReadinessRefusal(err);
+          const workflowOpenReadiness = readWorkflowOpenReadinessRefusal(err);
           const routeRegistrationReadiness = readRouteRegistrationReadinessRefusal(err);
+          const malformedToolName = readMalformedToolName(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -27726,11 +29160,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // reader answers the stronger question — did the gate mint this,
             // pre-executor? — and returns a freshly built object.
             ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
+            // #1297 — truncated/nested names are a validation miss, not unknown.
+            ...(malformedToolName ? { code: malformedToolName.code, applied: false } : {}),
             // #1785 — this is a read-only, pre-probe refusal. Keep it separate
             // from the graph-mutation gate's refusal vocabulary so a caller
             // cannot confuse a workflow-list readiness miss with a graph
             // command blocked by a different fence.
             ...(workflowListReadiness ? { workflow_list_readiness: workflowListReadiness } : {}),
+            // #1914 — mutator, but still pre-open: freeze/load have not run.
+            // Keep it out of the graph-mutation `refusal` field so a caller
+            // cannot treat an unsettled open as a gated graph write.
+            ...(workflowOpenReadiness ? { workflow_open_readiness: workflowOpenReadiness } : {}),
             // #1787 — this is a read-only, pre-refresh refusal. The route handoff
             // did not settle, so no node definitions were fetched or registered.
             ...(routeRegistrationReadiness
@@ -27743,6 +29183,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // the same rid on a fresh socket learns the true outcome instead of
         // re-executing the command.
         settleRid(reply);
+        if (msg.cmd === "graph_set_widget" && reply?.ok) {
+          lateMutationReceipts.remember(msg.rid, reply.result, {
+            cmd: msg.cmd,
+            fingerprint,
+          });
+        }
         // A command executor can be ASYNC (ask_user/request_secret block on the user;
         // graph run/save await). If a soft-reload/restart swapped this socket out while
         // we were suspended, this reply belongs to the DEAD session A — it must NOT be
@@ -27773,11 +29219,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // commands get the normal activity card.
         const SILENT_CMDS = new Set([
           "ask_user", "request_secret", "set_todo", "show_media", "open_civitai",
-          "ui_render", "ui_update", "fetch_image", "fetch_comfyui_read",
+          "ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read",
           "civitai_results", "civitai_highlight", "civitai_clear_highlight",
           "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
+          "civitai_close", "civitai_read", "civitai_set_dock",
           "open_training", "training_get_state", "training_set_field",
           "training_goto_step", "training_set_target", "training_highlight",
+          "training_close", "training_set_dock",
         ]);
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
@@ -27822,13 +29270,28 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         queueHiddenAgentNote(coerceMessageText(msg.text));
         return;
       }
+      // Codex generatedImage / imageGeneration: paint the bytes, then leftover prose.
+      // Array.isArray: extracted bridge-client tests stub missing helpers as noop.
+      const generatedItems = generatedImageMediaItems(msg);
+      if (Array.isArray(generatedItems) && generatedItems.length && onShowMedia) {
+        try {
+          await onShowMedia(generatedItems);
+        } catch {
+          /* a fenced turn must not surface as a transport error */
+        }
+      }
       if (msg && msg.type === "say" && msg.text != null) {
         // A completed render/output frame can arrive as a structured payload,
         // not a bare string (#238). Route it through the SAME serializer the
         // A2UI/replay paths use so the sidebar shows readable text instead of a
         // dropped frame or an "[object Object]" bubble.
         // `id` reconciles this committed reply with its live streaming preview.
-        onSay(coerceMessageText(msg.text), { id: msg.id, streamed: !!msg.streamed });
+        const sayText = Array.isArray(generatedItems) && generatedItems.length
+          ? generatedImageRemainderText(msg, generatedItems)
+          : coerceMessageText(msg.text);
+        if (sayText || !Array.isArray(generatedItems) || !generatedItems.length) {
+          onSay(sayText, { id: msg.id, streamed: !!msg.streamed });
+        }
       }
       // Live streaming deltas: incremental thinking / reply text before the final
       // `say` commits. phase: "think" | "text" | "end".
@@ -28167,6 +29630,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the orchestrator can resume an UNSAVED workflow's conversation without
             // cross-resuming a DIFFERENT same-title unsaved workflow.
             workflowUuid: (advertisedWorkflowUuid = workflowStableUuid()),
+            // #1925 — restock the promoted-scope cache that this hello is about to clear.
+            viewing: liveParseableViewingWitness() ?? undefined,
             // #508/#694 — NO lostReplies summaries here: the hello fires at
             // socket-open, BEFORE the models handshake stamps this socket's session
             // epoch, so any summary computed now is filtered with an unknown epoch
@@ -29708,6 +31173,48 @@ const PANEL_CSS = `
 /* #758 — the update notice. Sits in the transcript as a system line, so it inherits
    the panel's scale and scroll rather than becoming a modal the user must dismiss. */
 .cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+/* #1942 — pending-update badge + transcript card. Hidden on remote/mobile (#1944). */
+.cmcp-update-badge {
+  display: inline-flex; align-items: center; flex: none;
+  margin-left: 0.35rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--p-primary-color, #3b82f6);
+  background: transparent;
+  color: var(--p-primary-color, #3b82f6);
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.cmcp-update-badge[hidden] { display: none !important; }
+.cmcp-update-notice { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+.cmcp-update-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.45rem; align-items: center; }
+.cmcp-update-btn {
+  display: inline-flex; align-items: center;
+  padding: 0.28rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--p-primary-color, #8b5cf6);
+  background: var(--p-primary-color, #8b5cf6);
+  color: #fff;
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
+  cursor: pointer;
+}
+.cmcp-update-btn[disabled] { opacity: 0.55; cursor: default; }
+.cmcp-update-dismiss {
+  display: inline-flex; align-items: center;
+  padding: 0.28rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--p-surface-500, #555);
+  background: transparent;
+  color: var(--p-text-muted-color, #a1a1aa);
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
+  cursor: pointer;
+}
 .cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
 .cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
 .cmcp-whatsnew-list li { line-height: 1.45; }
@@ -30979,6 +32486,23 @@ function buildPanel() {
     logo.dataset.fellBack = "1";
     logo.src = LOGO_SERVED_PATH;
   }
+  // #1942 — unobtrusive "Update" chip. Hidden until a local host session is
+  // behind a published cut (or the running bundle does not match disk).
+  const updateBadge = document.createElement("button");
+  updateBadge.type = "button";
+  updateBadge.className = "cmcp-update-badge";
+  updateBadge.hidden = true;
+  updateBadge.dataset.testid = "panel-update-badge";
+  updateBadge.textContent = tr("panel.update", "Update");
+  updateBadge.title = tr("panel.an_update_is_available", "An update is available");
+  updateBadge.addEventListener("click", () => {
+    const existing = log.querySelector('[data-testid="panel-update-available"]');
+    if (existing) {
+      try { existing.scrollIntoView({ block: "nearest" }); } catch {}
+      return;
+    }
+    void notifyAvailablePanelUpdate({ force: true });
+  });
   const status = document.createElement("button");
   status.type = "button";
   status.className = "cmcp-status cmcp-status-btn";
@@ -31029,7 +32553,7 @@ function buildPanel() {
   const histPop = document.createElement("div");
   histPop.className = "cmcp-popover cmcp-popover--down cmcp-history-pop";
   histPop.hidden = true;
-  header.append(logo, actions, status, histPop);
+  header.append(logo, updateBadge, actions, status, histPop);
   root.appendChild(header);
 
   // ── Utility strip (row 2): agent-feed gates now live here instead of
@@ -32015,6 +33539,7 @@ function buildPanel() {
   const onNewMessagesClick = () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
+    scrollIntent.clearUserIntent();
     scrollIntent.noteProgrammaticScroll({ behavior: "smooth" });
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
     chatScrollStabilizer.schedule();
@@ -32025,9 +33550,16 @@ function buildPanel() {
   // real height; scroll anchoring then emits a browser scroll event with no user intent.
   // Such an event must not latch stickToBottom off while the transcript settles.
   const scrollIntent = createChatScrollIntentTracker();
+  let lastChatScrollTop = log.scrollTop;
   const chatScrollIntentListenerOptions = { passive: true };
   const onChatScrollIntent = (event) => {
     scrollIntent.note(event);
+    // Unstick on the gesture itself. Waiting for the matching scroll event lets
+    // the stabilizer's already-queued rAF overwrite the first wheel ticks while
+    // stickToBottom is still true, so a long streaming turn never leaves the pin.
+    if (isLeavingBottomScrollIntent(event) || scrollIntent.hasLeavingBottom()) {
+      stickToBottom = false;
+    }
   };
   const onChatScrollEnd = (event) => {
     if (event.target !== event.currentTarget) return;
@@ -32036,9 +33568,13 @@ function buildPanel() {
   const onChatLogScroll = (event) => {
     if (event.target !== event.currentTarget) return;
     const isAtBottom = atBottom();
+    const scrolledUp = log.scrollTop < lastChatScrollTop;
+    lastChatScrollTop = log.scrollTop;
+    const { userScrollIntent, leavingBottom } = scrollIntent.consumeIntent();
     stickToBottom = updateChatStickiness(stickToBottom, {
       atBottom: isAtBottom,
-      userScrollIntent: scrollIntent.consume(),
+      userScrollIntent,
+      leavingBottom: leavingBottom || (userScrollIntent && scrolledUp),
     });
     if (isAtBottom) newMsgBtn.hidden = true;
   };
@@ -32056,7 +33592,7 @@ function buildPanel() {
   log.addEventListener("scroll", onChatLogScroll);
   const chatScrollStabilizer = createChatScrollStabilizer({
     log,
-    shouldStick: () => stickToBottom,
+    shouldStick: () => stickToBottom && !scrollIntent.hasPending(),
     beforeScroll: () => scrollIntent.noteProgrammaticScroll(),
   });
   body.appendChild(newMsgBtn);
@@ -35234,7 +36770,7 @@ function buildPanel() {
     if (!holder.style.aspectRatio) holder.style.aspectRatio = "16 / 9";
   }
 
-  // #1280 — the placeholder a video card gets when "Video previews in chat" is
+  // #1280 — the placeholder a video card gets when inline video playback is
   // off. The element loads METADATA ONLY: no autoplay, no loop, no controls, so
   // the browser fetches the headers and the first frame and stops — the decode
   // this setting exists to avoid is never paid until the user asks for it.
@@ -35495,14 +37031,15 @@ function buildPanel() {
    *  Audio is also kept out of the agent's inline delivery: an audio file handed
    *  over as an inline IMAGE is a perception nobody had.
    *
-   *  DELIBERATELY NOT DONE HERE: collecting ComfyUI's own `audio` output key.
-   *  onExecuted reads images/gifs/videos only, so a SaveAudio render paints
-   *  nothing in chat today and reports nothing to the agent — that is silence,
-   *  not a false claim, so it is a missing feature on this surface rather than
-   *  the #710 honesty defect. Adding it changes what appears in chat after every
-   *  audio render and touches the completion-delivery lifecycle (#269/#468), so
-   *  it belongs in its own change. Until then this branch covers a descriptor
-   *  that arrives misfiled under one of the three collected keys. */
+   *  #2126 — ComfyUI's own `audio` output key IS collected now; that change is
+   *  this one. The note that stood here called the omission "silence, not a false
+   *  claim". It was not silence. A run whose only output node was SaveAudio
+   *  buffered nothing, so execution_success took the media-less branch and told
+   *  the agent the run "produced no image or video output ... if this workflow was
+   *  meant to save a file, no output node produced one" — with the file on disk.
+   *  This branch still earns its keep for a descriptor misfiled under one of the
+   *  three image keys; one from the `audio` BAG is audio by provenance and is
+   *  never asked. */
   function isAudioOutput(m) {
     const fmt = String(m?.format || "").toLowerCase();
     if (fmt.startsWith("audio/")) return true;
@@ -35790,6 +37327,7 @@ function buildPanel() {
       forceStick: () => {
         stickToBottom = true;
         newMsgBtn.hidden = true;
+        scrollIntent.clearUserIntent();
       },
       scrollNow: () => {
         scrollIntent.noteProgrammaticScroll();
@@ -35826,8 +37364,33 @@ function buildPanel() {
         }),
       abandon,
     });
-    promise.then(unregister, unregister);
-    return promise;
+    // #390 — the 18+ consent card is the one question whose idle wait used to
+    // outlive the enclosing tools/call. Bound HERE, on the promise the
+    // executor awaits, so an unanswered gate resolves with a structured
+    // timeout instead of holding the rid until the transport kills it.
+    // Non-consent questions (restart confirm, generic asks) pass through.
+    const handedToCaller = waitForAdultConsentAnswer(msg, promise, {
+      onTimeout: () => {
+        if (done || abandoned) return;
+        done = true;
+        try {
+          const note = document.createElement("div");
+          note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.7;margin-top:0.4rem;";
+          note.textContent = tr(
+            "panel.no_answer_in_time_adult_content_stays",
+            "No answer in time — adult content stays as it was.",
+          );
+          card.appendChild(note);
+          for (const el of [...btnRow.children, other, submit]) {
+            try { el.disabled = true; } catch { /* presentation-only */ }
+          }
+        } catch (error) {
+          console.warn("[comfyui-mcp-panel] couldn't present consent-card timeout:", error?.message ?? error);
+        }
+      },
+    });
+    handedToCaller.then(unregister, unregister);
+    return handedToCaller;
   }
 
   /**
@@ -36078,6 +37641,7 @@ function buildPanel() {
       forceStick: () => {
         stickToBottom = true;
         newMsgBtn.hidden = true;
+        scrollIntent.clearUserIntent();
       },
       scrollNow: () => {
         scrollIntent.noteProgrammaticScroll();
@@ -36124,6 +37688,7 @@ function buildPanel() {
   function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
+    scrollIntent.clearUserIntent();
     // Capture the rewind anchor NOW (the latest turn's UUID) so a later rewind to
     // this message forks the conversation right before it — stored directly (not as
     // an index, which a bounded-ring shift() would invalidate).
@@ -36653,6 +38218,219 @@ function buildPanel() {
       if (!force) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
     } catch {
       // A release note is never worth breaking the panel over.
+    }
+  }
+
+  /**
+   * #1942 — one-click install+restart, only on a local host client (#1943).
+   *
+   * Reuses the existing Manager update + reboot executors rather than a new
+   * installer. Re-classifies from this tab's location/UA at click time so a
+   * captured "local" from notify cannot authorize a remote caller. Fail closed.
+   */
+  async function applyPanelUpdate({ kind, button } = {}) {
+    const clientContext = readBrowserClientContext({
+      location: typeof location !== "undefined" ? location : undefined,
+      navigator: typeof navigator !== "undefined" ? navigator : undefined,
+    });
+    if (!shouldOfferHostMutation(clientContext)) return;
+    const installLabel = tr("panel.install_and_restart", "Install and restart");
+    const restartLabel = tr("panel.restart_comfyui", "Restart ComfyUI");
+    const restore = () => {
+      if (!button) return;
+      button.disabled = false;
+      button.textContent = kind === "update" ? installLabel : restartLabel;
+    };
+    const setBusy = (label) => {
+      if (!button) return;
+      button.disabled = true;
+      button.textContent = label;
+    };
+    try {
+      if (kind === "update") {
+        setBusy(tr("panel.installing_the_update", "Installing the update…"));
+        const result = await GRAPH_TOOL_EXECUTORS.graph_update_node({
+          id: "comfyui-agent-panel",
+        });
+        if (result?.unmanaged_pack) {
+          restore();
+          appendSystem(
+            result.note ||
+              tr(
+                "panel.could_not_queue_the_pack_update_from_this_checkout",
+                "Could not queue the pack update from this checkout.",
+              ),
+          );
+          return;
+        }
+      }
+      setBusy(tr("panel.restarting_comfyui", "Restarting ComfyUI…"));
+      const reboot = await GRAPH_TOOL_EXECUTORS.comfy_reboot({ force: false });
+      if (reboot?.blocked_busy) {
+        restore();
+        appendSystem(
+          tr(
+            "panel.comfyui_is_busy_wait_for_the_current_render",
+            "ComfyUI is busy — wait for the current render, then retry the restart.",
+          ),
+        );
+        return;
+      }
+      if (reboot?.refused) {
+        restore();
+        appendSystem(
+          reboot.error || tr("panel.restart_was_refused", "Restart was refused."),
+        );
+        return;
+      }
+    } catch (err) {
+      restore();
+      appendSystem(
+        tr("panel.could_not_apply_the_update", "Could not apply the update: {error}", {
+          error: err instanceof Error ? err.message : String(err ?? "unknown"),
+        }),
+      );
+    }
+  }
+
+  /**
+   * #1942 — if a newer pack is published (or disk already moved), tell a LOCAL
+   * host session what it fixes and offer install+restart.
+   *
+   * #1944 — remote/tunnelled/mobile clients return before anything is painted.
+   * No badge, no banner, no "install it on the host" copy. The Registry probe
+   * is skipped here too: its result is not persisted, so running it would not
+   * inform the next local session.
+   */
+  async function notifyAvailablePanelUpdate({ force = false } = {}) {
+    try {
+      const hostname = typeof location !== "undefined" ? location.hostname : "";
+      const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+      if (!shouldSurfaceUpdateNotice(readBrowserClientContext({
+        location: typeof location !== "undefined" ? location : undefined,
+        navigator: typeof navigator !== "undefined" ? navigator : undefined,
+      }))) return;
+
+      const probeInstalled = (async () => {
+        if (typeof api?.fetchApi !== "function") return "";
+        const res = await api.fetchApi("/comfyui_mcp_panel/version", { cache: "no-store" });
+        if (!res || !res.ok) return "";
+        const body = await res.json().catch(() => null);
+        return typeof body?.version === "string" ? body.version : "";
+      })();
+      const installed = await Promise.race([
+        probeInstalled,
+        new Promise((resolve) => setTimeout(() => resolve(""), 2000)),
+      ]);
+      const published = await fetchPublishedPanelVersions({
+        fetchImpl: (url, opts) => fetch(url, opts),
+      });
+      const latest = published.latest?.version || "";
+      const state = resolveUpdateState({
+        running: PANEL_VERSION,
+        installed,
+        latest,
+      });
+      const affordance = decideUpdateNoticeAffordance({
+        hostname,
+        userAgent,
+        kind: state.kind,
+      });
+      if (!affordance.surfaceNotice) {
+        updateBadge.hidden = true;
+        return;
+      }
+      if (!force && isDismissed(lsGet(UPDATE_NOTICE_DISMISS_KEY), state.kind, state.targetVersion)) {
+        return;
+      }
+      if (client !== liveBridgeClient || !log.isConnected) return;
+
+      const entries = summarizePendingVersions(published.versions, {
+        from: PANEL_VERSION,
+        to: state.targetVersion,
+        maxEntries: 8,
+      });
+      updateBadge.hidden = false;
+      updateBadge.title =
+        state.kind === "restart"
+          ? tr(
+              "panel.restart_to_load_version",
+              "Restart to load {version}",
+              { version: state.targetVersion },
+            )
+          : tr(
+              "panel.version_is_available",
+              "{version} is available",
+              { version: state.targetVersion },
+            );
+
+      const existing = log.querySelector('[data-testid="panel-update-available"]');
+      if (existing) existing.remove();
+
+      const box = document.createElement("div");
+      box.className = "cmcp-sys cmcp-whatsnew cmcp-update-notice";
+      box.dataset.testid = "panel-update-available";
+      const head = document.createElement("div");
+      head.className = "cmcp-whatsnew-head";
+      head.textContent =
+        state.kind === "restart"
+          ? tr(
+              "panel.this_tab_is_running_but_the_pack_on_disk_is",
+              "This tab is running {running} but the pack on disk is {installed}. Restart ComfyUI to load it.",
+              { running: state.running, installed: state.installed || state.targetVersion },
+            )
+          : tr(
+              "panel.version_available_you_are_on",
+              "Panel {version} is available (you are on {running}).",
+              { version: state.targetVersion, running: state.running },
+            );
+      box.appendChild(head);
+      if (entries.length) {
+        const sub = document.createElement("div");
+        sub.textContent = tr("panel.what_this_update_fixes", "What this update fixes:");
+        box.appendChild(sub);
+        const list = document.createElement("ul");
+        list.className = "cmcp-whatsnew-list";
+        for (const entry of entries) {
+          const li = document.createElement("li");
+          const tag = document.createElement("span");
+          tag.className = "cmcp-whatsnew-tag";
+          tag.textContent = entry.section;
+          li.appendChild(tag);
+          li.appendChild(document.createTextNode(" " + entry.text));
+          list.appendChild(li);
+        }
+        box.appendChild(list);
+      }
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "cmcp-update-actions";
+      // Always the host action when we surface. No inform-without-button path (#1944).
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "cmcp-update-btn";
+      go.dataset.testid = "panel-update-install";
+      go.textContent = affordance.offerInstall
+        ? tr("panel.install_and_restart", "Install and restart")
+        : tr("panel.restart_comfyui", "Restart ComfyUI");
+      go.addEventListener("click", () => {
+        void applyPanelUpdate({ kind: state.kind, button: go });
+      });
+      actionsRow.appendChild(go);
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "cmcp-update-dismiss";
+      dismiss.textContent = tr("panel.dismiss", "Dismiss");
+      dismiss.addEventListener("click", () => {
+        lsSet(UPDATE_NOTICE_DISMISS_KEY, dismissToken(state.kind, state.targetVersion));
+        box.remove();
+        updateBadge.hidden = true;
+      });
+      actionsRow.appendChild(dismiss);
+      box.appendChild(actionsRow);
+      log.appendChild(box);
+      scrollLog();
+    } catch {
+      // A pending-update check is never worth breaking the panel over.
     }
   }
 
@@ -38284,22 +40062,42 @@ function buildPanel() {
     // The agent called panel_open_civitai — open the CivitAI browser pre-seeded
     // with a query + suggested filters so the user can visually pick a resource.
     onOpenCivitai(msg) {
-      openCivitai({
+      const dock = msg.dock !== false;
+      const handle = openCivitai({
         query: typeof msg.query === "string" ? msg.query : "",
         tab: msg.tab,
         filters: msg.filters,
         browsingLevels: msg.browsingLevels,
         // Agent-opened → side-dock by default (chat stays visible) unless the
         // agent explicitly passes dock:false.
-        dock: msg.dock !== false,
+        dock,
       });
-      return { ok: true };
+      // #1958 — echo the applied tab/query/filters/dock the way search already
+      // does. A bare {ok:true} left the agent unable to tell which tab opened
+      // or whether the query landed.
+      try {
+        const st = handle?.civitai?.getState?.();
+        if (st && typeof st === "object") return { ok: true, ...st };
+      } catch { /* fall through to the request echo */ }
+      return {
+        ok: true,
+        tab: msg.tab || "images",
+        query: typeof msg.query === "string" ? msg.query : "",
+        docked: dock,
+      };
     },
     // The agent DRIVES the already-open CivitAI browser tab (switch sub-tab,
     // re-search, read results, glow-highlight). Routes to the unified side-panel
     // handle's civitai facade; throws an honest "civitai browser not open" error
     // (guard here, plus the facade re-checks the active tab).
     onCivitaiCmd(msg) {
+      if (msg.cmd === "civitai_close") return closeSidePanelHandle(_sidePanelHandle);
+      if (msg.cmd === "civitai_read") return readCivitaiPaneHandle(_sidePanelHandle, {
+        limit: msg.limit,
+        includePreview: msg.include_preview === true,
+        blind: AGENT_BLIND,
+      });
+      if (msg.cmd === "civitai_set_dock") return setSidePanelDocked(_sidePanelHandle, msg.docked);
       const h = _sidePanelHandle;
       if (!h) throw new Error("civitai browser not open");
       switch (msg.cmd) {
@@ -38318,6 +40116,8 @@ function buildPanel() {
         openTraining({ dock: msg.dock !== false });
         return { ok: true };
       }
+      if (msg.cmd === "training_close") return closeSidePanelHandle(_sidePanelHandle);
+      if (msg.cmd === "training_set_dock") return setSidePanelDocked(_sidePanelHandle, msg.docked);
       const h = _sidePanelHandle;
       if (!h) throw new Error("training wizard not open");
       switch (msg.cmd) {
@@ -38362,6 +40162,36 @@ function buildPanel() {
       persistThreads();
       setChatSurfaceForCards();
       return { ok: true };
+    },
+    // Inverse of ui_render / show_media: retire live cards so a long session can
+    // shed renderer state (#1952). A named card_id dismisses that A2UI card the
+    // same way the user ✕ does. Omitting it dismisses every live A2UI card and
+    // unloads painted media cards from the live log.
+    onUiDismiss(msg) {
+      const persistRec = (rec) => {
+        if (!rec) return;
+        try { historyStore.touchMessage(rec); persistThreads(); } catch { /* bookkeeping */ }
+      };
+      if (msg.card_id != null && String(msg.card_id).trim() !== "") {
+        const r = dismissLiveA2uiCard(liveA2uiCards, msg.card_id, { removeEl: true });
+        persistRec(r.rec);
+        setChatSurfaceForCards();
+        return { ok: true, dismissed: r.dismissed ? 1 : 0, card_ids: [r.card_id] };
+      }
+      const cards = dismissAllLiveA2uiCards(liveA2uiCards, { removeEl: true });
+      for (const rec of cards.recs) persistRec(rec);
+      if (_activeLightboxClose) {
+        try { _activeLightboxClose(); } catch { /* already gone */ }
+        _activeLightboxClose = null;
+      }
+      const media = unloadChatMediaCards(log);
+      setChatSurfaceForCards();
+      return {
+        ok: true,
+        dismissed: cards.dismissed,
+        card_ids: cards.card_ids,
+        media_unloaded: media.unloaded,
+      };
     },
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
@@ -38882,7 +40712,10 @@ function buildPanel() {
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
       cmcpOauthOnBackendsPush?.();
     },
-    onHelloLanded: noteDedicatedWorkflowHello,
+    onHelloLanded: (ctx) => {
+      tabChannelReadyEpoch = backendReconnectEpoch;
+      noteDedicatedWorkflowHello(ctx);
+    },
     onAck(ack) {
       // In-panel OAuth acks (oauth_begin/oauth_status/oauth_signout) are routed
       // to whichever credentials card is currently open — see
@@ -39110,6 +40943,9 @@ function buildPanel() {
   // #758 — announce an update once the transcript exists to receive it. Deliberately
   // NOT awaited: a release note must never sit in front of the panel becoming usable.
   announcePanelUpdate();
+  // #1942 — and, separately, whether a NEWER pack is sitting unpublished-to-this-tab
+  // on the Registry or already on disk. Same "don't block usability" rule.
+  void notifyAvailablePanelUpdate();
   // #758 — and keep it REACHABLE. The Discord ask was for somewhere to reference what
   // changed; a line in the transcript scrolls away, is cleared with the chat, and is
   // gone entirely if the user was not looking (codex). Settings → About re-paints it on
@@ -40288,15 +42124,25 @@ function buildPanel() {
     const out = d.output || {};
     // ComfyUI groups a node's outputs by kind: `images`, plus `gifs`/`videos` for
     // VHS-style video nodes (e.g. LTX → VHS_VideoCombine). Render each by type so a
-    // video isn't shown as a broken <img>.
-    const media = [...(out.images || []), ...(out.gifs || []), ...(out.videos || [])];
-    if (!media.length) return;
+    // video isn't shown as a broken <img>. CompareFrames (and similar) write
+    // `a_images` / `b_images` instead — those are counted as withheld, never
+    // attached, so a 768-temp dump cannot flood the completion frame (#1934).
+    const {
+      deliverable: media,
+      audio: audioBag,
+      models3d: model3dBag,
+      withheld,
+    } = collectNodeOutputMedia(out);
+    if (!media.length && !audioBag.length && !model3dBag.length && !withheld) return;
     const nodeId = d.node ?? d.display_node ?? null;
     // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
     // refs are EXCLUDED here — the agent can't decode them — and instead get a
     // storyboard delivered asynchronously below.
     const inlineImages = [];
     const videos = [];
+    // #2126 — this run's audio refs. Played in chat, and reported to the agent by
+    // NAME on the completion frame; never added to inlineImages (see below).
+    const audios = [];
     // #1834 — the still cards' cache key: the id the completion frame's probes
     // will bust with, derived the way the tracker derives it. It runs BOTH of
     // the tracker's steps, because either one alone puts the card on a
@@ -40314,6 +42160,10 @@ function buildPanel() {
       const k = d.prompt_id == null ? NO_PROMPT_KEY : String(d.prompt_id);
       return k === NO_PROMPT_KEY ? null : k;
     })();
+    // #2034 — read per completion, not at mount. An unreadable store must not
+    // hide cards (`!== false`); skipping paint skips recordMedia so a suppressed
+    // card is not replayed. Agent-visible buffers below still fill.
+    const chatMediaOn = chatMediaEnabled(getSetting(SETTING_CHAT_MEDIA));
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
@@ -40323,7 +42173,7 @@ function buildPanel() {
         // source decode, and late poster callback all address this render only.
         const storyboardIdentity = createStoryboardIdentity();
         const videoUrl = appendStoryboardCacheBust(url, storyboardIdentity);
-        paintVideo(videoUrl, m.filename);
+        if (chatMediaOn) paintVideo(videoUrl, m.filename);
         // Carry the node id so the deferred storyboard event can name its node,
         // plus the exact URL/identity used by the already-painted card.
         videos.push({ m, nodeId, videoUrl, storyboardIdentity });
@@ -40331,8 +42181,10 @@ function buildPanel() {
         // Played, never painted as an image — and deliberately NOT added to
         // inlineImages: that list is delivered to the agent as inline image
         // blocks, so audio there would be both a broken picture and a claim of
-        // something the agent cannot perceive (#710).
-        paintAudio(url, m.filename);
+        // something the agent cannot perceive (#710). It IS reported by NAME on
+        // the completion frame (#2126), which is the honest half.
+        if (chatMediaOn) paintAudio(url, m.filename);
+        audios.push(m);
       } else {
         // #1834 — THE CARD's URL is the one that has to be unique, not just the
         // metadata probe's. `/view?filename=…` is stable across runs, and a
@@ -40352,9 +42204,21 @@ function buildPanel() {
         // probe could agree with — a key minted here would just make the note
         // describe a different file from the one on screen. Closing it needs a
         // per-run identity threaded through the tracker's buffer and flush.
-        paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
+        if (chatMediaOn) paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
         inlineImages.push(m);
       }
+    }
+    // ComfyUI's own `audio` bag (#2126). SaveAudio / SaveAudioMP3 / SaveAudioOpus /
+    // SaveAudioAdvanced / PreviewAudio all serialise through SavedAudios.as_dict()
+    // — `{ audio: [ {filename, subfolder, type} ] }` — so this one key covers every
+    // core audio output node. Kind is settled by PROVENANCE, not by isAudioOutput:
+    // the bag already said what these are, and a file whose extension that regex
+    // does not list would otherwise fall through to paintImage — #710 on a third
+    // surface. No cache-bust: audio has no poster/probe pair to keep on one URL.
+    for (const m of audioBag) {
+      if (!m || !m.filename) continue;
+      if (chatMediaOn) paintAudio(imageViewUrl(m), m.filename);
+      audios.push(m);
     }
     // Buffer this run's outputs (images AND videos) instead of delivering per
     // node — the tracker flushes them together as ONE completion when the prompt
@@ -40363,13 +42227,32 @@ function buildPanel() {
     // deferred+grouped. Routing videos through the SAME lifecycle (rather than a
     // per-node timer) is what gives a video its real start→finish duration and
     // guarantees exactly one completion per prompt (#269/#468).
-    if (inlineImages.length || videos.length) {
-      runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos });
+    // #2128 — ComfyUI's 3D outputs. SaveGLB reports `{3d:[{filename,subfolder,type}]}`;
+    // Save3DAdvanced / SaveGaussianSplat / SavePointCloud / Preview3D* report a bare
+    // path string inside `{result:[...]}`. collectNodeOutputMedia has already
+    // normalised both to `/view` descriptors. Nothing is painted: a mesh has no chat
+    // widget here, and it must never reach paintImage — that is #710 on a fourth
+    // surface. The agent is told about it by NAME on the completion frame, which is
+    // the half that was missing.
+    const models3d = model3dBag.filter((m) => m && m.filename);
+    if (inlineImages.length || videos.length || audios.length || models3d.length || withheld) {
+      runCompletion.onExecuted(d.prompt_id, {
+        images: inlineImages,
+        videos,
+        audio: audios,
+        models3d,
+        withheld,
+      });
     }
     // #1286 — ComfyUI keys preview images by node id and will plant
     // $$canvas-image-preview on whatever node now holds that id (a freshly
     // added ConditioningConcat after a live-canvas edit). Keep the preview
     // on the emitting image/output node.
+    // Still gated on IMAGE media, deliberately (#2126). This sweep re-homes image
+    // outputs onto `preferNodeId` and records it in the #1374 ownership ledger, so
+    // handing it an audio emitter would attribute image-preview state to a node
+    // that cannot host one. An audio-only `executed` used to return before this
+    // line; keeping it out preserves that exactly.
     if (media.length) {
       stripMisattachedExecutionPreviews({
         graph: app?.graph,

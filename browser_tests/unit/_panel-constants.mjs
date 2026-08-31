@@ -26,6 +26,7 @@ import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-c
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 import { reconcileFreshDynamicWidgets } from "../../web/js/lib/dynamic-widget-reconcile.js";
 import { safeRemoveNode } from "../../web/js/lib/safe-remove-node.js";
+import { ensureControlAfterGenerateQueueHooks } from "../../web/js/lib/control-after-generate.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -104,6 +105,12 @@ export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
   // touching the global node-definition refresh. Harnesses inject their own
   // readiness promise; this default preserves the existing refresh-only cases.
   awaitActiveRouteRegistration: async () => {},
+  // #2026 — the executor snapshots the canvas identity it refreshed. Defaults
+  // keep existing refresh-only harnesses from throwing ReferenceError.
+  liveParseableViewingWitness: () => null,
+  workflowStableUuid: () => null,
+  routeRegistrationReadinessRefusalError: (reason) =>
+    new Error(reason || "route registration not ready"),
 });
 
 /** #1413 — the whole-command deadline `graph_set_widget` takes on its first line. */
@@ -241,6 +248,8 @@ export function addNodeCommandBudgetDeps() {
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
     reconcileFreshDynamicWidgets,
     safeRemoveNode,
+    // #2029 — graph_add_node arms inert control_after_generate combos after graph.add.
+    ensureControlAfterGenerateQueueHooks,
   };
 }
 
@@ -273,5 +282,8 @@ export function setWidgetCommandBudgetDeps() {
     COMBO_REFRESH_NEVER_RAN,
     // #1709 — a live whole-schema widget read retires this shared add-node proof.
     verifiedNodeDefCache: createVerifiedNodeDefCache(),
+    // #2116 — late mutation receipts are panel module state. Harnesses supply a no-op.
+    commandFingerprint: () => "",
+    lateMutationReceipts: { remember() {} },
   };
 }

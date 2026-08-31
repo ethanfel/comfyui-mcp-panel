@@ -34,6 +34,7 @@ import {
   isSubgraphUuidType,
   subgraphTypeIsLoaded,
   subgraphUuidAddRefusal,
+  frontendOnlyNotAllowlistedRefusal,
 } from "../../web/js/lib/node-resolve.js";
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
@@ -532,6 +533,184 @@ test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still s
   assert.equal(set.value, "karras");
   assert.equal(set.promoted_from.inner_node_id, 54);
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+});
+
+test("#366 recurrence: production promoted write selects the host rail after a stale inner projection rebind", async () => {
+  const reg = loadedRegistry();
+  const inner = {
+    id: 13,
+    type: "KSampler",
+    widgets: [{ name: "caption", type: "STRING", value: "old" }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "13" ? inner : null) };
+
+  // During the reported rebind, the input still references the old/link-driven
+  // projection, while the live widget list already contains the host-owned rail.
+  // The two objects deliberately share a display name but have different canonical
+  // widget IDs, so a name/list-order resolver verifies the wrong object.
+  const staleInnerProjection = {
+    name: "caption",
+    widgetId: "root:13:caption",
+    type: "STRING",
+    value: "old",
+  };
+  const parentRail = {
+    name: "caption",
+    widgetId: "root:37:caption",
+    type: "STRING",
+    value: "old",
+  };
+  const displayProxy = {
+    name: "caption",
+    type: "STRING",
+    value: "old",
+  };
+  const hostInput = {
+    name: "caption",
+    widgetId: "root:37:caption",
+    _widget: staleInnerProjection,
+    widget: displayProxy,
+    _subgraphSlot: { name: "caption" },
+  };
+  const parent = {
+    id: 37,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    widgets: [staleInnerProjection, parentRail, displayProxy],
+  };
+  const resolveSource = (_node, input) =>
+    input?.name === "caption" ? { sourceNodeId: "13", sourceWidgetName: "caption" } : null;
+
+  const { set } = await setViaHandler(reg, parent, "caption", "new", resolveSource);
+
+  assert.equal(parentRail.value, "new", "the host-owned rail must receive the write");
+  assert.equal(displayProxy.value, "new", "the identity-linked display projection must receive the write");
+  assert.equal(staleInnerProjection.value, "old", "the stale inner projection must not be selected");
+  assert.equal(set.node_id, 37, "the result must identify the root-scope host node");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.display_widgets_synced, 1);
+  assert.equal(set.promoted_from.value_scope, "instance");
+});
+
+test("#366 recurrence: stale inner _widget is rematerialized into the host-keyed rail through runSetWidget", async () => {
+  const reg = loadedRegistry();
+  const innerWidget = { name: "value", type: "INT", value: 5 };
+  const inner = {
+    id: 136,
+    type: "KSampler",
+    widgets: [innerWidget],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "136" ? inner : null) };
+  const store = { value: 5 };
+  const hostInput = {
+    name: "value_1",
+    label: "duration",
+    widgetId: "root:105:value_1",
+    widget: { name: "value_1" },
+    _widget: innerWidget,
+    _subgraphSlot: { name: "value_1", label: "duration" },
+  };
+  const parent = {
+    id: 105,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    get widgets() {
+      if (!hostInput._widget && hostInput.widgetId) {
+        const rail = {
+          name: "value_1",
+          label: "duration",
+          widgetId: hostInput.widgetId,
+          type: "INT",
+          get value() {
+            return store.value;
+          },
+          set value(next) {
+            store.value = next;
+          },
+        };
+        hostInput._widget = rail;
+      }
+      return hostInput._widget ? [hostInput._widget] : [];
+    },
+  };
+  const resolveSource = (_node, input) =>
+    input?.name === "value_1" ? { sourceNodeId: "136", sourceWidgetName: "value" } : null;
+
+  const { set } = await setViaHandler(reg, parent, "duration", 12, resolveSource);
+
+  assert.equal(store.value, 12, "the host-keyed rail store must receive the write");
+  assert.notEqual(hostInput._widget, innerWidget);
+  assert.equal(innerWidget.value, 5, "the inner Primitive-shaped widget is not the serializing rail");
+  assert.equal(set.node_id, 105);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.value_scope, "instance");
+});
+
+test("#366 recurrence: promoted CLIPTextEncode.text writes the host rail, not the inner converted-to-input clone", async () => {
+  const reg = loadedRegistry();
+  const innerWidget = { name: "text", type: "STRING", value: "old instructional prompt" };
+  const inner = {
+    id: 11,
+    type: "CLIPTextEncode",
+    widgets: [innerWidget],
+    inputs: [{ name: "text", widget: { name: "text" }, type: "STRING", link: 1 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = {
+    _nodes: [inner],
+    inputs: [{ name: "text", linkIds: [1] }],
+    inputNode: { id: -10 },
+    links: { 1: { id: 1, origin_id: -10, origin_slot: 0, target_id: 11, target_slot: 0 } },
+    getNodeById: (id) => (String(id) === "11" ? inner : null),
+  };
+  const innerClone = { name: "text", type: "STRING", value: "old instructional prompt" };
+  const store = { value: "old instructional prompt" };
+  const hostInput = {
+    name: "text",
+    widgetId: "root:22:text",
+    widget: { name: "text" },
+    _widget: innerClone,
+    _subgraphSlot: { name: "text" },
+  };
+  const parent = {
+    id: 22,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    get widgets() {
+      if (!hostInput._widget && hostInput.widgetId) {
+        const rail = {
+          name: "text",
+          widgetId: hostInput.widgetId,
+          type: "STRING",
+          get value() {
+            return store.value;
+          },
+          set value(next) {
+            store.value = next;
+          },
+        };
+        hostInput._widget = rail;
+      }
+      return hostInput._widget ? [hostInput._widget] : [];
+    },
+  };
+  const resolveSource = (_node, input) =>
+    input?.name === "text" ? { sourceNodeId: "11", sourceWidgetName: "text" } : null;
+
+  const { set } = await setViaHandler(reg, parent, "text", "new vertical prompt", resolveSource);
+
+  assert.equal(store.value, "new vertical prompt", "the host-keyed rail store must receive the write");
+  assert.notEqual(hostInput._widget, innerClone);
+  assert.equal(innerWidget.value, "old instructional prompt");
+  assert.equal(innerClone.value, "old instructional prompt");
+  assert.equal(set.node_id, 22);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.value_scope, "instance");
 });
 
 test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", async () => {
@@ -1479,6 +1658,69 @@ test("#1296 add_node: the reload diagnosis is scoped — provenance-bearing husk
       assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
       return true;
     },
+  );
+});
+
+// ---- #1956: a registered frontend-virtual type that is NOT on the addable
+//      allowlist (Bookmark (rgthree)) fails closed — correct — but must not
+//      claim the pack is missing. rgthree is installed; the type is absent
+//      from /object_info BY DESIGN. ------------------------------------------
+
+/** rgthree-style virtual class: base ctor throws on the default title. */
+class BookmarkRgthree {
+  constructor(title = "__NEED_CLASS_TITLE__") {
+    if (title === "__NEED_CLASS_TITLE__") throw new Error("needs overrides");
+    this.title = title;
+    this.isVirtualNode = true;
+  }
+}
+
+test('#1956 add_node: "Bookmark (rgthree)" is refused as frontend-only not-addable, not as a missing pack', async () => {
+  const fresh = objectInfo();
+  const reg = loadedRegistry();
+  reg["Bookmark (rgthree)"] = BookmarkRgthree;
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "Bookmark (rgthree)", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /frontend-only type/);
+      assert.match(err.message, /deliberately not addable/);
+      assert.match(err.message, /Fast Groups Bypasser \(rgthree\)/);
+      assert.match(err.message, /Fast Groups Muter \(rgthree\)/);
+      assert.match(err.message, /Label \(rgthree\)/);
+      assert.match(err.message, /Reroute \(rgthree\)/);
+      assert.match(err.message, /Node Collector \(rgthree\)/);
+      assert.doesNotMatch(err.message, /Unknown node type/);
+      assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+      assert.doesNotMatch(err.message, /failed to import/);
+      assert.doesNotMatch(err.message, /create_workflow \(action:"node_info"\)/);
+      return true;
+    },
+  );
+});
+
+test("#1956 add_node: the not-allowlisted refusal still fails closed — Bookmark is not added", async () => {
+  const msg = frontendOnlyNotAllowlistedRefusal("Bookmark (rgthree)");
+  assert.match(msg, /Cannot add "Bookmark \(rgthree\)"/);
+  assert.match(msg, /deliberately not addable/);
+  assert.doesNotMatch(msg, /Unknown node type|not installed|failed to import/);
+});
+
+test("#1956 add_node: a defless husk WITHOUT isVirtualNode keeps the generic unknown-type refusal", async () => {
+  // The #458 hole stays closed: a leftover class that does not prove virtual
+  // is not re-diagnosed as frontend-only.
+  const fresh = objectInfo();
+  const reg = loadedRegistry([], ["RemovedBackendNode"]);
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "RemovedBackendNode", ADD_OPTS(fresh)),
+    /Unknown node type "RemovedBackendNode"|backend does not provide/i,
+  );
+});
+
+test("#1956 add_node: allowlisted Fast Groups Bypasser stays addable", async () => {
+  const fresh = objectInfo();
+  const reg = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
   );
 });
 

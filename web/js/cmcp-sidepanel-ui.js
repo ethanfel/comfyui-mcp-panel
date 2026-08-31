@@ -18,6 +18,8 @@
 // onActivate(), onDeactivate(), teardown(), escapeBlocked() }`.
 
 import { isImeComposing } from "./lib/ime.js";
+import { closeSidePanelHandle } from "./lib/resident-ui-close.js";
+import { readLiveCivitaiPane } from "./lib/pane-read.js";
 import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
@@ -216,8 +218,9 @@ export function openSidePanel(ctx = {}, opts = {}) {
 
   // ── docked mode ─────────────────────────────────────────────────────────────
   applyDock.centered = false;
+  let dockEnabled = !!opts.dock;
   function applyDock() {
-    if (!opts.dock) { setCentered(); return; }
+    if (!dockEnabled) { setCentered(); return; }
     const geo = _dockGeometry();
     if (geo?.status === "detached") { overlay.style.display = "none"; return; }
     overlay.style.display = "";
@@ -336,7 +339,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
 
   // ── go: mount the initial tab, then wire the dock + slide-in ──────────────────
   activate(initialKey);
-  if (opts.dock) {
+  if (dockEnabled) {
     applyDock();
     if (typeof ctx.watchDock === "function") {
       try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
@@ -353,6 +356,62 @@ export function openSidePanel(ctx = {}, opts = {}) {
     }
     return c.drive[method](...args);
   }
+  // close() is the WHOLE panel, not the active tab: training/civitai content
+  // stays resident in `contents` until the shell tears down. Gating close on
+  // the active tab (via _driveOf) would leave the other surface's grids/polls
+  // in the renderer — the accumulation #1952/#1960 exist to shed.
+  const closeResident = () => closeSidePanelHandle({
+    close,
+    isOpen: () => isOpen,
+    activeTab: () => activeKey,
+  });
+  // Dock mode is the SHELL's, not the active tab's. A tab-gated undock would
+  // refuse while Training is showing — the same accumulation trap close
+  // already refuses to walk into.
+  const setDocked = (docked) => {
+    if (!isOpen) return { ok: true, open: false, changed: false, docked: false, tab: null };
+    const want = !!docked;
+    const was = shell.isDocked();
+    dockEnabled = want;
+    if (want) {
+      applyDock();
+      overlay.classList.add("cmcp-dock-in");
+    } else {
+      setCentered();
+      overlay.classList.add("cmcp-dock-in");
+    }
+    const now = shell.isDocked();
+    return {
+      ok: true,
+      open: true,
+      changed: was !== now,
+      docked: now,
+      centered: shell.isCentered(),
+      tab: activeKey,
+    };
+  };
+  const readCivitai = (opts = {}) => {
+    const c = contents.get("civitai");
+    const showing = isOpen && activeKey === "civitai";
+    if (c && c.drive && typeof c.drive.read === "function") {
+      return c.drive.read({
+        ...opts,
+        open: isOpen,
+        showing,
+        shellTab: activeKey,
+      });
+    }
+    return readLiveCivitaiPane({
+      open: isOpen,
+      showing: false,
+      shellTab: activeKey,
+      docked: shell.isDocked(),
+      limit: opts.limit,
+      includePreview: opts.includePreview === true,
+      blind: opts.blind === true,
+      createElement: opts.createElement,
+    });
+  };
   const civitai = {
     getResults: (a) => _driveOf("civitai", "civitai browser not open", "getResults", [a]),
     highlight: (ids, o) => _driveOf("civitai", "civitai browser not open", "highlight", [ids, o]),
@@ -361,6 +420,8 @@ export function openSidePanel(ctx = {}, opts = {}) {
     search: (a) => _driveOf("civitai", "civitai browser not open", "search", [a]),
     openLightbox: (id, o) => _driveOf("civitai", "civitai browser not open", "openLightbox", [id, o]),
     getState: () => _driveOf("civitai", "civitai browser not open", "getState", []),
+    read: (o) => readCivitai(o),
+    close: closeResident,
   };
   const training = {
     getState: () => _driveOf("training", "training wizard not open", "getState", []),
@@ -369,12 +430,16 @@ export function openSidePanel(ctx = {}, opts = {}) {
     setTarget: (t) => _driveOf("training", "training wizard not open", "setTarget", [t]),
     highlight: (r) => _driveOf("training", "training wizard not open", "highlight", [r]),
     clearHighlight: () => _driveOf("training", "training wizard not open", "clearHighlight", []),
+    close: closeResident,
   };
 
   return {
     close,
     isOpen: () => isOpen,
     activeTab: () => activeKey,
+    isDocked: () => shell.isDocked(),
+    setDocked,
+    readCivitai,
     focus: () => { try { if (searchEl.style.display !== "none") searchEl.focus(); } catch { /* detached */ } },
     // RunPod status frames → re-render the active content (no-op unless Local).
     update: () => { const c = contents.get(activeKey); if (c && typeof c.update === "function") { try { c.update(); } catch { /* ignore */ } } },

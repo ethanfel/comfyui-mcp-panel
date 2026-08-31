@@ -3,6 +3,24 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
 import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
+import { classifyLtxTimelineWrite, applyLtxTimelineWrite, derivedTimelineRefusal } from "../../web/js/lib/ltx-director.js";
+import {
+  classifyPromptRelayTimelineWrite,
+  applyPromptRelayTimelineWrite,
+  promptRelayDerivedRefusal,
+} from "../../web/js/lib/prompt-relay-timeline.js";
+import { classifyRgthreeFastGroupsWrite, rgthreeFastGroupsRefusal } from "../../web/js/lib/rgthree-fast-groups.js";
+import {
+  classifyIdeogram4PromptBuilderWrite,
+  applyIdeogram4PromptBuilderWrite,
+  ideogram4PromptBuilderRefusal,
+} from "../../web/js/lib/ideogram4-prompt-builder.js";
+import {
+  classifyMiniMaxH3PromptBuilderWrite,
+  applyMiniMaxH3PromptBuilderWrite,
+} from "../../web/js/lib/minimax-h3-prompt-builder.js";
+import { classifyMiniMaxH3DirectorWrite, miniMaxH3DirectorPromptRefusal } from "../../web/js/lib/minimax-h3-director.js";
 
 // This tree is CRLF; CI checks out LF. Every source pin below anchors on a BLANK LINE,
 // and a literal two-newline anchor never matches a CRLF blank line — so these four fence
@@ -46,6 +64,79 @@ function extractShippingMethod(signature) {
   throw new Error(`unterminated method: ${signature}`);
 }
 
+function extractTargetFenceProperty() {
+  const start = PANEL_SRC.indexOf("const assertGraphSetWidgetTargetStillCurrent = () => {");
+  const end = PANEL_SRC.indexOf("\n    // #314:", start);
+  assert.ok(start >= 0 && end > start, "production graph_set_widget fence not found");
+  const bodyStart = PANEL_SRC.indexOf("{", start) + 1;
+  const bodyEnd = PANEL_SRC.lastIndexOf("\n    };", end);
+  assert.ok(bodyStart > 0 && bodyEnd > bodyStart, "production graph_set_widget fence body not found");
+  return `assertTargetStillCurrent: () => {${PANEL_SRC.slice(bodyStart, bodyEnd)}\n      }`;
+}
+
+function makeProductionTargetFence({ node, graph, expectedNodeType, expectedNodeIdentity }) {
+  const fenceProperty = extractTargetFenceProperty();
+  const makeFence = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "assertActiveWorkflowCommandTarget",
+    "assertExpectedPromotedScope",
+    "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
+      const enforceDeferredExpected = defer_replay === true;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
+    };`,
+  );
+  let liveTarget = node;
+  const fence = makeFence(
+    () => ({ graph, rootGraph: graph }),
+    () => liveTarget,
+    () => {},
+    () => {},
+    "workflow_uuid",
+    nodeInstanceIdentity,
+  )(node.id, expectedNodeType, undefined, undefined, node, undefined, expectedNodeIdentity);
+  return {
+    fence,
+    replaceNode: (replacement) => {
+      liveTarget = replacement;
+    },
+  };
+}
+
+function makeProductionCustomRoute() {
+  const start = PANEL_SRC.indexOf("    const ltxKind = classifyLtxTimelineWrite(node, widget);");
+  const end = PANEL_SRC.indexOf("    // #458:", start);
+  assert.ok(start >= 0 && end > start, "production custom graph_set_widget routes not found");
+  return new Function(
+    "node",
+    "widget",
+    "value",
+    "builder_state",
+    "graph",
+    "assertGraphSetWidgetTargetStillCurrent",
+    "classifyLtxTimelineWrite",
+    "applyLtxTimelineWrite",
+    "derivedTimelineRefusal",
+    "classifyPromptRelayTimelineWrite",
+    "applyPromptRelayTimelineWrite",
+    "promptRelayDerivedRefusal",
+    "classifyRgthreeFastGroupsWrite",
+    "rgthreeFastGroupsRefusal",
+    "classifyIdeogram4PromptBuilderWrite",
+    "applyIdeogram4PromptBuilderWrite",
+    "ideogram4PromptBuilderRefusal",
+    "classifyMiniMaxH3PromptBuilderWrite",
+    "applyMiniMaxH3PromptBuilderWrite",
+    "classifyMiniMaxH3DirectorWrite",
+    "miniMaxH3DirectorPromptRefusal",
+    `return async function runCustomRoute() {
+      ${PANEL_SRC.slice(start, end)}
+    };`,
+  );
+}
+
 test("graph_set_widget enforces expected_node_type at the synchronous write boundary", () => {
   const start = PANEL_SRC.indexOf("async graph_set_widget({");
   const end = PANEL_SRC.indexOf("\n  // artokun/comfyui-mcp#938", start);
@@ -56,29 +147,234 @@ test("graph_set_widget enforces expected_node_type at the synchronous write boun
   const expectedArg = handler.indexOf("expected_node_type");
   const targetCheck = handler.indexOf("liveTarget.type !== expected_node_type");
   const identityCheck = handler.indexOf("liveTarget !== node");
+  const expectedIdentity = handler.indexOf("expected_node_identity");
+  const identityWitnessCheck = handler.indexOf("nodeInstanceIdentity(liveTarget)");
   const runSet = handler.indexOf("runSetWidget(node, widget, value, setWidgetOpts)");
   assert.ok(expectedArg >= 0, "handler does not accept expected_node_type");
   assert.ok(targetCheck >= 0, "handler does not verify the live target type");
+  assert.ok(expectedIdentity >= 0, "handler does not accept expected_node_identity");
+  assert.ok(identityWitnessCheck >= 0, "handler does not verify the live node identity");
   assert.ok(identityCheck >= 0, "handler does not reject a same-type replacement object");
   assert.ok(runSet > targetCheck, "target type must be checked before runSetWidget");
+  assert.ok(runSet > identityWitnessCheck, "target identity must be checked before runSetWidget");
   assert.ok(runSet > identityCheck, "target identity must be checked before runSetWidget");
 });
 
+test("node detail identity is panel-owned, stable per object, and changes on replacement", () => {
+  const original = { id: 78, type: "OrdinaryNode", node_identity: "forged" };
+  const replacement = { id: 78, type: "OrdinaryNode", node_identity: "forged" };
+  const first = nodeInstanceIdentity(original);
+  assert.match(first, /^node-incarnation:/);
+  assert.equal(nodeInstanceIdentity(original), first);
+  assert.notEqual(nodeInstanceIdentity(replacement), first);
+  assert.equal(nodeInstanceIdentity(null), null);
+  assert.equal(nodeInstanceIdentity("not a node"), null);
+});
+
+test("structured production projections carry the same node identity witness", () => {
+  const summaryStart = PANEL_SRC.indexOf("function summarizeNode(node) {");
+  const summaryEnd = PANEL_SRC.indexOf("function nodeDescription(node)", summaryStart);
+  assert.ok(summaryStart >= 0 && summaryEnd > summaryStart, "production node summarizer not found");
+  const summary = PANEL_SRC.slice(summaryStart, summaryEnd);
+  assert.match(summary, /nodeInstanceIdentity\(node\)/);
+  assert.match(summary, /node_identity/);
+  assert.match(PANEL_SRC, /nodes: inner\.slice\(0, MAX_STATE_NODES\)\.map\(summarizeNode\)/);
+  assert.match(PANEL_SRC, /capSummaryWidgets\(summarizeNode\(n\)/);
+});
+
+test("the command bridge forwards the complete identity-bearing message to the production executor", () => {
+  const dispatchStart = PANEL_SRC.indexOf("const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];");
+  const dispatchEnd = PANEL_SRC.indexOf("result = await executor(msg);", dispatchStart);
+  assert.ok(dispatchStart >= 0 && dispatchEnd > dispatchStart, "production command bridge dispatch not found");
+  assert.match(PANEL_SRC.slice(dispatchStart, dispatchEnd + "result = await executor(msg);".length), /executor\(msg\)/);
+});
+
+test("#2478 every custom mutation route fences a same-ID same-type replacement before mutation", async () => {
+  const runCustomRoute = makeProductionCustomRoute();
+  const promptRelayTimeline = { segments: [{ prompt: "old", length: 24, color: "#fff" }] };
+  const minimaxState = {
+    version: 1,
+    mode: "T2VA",
+    off: {},
+    duration: 5,
+    p2Shot: 1,
+    lastShot: 1,
+    imd: "old",
+    soundscape: "",
+    music: "N/A",
+    ref: {
+      subjectDefs: [],
+      summaryTypes: ["reference generation"],
+      summaryText: "",
+      retention: [],
+      styleLine: "",
+      detail: "",
+      soundscape: "",
+      music: "N/A",
+    },
+  };
+  const cases = [
+    {
+      label: "LTXDirector",
+      widget: "timeline_data",
+      value: { segments: [{ start: 0, length: 24, prompt: "new", type: "text" }] },
+      makeNode: () => {
+        const node = {
+          id: 7,
+          type: "LTXDirector",
+          _timelineEditor: {
+            timelineDataWidget: { value: JSON.stringify({ segments: [{ start: 0, length: 24, prompt: "old", type: "text" }] }) },
+            _applyLoadedTimeline() {
+              throw new Error("custom mutation was reached");
+            },
+          },
+        };
+        return node;
+      },
+    },
+    {
+      label: "PromptRelayEncodeTimeline",
+      widget: "timeline_data",
+      value: { segments: [{ prompt: "new", length: 24, color: "#fff" }] },
+      makeNode: () => ({
+        id: 7,
+        type: "PromptRelayEncodeTimeline",
+        widgets: [
+          { name: "timeline_data", value: JSON.stringify(promptRelayTimeline) },
+          { name: "local_prompts", value: "old" },
+          { name: "segment_lengths", value: "24" },
+        ],
+      }),
+    },
+    {
+      label: "Ideogram4PromptBuilderKJ",
+      widget: "elements_data",
+      value: [{ x: 0.1, y: 0.2, w: 0.3, h: 0.4, type: "text", text: "new", desc: "new region", palette: ["#abc"] }],
+      makeNode: () => {
+        const currentBoxes = [{ x: 0, y: 0, w: 0.2, h: 0.2, type: "obj", text: "", desc: "old", palette: [] }];
+        const node = {
+          id: 7,
+          type: "Ideogram4PromptBuilderKJ",
+          _boxes: currentBoxes,
+          widgets: [],
+        };
+        node.widgets.push({
+          name: "elements_data",
+          value: JSON.stringify(currentBoxes),
+          serializeValue: () => JSON.stringify(node._boxes),
+        });
+        node.onExecuted = () => {
+          throw new Error("custom mutation was reached");
+        };
+        return node;
+      },
+    },
+    {
+      label: "MiniMaxH3PromptBuilder",
+      widget: "prompt_text",
+      value: "new prompt",
+      makeNode: () => ({
+        id: 7,
+        type: "MiniMaxH3PromptBuilder",
+        widgets: [
+          { name: "prompt_text", value: "old prompt" },
+          { name: "builder_state", value: JSON.stringify(minimaxState) },
+        ],
+      }),
+    },
+  ];
+
+  for (const item of cases) {
+    const node = item.makeNode();
+    const replacement = { id: node.id, type: node.type, widgets: [] };
+    const graph = {
+      beforeChange() {
+        fence.replaceNode(replacement);
+      },
+      afterChange() {},
+      setDirtyCanvas() {},
+    };
+    const fence = makeProductionTargetFence({
+      node,
+      graph,
+      expectedNodeType: node.type,
+      expectedNodeIdentity: nodeInstanceIdentity(node),
+    });
+    await assert.rejects(
+      runCustomRoute(
+        node,
+        item.widget,
+        item.value,
+        undefined,
+        graph,
+        fence.fence,
+        classifyLtxTimelineWrite,
+        applyLtxTimelineWrite,
+        derivedTimelineRefusal,
+        classifyPromptRelayTimelineWrite,
+        applyPromptRelayTimelineWrite,
+        promptRelayDerivedRefusal,
+        classifyRgthreeFastGroupsWrite,
+        rgthreeFastGroupsRefusal,
+        classifyIdeogram4PromptBuilderWrite,
+        applyIdeogram4PromptBuilderWrite,
+        ideogram4PromptBuilderRefusal,
+        classifyMiniMaxH3PromptBuilderWrite,
+        applyMiniMaxH3PromptBuilderWrite,
+        classifyMiniMaxH3DirectorWrite,
+        miniMaxH3DirectorPromptRefusal,
+      ),
+      /target (?:identity )?changed before dispatch/,
+      item.label,
+    );
+    assert.equal(node.id, replacement.id, `${item.label} node remains addressable`);
+    assert.equal(node.type, replacement.type, `${item.label} replacement used the same type`);
+  }
+});
+
+test("the production write fence accepts legacy writes, rejects missing-shape identities, and blocks same-type reuse", () => {
+  const fenceProperty = extractTargetFenceProperty();
+  const makeFence = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "assertActiveWorkflowCommandTarget",
+    "assertExpectedPromotedScope",
+    "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
+      const enforceDeferredExpected = defer_replay === true;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
+    };`,
+  );
+  const original = { id: 78, type: "OrdinaryNode" };
+  let liveTarget = original;
+  const make = (identity) =>
+    makeFence(
+      () => ({ graph: {} }),
+      () => liveTarget,
+      () => {},
+      () => {},
+      "workflow_uuid",
+      nodeInstanceIdentity,
+    )(78, undefined, undefined, undefined, original, undefined, identity);
+
+  const run = (identity) => make(identity)();
+  assert.doesNotThrow(() => run(undefined), "omitting the optional field preserves legacy writes");
+  assert.throws(() => run(""), /expected_node_identity must be a non-empty string/);
+  assert.throws(() => run(42), /expected_node_identity must be a non-empty string/);
+  const identity = nodeInstanceIdentity(original);
+  assert.doesNotThrow(() => run(identity));
+  liveTarget = { id: 78, type: "OrdinaryNode" };
+  assert.throws(() => run(identity), /target identity changed before dispatch/);
+});
+
 test("the shipped target fence rejects replacement objects and preserves qualified ids", () => {
-  const start = PANEL_SRC.indexOf("async graph_set_widget({");
-  const end = PANEL_SRC.indexOf("\n  // artokun/comfyui-mcp#938", start);
-  const handler = PANEL_SRC.slice(start, end);
-  const fenceStart = handler.indexOf("assertTargetStillCurrent: () => {");
-  const fenceTail = handler.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
-  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
-  assert.ok(fenceStart >= 0, "production target fence not found");
-  assert.ok(fenceEnd > fenceStart, "production target fence boundary not found");
-  const fenceProperty = handler.slice(fenceStart, fenceEnd) + "\n      }";
+  const fenceProperty = extractTargetFenceProperty();
 
   const original = { id: 7, type: "OtherLoraLoader" };
   let liveTarget = original;
   let resolvedId;
-  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
       return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`;
@@ -90,6 +386,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
     factorySource,
     );
   } catch (err) {
@@ -104,6 +401,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
     () => {},
     () => {},
     "workflow_uuid",
+    nodeInstanceIdentity,
   )("7:subgraph", "OtherLoraLoader", undefined, undefined, original, undefined);
 
   fence();
@@ -118,7 +416,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
 
 test("#2314 production scope fence refuses receiver navigation after graph_query reply", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0, "production promoted-scope helper not found");
   assert.ok(helperEnd > helperStart, "production promoted-scope helper boundary not found");
   const helperSource = PANEL_SRC.slice(helperStart, helperEnd);
@@ -142,12 +440,10 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
   let writes = 0;
   let liveTarget = { id: 76, type: "OrdinaryNode" };
   const currentCtx = () => ({ graph: currentGraph, rootGraph });
-  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+  const fenceProperty = extractTargetFenceProperty();
+  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
-      return ({ ${PANEL_SRC.slice(
-        PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", PANEL_SRC.indexOf("async graph_set_widget({")),
-        PANEL_SRC.indexOf("\n      // Stale-combo retry", PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", PANEL_SRC.indexOf("async graph_set_widget({"))),
-      )} }).assertTargetStillCurrent;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`;
   const makeFence = new Function(
     "getGraphCtx",
@@ -155,6 +451,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
     factorySource,
   );
   const fence = makeFence(
@@ -163,6 +460,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
     () => {},
     assertScope,
     "workflow_uuid",
+    nodeInstanceIdentity,
   )(
     76,
     "OrdinaryNode",
@@ -202,7 +500,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
 
 test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a parent-rail relink", async () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
   const promotionStart = PANEL_SRC.indexOf("function resolveSubgraphLink(");
   const promotionEnd = PANEL_SRC.indexOf("\nfunction findPromotedHostInput", promotionStart);
@@ -294,19 +592,15 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
   const enterReply = await enter({ node_id: 78 });
   assert.equal(enterReply.settled, true, "the production enter path must settle on the child graph");
 
-  const handlerStart = PANEL_SRC.indexOf("async graph_set_widget({");
-  const fenceStart = PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", handlerStart);
-  const fenceTail = PANEL_SRC.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
-  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
-  assert.ok(fenceStart >= 0 && fenceEnd > fenceStart, "production graph_set_widget fence not found");
-  const fenceProperty = PANEL_SRC.slice(fenceStart, fenceEnd) + "\n      }";
+  const fenceProperty = extractTargetFenceProperty();
   const makeFence = new Function(
     "getGraphCtx",
     "resolveNode",
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
-    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
       return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`,
@@ -329,6 +623,7 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
     () => {},
     assertScope(describeActiveGraph, findSubgraphOwner, resolvePromotedInnerTarget, sourceForSubgraphInput),
     "workflow_uuid",
+    nodeInstanceIdentity,
   )(76, "PrimitiveStringMultiline", "workflow-a", expectedScope, inner, undefined);
 
   assert.doesNotThrow(() => fence(), "the entered, still-authoritative promotion is writable");
@@ -346,7 +641,7 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
 
 test("#2314 same owner id in a different graph is refused at the shipped fence", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   const helperSource = PANEL_SRC.slice(helperStart, helperEnd);
   const assertScope = new Function(
     "describeActiveGraph",
@@ -378,7 +673,7 @@ test("#2314 same owner id in a different graph is refused at the shipped fence",
 
 test("#2314 terminal endpoint is part of the shipped receiver fence", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
   const assertScope = new Function(
     "describeActiveGraph",
@@ -427,5 +722,188 @@ test("#2314 terminal endpoint is part of the shipped receiver fence", () => {
   assert.throws(
     () => assertScope(current, expected),
     /could not verify the terminal promotion endpoint/,
+  );
+});
+
+function loadPromotedScopeHelper() {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
+  return PANEL_SRC.slice(helperStart, helperEnd);
+}
+
+test("#1925 verified-stable root dispatches a promoted write on a subgraph instance", () => {
+  const childGraph = { name: "Video Generation" };
+  const wrapper = { id: 340, subgraph: childGraph, widgets: [], title: "LTX" };
+  const rootGraph = { _nodes: [wrapper], name: "root" };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    (graph) =>
+      graph === childGraph
+        ? {
+            scope: "subgraph",
+            owner_node_id: 340,
+            workflow_uuid: "workflow-a",
+            graph_identity: "graph:child",
+          }
+        : { scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" },
+    (_root, graph) => (graph === childGraph ? { id: 340, node: wrapper } : null),
+  );
+
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 340,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:child",
+  };
+  assert.doesNotThrow(
+    () => assertScope({ graph: rootGraph, rootGraph }, expected),
+    "a verified-stable root must dispatch a promoted write aimed at a root-visible subgraph instance",
+  );
+});
+
+test("#1925 root expected_scope matches the live root graph identity", () => {
+  const wrapper = { id: 92, subgraph: { name: "klein" }, widgets: [] };
+  const rootGraph = { _nodes: [wrapper] };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    () => ({ scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" }),
+    () => null,
+  );
+  assert.doesNotThrow(() =>
+    assertScope({ graph: rootGraph, rootGraph }, {
+      scope: "root",
+      owner_node_id: 92,
+      workflow_uuid: "workflow-a",
+      graph_identity: "graph:root",
+    }),
+  );
+  assert.throws(
+    () =>
+      assertScope({ graph: rootGraph, rootGraph }, {
+        scope: "root",
+        owner_node_id: 92,
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:other-root",
+      }),
+    /expected root graph graph:other-root/,
+  );
+  assert.doesNotMatch(
+    (() => {
+      try {
+        assertScope({ graph: rootGraph, rootGraph }, {
+          scope: "root",
+          owner_node_id: 92,
+          workflow_uuid: "workflow-a",
+          graph_identity: "graph:other-root",
+        });
+        return "";
+      } catch (err) {
+        return String(err.message);
+      }
+    })(),
+    /unverifiable/,
+    "a mismatched but readable root must name the live identity, not 'unverifiable'",
+  );
+});
+
+test("#1925 a verified-stable root still refuses when the subgraph instance is gone", () => {
+  const rootGraph = { _nodes: [{ id: 1, type: "SaveVideo" }] };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    () => ({ scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" }),
+    () => null,
+  );
+  assert.throws(
+    () =>
+      assertScope({ graph: rootGraph, rootGraph }, {
+        scope: "subgraph",
+        owner_node_id: 340,
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:child",
+      }),
+    /expected subgraph instance owner 340/,
+  );
+});
+
+test("#1925 parent-rail check resolves the wrapper on the live root", () => {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const promotionStart = PANEL_SRC.indexOf("function resolveSubgraphLink(");
+  const promotionEnd = PANEL_SRC.indexOf("\nfunction findPromotedHostInput", promotionStart);
+  const sourceForSubgraphInput = new Function(
+    `${PANEL_SRC.slice(promotionStart, promotionEnd)}; return sourceForSubgraphInput;`,
+  )();
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    "resolvePromotedInnerTarget",
+    "sourceForSubgraphInput",
+    `${PANEL_SRC.slice(helperStart, helperEnd)}; return assertExpectedPromotedScope;`,
+  );
+
+  const rail = { name: "value_5", value: true };
+  const innerWidget = { name: "value", value: true };
+  const innerInput = { name: "value", widget: { name: "value" } };
+  const inner = {
+    id: 12,
+    type: "PrimitiveBoolean",
+    inputs: [innerInput],
+    widgets: [innerWidget],
+  };
+  const childGraph = {
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === "12" ? inner : null),
+    getLink: (id) => (id === 1 ? { origin_id: 12, target_id: 12, target_slot: 0 } : null),
+  };
+  const hostInput = {
+    name: "value_5",
+    widget: rail,
+    _widget: rail,
+    widgetId: "root:340:value_5",
+    _subgraphSlot: { name: "value_5", linkIds: [1] },
+  };
+  const wrapper = { id: 340, widgets: [rail], inputs: [hostInput], subgraph: childGraph };
+  const rootGraph = { _nodes: [wrapper] };
+  const describeActiveGraph = () => ({
+    scope: "root",
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:root",
+  });
+  const fence = assertScope(
+    describeActiveGraph,
+    findSubgraphOwner,
+    resolvePromotedInnerTarget,
+    sourceForSubgraphInput,
+  );
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 340,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:child",
+    promoted_widget: "value_5",
+    parent_rail: {
+      authoritative: true,
+      widget: "value_5",
+      widget_id: "root:340:value_5",
+    },
+  };
+  assert.doesNotThrow(
+    () => fence({ graph: rootGraph, rootGraph }, expected),
+    "the root-visible wrapper's promoted rail must be writable without entering",
+  );
+  hostInput.link = 99;
+  assert.throws(
+    () => fence({ graph: rootGraph, rootGraph }, expected),
+    /promoted parent rail changed or became unverifiable/,
   );
 });

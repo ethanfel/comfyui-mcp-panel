@@ -32,12 +32,127 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 // timeout helper is how this repo keeps producing near-duplicate bugs (bounded-step's
 // own header), so there is not one.
 import { withTimeout } from "./bounded-step.js";
+import { scrubSecretShapedText } from "./http-failure.js";
+import { installQueuePromptScopeAdapter } from "./queue-prompt-scope-adapter.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
 // own property, so a shadowed one could throw before the original ran; this
 // reads nothing off the target at call time.
 const rawApply = Reflect.apply;
+
+const QUEUE_PROMPT_ERROR_PREFIX = "app.queuePrompt failed:\n";
+const QUEUE_PROMPT_ERROR_MESSAGE_MAX = 4096;
+const QUEUE_PROMPT_ERROR_DETAIL_MAX =
+  QUEUE_PROMPT_ERROR_MESSAGE_MAX - QUEUE_PROMPT_ERROR_PREFIX.length;
+const QUEUE_PROMPT_ERROR_TRUNCATION = "\n… [browser stack truncated]";
+const objectToString = Object.prototype.toString;
+const hasOwn = Object.prototype.hasOwnProperty;
+const getPrototypeOf = Object.getPrototypeOf;
+const toStringTag = Symbol.toStringTag;
+const stackProperty = "stack";
+const BROWSER_ERROR_PROTO_MAX = 32;
+
+// `instanceof Error` rejects an Error created by the browser realm when this
+// module runs in another realm. The object tag keeps that existing browser
+// behaviour; the prototype walk rejects inherited toStringTag spoofs while
+// remaining behind the object-tag check for ordinary hostile values.
+function isBrowserError(value) {
+  try {
+    // Object.prototype.toString gives objects control over this result through
+    // Symbol.toStringTag. A thrown structured value can therefore impersonate
+    // an Error unless its own tag is excluded before relying on the cross-realm
+    // brand check. Ordinary same- and cross-realm Errors do not define an own
+    // toStringTag and continue through to the existing decoration path.
+    if (hasOwn.call(value, toStringTag)) return false;
+    if (objectToString.call(value) !== "[object Error]") return false;
+
+    // A spoof can put the tag on a custom prototype instead of the thrown
+    // object itself. Genuine Error prototype chains do not define it, so
+    // reject any candidate that does. Proxies can return themselves or an
+    // unbounded stream of fresh objects from getPrototypeOf; bound both cases
+    // so classification remains synchronous and fail-closed.
+    const seen = new WeakSet([value]);
+    let prototype = getPrototypeOf(value);
+    for (let depth = 0; prototype !== null && depth < BROWSER_ERROR_PROTO_MAX; depth += 1) {
+      if (seen.has(prototype)) return false;
+      seen.add(prototype);
+      if (hasOwn.call(prototype, toStringTag)) return false;
+      prototype = getPrototypeOf(prototype);
+    }
+    if (prototype !== null) return false;
+
+    // JavaScript has no standard Proxy detector, and a Proxy can synthesize
+    // Symbol.toStringTag dynamically without exposing that tag through its
+    // own/prototype descriptors. Native browser Error instances do expose an
+    // own stack slot, including the cross-realm Errors this classifier exists
+    // to support. Requiring that independent witness keeps a finite tag-only
+    // Proxy fail-closed instead of replacing the thrown value and losing its
+    // identity/message surface.
+    return hasOwn.call(value, stackProperty);
+  } catch {
+    return false;
+  }
+}
+
+function formatQueuePromptStack(stack) {
+  const truncated = stack.length > QUEUE_PROMPT_ERROR_DETAIL_MAX;
+  const raw = truncated
+    ? `${stack.slice(0, QUEUE_PROMPT_ERROR_DETAIL_MAX - QUEUE_PROMPT_ERROR_TRUNCATION.length)}${QUEUE_PROMPT_ERROR_TRUNCATION}`
+    : stack;
+  // Keep stack newlines for source readability, but do not carry control bytes
+  // into the bridge. Redaction runs only after the bounded slice.
+  const clean = raw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ");
+  const redacted = scrubSecretShapedText(clean);
+  return redacted.length <= QUEUE_PROMPT_ERROR_DETAIL_MAX
+    ? redacted
+    : `${redacted.slice(0, QUEUE_PROMPT_ERROR_DETAIL_MAX - 1)}…`;
+}
+
+/**
+ * #248 — Preserve the browser-side source context when the frontend's queue
+ * wrapper throws. The bridge serializes an executor failure from `message`,
+ * not `stack`, so passing the original Error through loses the extension URL
+ * and line that identify the broken graph serializer. Keep a bounded, redacted
+ * browser stack inside the message for both synchronous throws and rejected
+ * promises.
+ */
+function queuePromptFailureError(error) {
+  // Preserve JavaScript's existing contract for non-Error throws (including
+  // `throw undefined`) and values whose object surface is hostile. In
+  // particular, a frontend can throw a structured non-Error with its own
+  // readable `message` and `stack`; wrapping it would discard that object's
+  // identity and hand the bridge a different message surface.
+  if (error === null || typeof error !== "object" || !isBrowserError(error)) return error;
+  let stack;
+  try {
+    // Some browser Error-like objects expose a hostile or non-string stack
+    // value. Keep native string stacks verbatim; never interpolate arbitrary
+    // values because Symbol() and throwing coercers can mask the queue error.
+    stack = error.stack;
+  } catch {
+    // A throwing stack accessor means the original value is the only safe one.
+    return error;
+  }
+  // A non-string or absent stack is left for the bridge's ordinary message
+  // serializer; there is no safe browser context to add here.
+  if (typeof stack !== "string" || !stack) return error;
+  return new Error(`${QUEUE_PROMPT_ERROR_PREFIX}${formatQueuePromptStack(stack)}`);
+}
+
+/** Invoke the live frontend queue while preserving its browser diagnostics. */
+export function invokeQueuePromptWithBrowserStack(app, ...args) {
+  let result;
+  try {
+    result = app.queuePrompt(...args);
+  } catch (error) {
+    return Promise.reject(queuePromptFailureError(error));
+  }
+  return Promise.resolve(result).catch((error) => {
+    throw queuePromptFailureError(error);
+  });
+}
+
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -782,6 +897,51 @@ function sameSet(a, b) {
 }
 
 /**
+ * IDs a queue item or a wrapped options object is already carrying.
+ *
+ * Frontend 1.49.6 stores `queueNodeIds` as a NodeExecutionId[] on the pending
+ * item. A wrapper that forwards the third argument verbatim can instead leave
+ * the store/API options object in that slot (or in `partial_execution_targets`).
+ * Those are the same IDs in another layer's shape, not a different request.
+ *
+ * @param {unknown} raw
+ * @returns {string[]|null}
+ */
+export function queueItemScopeIds(raw) {
+  if (Array.isArray(raw) && raw.length) return raw.map(String);
+  if (!raw || typeof raw !== "object") return null;
+  if (Array.isArray(raw.queueNodeIds) && raw.queueNodeIds.length) {
+    return raw.queueNodeIds.map(String);
+  }
+  if (Array.isArray(raw.partialExecutionTargets) && raw.partialExecutionTargets.length) {
+    return raw.partialExecutionTargets.map(String);
+  }
+  return null;
+}
+
+/**
+ * When a present-but-unusable `partial_execution_targets` value still names
+ * EXACTLY the requested execution roots, that is not a different request — it
+ * is the store/API option object copied into the body. Returning the expected
+ * ids lets the repair rewrite that shape into the array ComfyUI accepts
+ * instead of false-rejecting an exact-target payload (#1782).
+ *
+ * Wrong, extra, or empty ids return null: those remain a mismatch we do not
+ * overwrite.
+ *
+ * @param {unknown} raw
+ * @param {string[]} expected
+ * @returns {string[]|null}
+ */
+export function unwrapExactScopeTargets(raw, expected) {
+  const want = (expected ?? []).map(String);
+  if (!want.length) return null;
+  const got = queueItemScopeIds(raw);
+  if (!got || !sameSet(got, want)) return null;
+  return want.slice();
+}
+
+/**
  * Verify a POST /prompt request body carries EXACTLY the requested
  * partial-execution scope. Compared as string sets (server exec ids are strings;
  * a colon path like "76:34" for a subgraph-nested output must survive verbatim).
@@ -1433,7 +1593,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null, prunedRetry: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, droppedBody: null, failed: null, repairedFromKeys: null, prunedRetry: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -1515,20 +1675,22 @@ export function createScopedRunGuard({
     // overwrite; an unparseable body cannot be repaired. Both fall through to
     // the refusal below, exactly as before.
     let forwardOptions = options;
+    const exactWrapped = unwrapExactScopeTargets(scopeRead.raw, expected);
     if (
       repairScope &&
       contentOk &&
       !targets &&
-      // ONLY a genuinely ABSENT key (codex gate r7, P0-1). Previously `empty`
-      // and `not_a_list` were repaired too, which broke this module's own rule
-      // that a scope we did not put there is never overwritten. `[]`, `null`,
-      // `"14"`, and especially `{ queueNodeIds: [...] }` are PRESENT values in
-      // a shape we did not expect — the last looks like another layer's scope
-      // convention, not an absence. Absence is ours to fill; a present value we
-      // cannot interpret is someone else's data, and rewriting it would be
-      // executing our intent over a request that said something different.
-      // Those states now fall through to the refusal, which names what it saw.
-      scopeRead.state === "absent"
+      // Absence is ours to fill (codex gate r7, P0-1). `[]`, `null`, `"14"`,
+      // and a `{ queueNodeIds }` object naming SOME OTHER node are PRESENT
+      // values we cannot interpret — rewriting those would execute our intent
+      // over a request that said something different.
+      //
+      // #1782 — the exception is exact-target verified: a store/API options
+      // object that already names THIS run's roots is the same scope in
+      // another layer's shape (measured on 1.48.7 as a verbatim third-argument
+      // copy). That is not a different request, so refusing it was a false
+      // reject of a payload we can rewrite into the array ComfyUI accepts.
+      (scopeRead.state === "absent" || exactWrapped)
     ) {
       const repairedBody = repairScopeInBody(options?.body, expected);
       if (repairedBody != null) {
@@ -1665,6 +1827,13 @@ export function createScopedRunGuard({
               bodyKeys: scopeRead.bodyKeys,
             };
       state.droppedReason = verdict.reason;
+      if (!contentOk) {
+        try {
+          state.droppedBody = typeof options?.body === "string" ? options.body : null;
+        } catch {
+          state.droppedBody = null;
+        }
+      }
       try {
         state.dropped = scopeDroppedError({ toNodeId, verdict });
       } catch {
@@ -1765,6 +1934,116 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
 }
 
 /**
+ * Restore `queueNodeIds` onto THIS run's pending frontend 1.49.6 queue item
+ * when a wrapper dropped the third argument of `app.queuePrompt`.
+ *
+ * ComfyApp 1.49.6 pushes `{ number, batchCount, queueNodeIds }` synchronously,
+ * then later reads that array for `isPartialExecution` and
+ * `api.queuePrompt(..., { partialExecutionTargets: queueNodeIds })`. An
+ * own-property wrapper that calls through with only `(number, batch)` still
+ * reaches that native loop — it just pushes `queueNodeIds: undefined`. Filling
+ * the missing array on the item lets the frontend write
+ * `partial_execution_targets` itself. The item's `number` must match this
+ * run's mark; a present array/object naming different roots is left untouched.
+ *
+ * Bypassing the wrapper entirely would skip its queue-time behaviour (seed
+ * capture, telemetry). This does not: it still calls through, then puts back
+ * the ids the native loop already knows how to honour.
+ *
+ * @param {object} app
+ * @param {{queueMark: number, execIds: string[]}} scope
+ * @param {() => *} invoke
+ */
+export function withScopedQueueItemTargets(app, { queueMark, execIds } = {}, invoke) {
+  const expected = (execIds ?? []).map(String);
+  const run = typeof invoke === "function" ? invoke : () => {};
+  let items;
+  try {
+    items = app?.queueItems;
+  } catch {
+    return run();
+  }
+  if (!Array.isArray(items) || typeof items.push !== "function" || !expected.length) {
+    return run();
+  }
+
+  const restoreItem = (item) => {
+    try {
+      if (!item || typeof item !== "object") return;
+      if (Number(item.number) !== queueMark) return;
+      // ComfyApp 1.49.6 stamps `requestId` on every queue item. Mock deferred
+      // items used by the fetch-chain tests share `queueItems` without that
+      // field; filling those would rewrite a fixture's stored third argument
+      // and hide a real retry. Absence of requestId means this is not the
+      // native processor's item, so leave it for the body-repair fallback.
+      if (!Object.prototype.hasOwnProperty.call(item, "requestId")) return;
+      const got = queueItemScopeIds(item.queueNodeIds);
+      if (got) {
+        // Already carrying the exact roots, but 1.49.6's `!!queueNodeIds?.length`
+        // and `partialExecutionTargets: queueNodeIds` need an ARRAY. An options
+        // object in that slot is the same scope in the wrong shape — flatten it.
+        if (sameSet(got, expected) && !Array.isArray(item.queueNodeIds)) {
+          item.queueNodeIds = execIds;
+        }
+        return;
+      }
+      item.queueNodeIds = execIds;
+    } catch {
+      // A hostile queue item cannot prevent the original push from running.
+    }
+  };
+
+  const origPush = items.push;
+  const push = function scopedQueueItemPush(...args) {
+    for (const arg of args) restoreItem(arg);
+    return origPush.apply(this, args);
+  };
+  try {
+    items.push = push;
+  } catch {
+    return run();
+  }
+
+  const restorePush = () => {
+    try {
+      if (items.push === push) items.push = origPush;
+    } catch {
+      // A hostile setter cannot prevent the invoke from having run.
+    }
+  };
+  const scanPending = () => {
+    try {
+      for (const item of items) restoreItem(item);
+    } catch {
+      // Reading a hostile queueItems entry must not replace the invoke result.
+    }
+  };
+
+  try {
+    const result = run();
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).then(
+        (value) => {
+          scanPending();
+          restorePush();
+          return value;
+        },
+        (error) => {
+          restorePush();
+          throw error;
+        },
+      );
+    }
+    scanPending();
+    restorePush();
+    return result;
+  } catch (error) {
+    restorePush();
+    throw error;
+  }
+}
+
+/**
  * The scoped-dispatch orchestration graph_run runs — extracted whole so the
  * REAL control flow (guard install, queuePrompt, observation wait, cancel/
  * sentinel decision, and the finally-restore) is what the unit tests drive.
@@ -1785,6 +2064,68 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
  *    (no fetchApi to observe through, or no prompt signature) — refused
  *    BEFORE dispatch, nothing queued.
  */
+
+/**
+ * The cheap canvas-revision signal the scoped-run stamp waits on (#572).
+ * `changeCount` / `_restoringState` / `isLoadingGraph` are ChangeTracker's
+ * own "do not snapshot yet" windows; `extra` is LiteGraph's last-change
+ * counter when the frontend exposes one. Unreadable fields count as idle.
+ */
+export function graphStampRevision(app) {
+  const graph = app?.rootGraph ?? app?.graph ?? null;
+  let tracker = null;
+  try {
+    tracker =
+      app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ??
+      graph?.changeTracker ??
+      null;
+  } catch {
+    tracker = null;
+  }
+  let changeCount = 0;
+  let restoring = false;
+  let loading = false;
+  let extra = 0;
+  try {
+    const n = Number(tracker?.changeCount);
+    if (Number.isFinite(n) && n > 0) changeCount = n;
+  } catch {
+    /* unreadable tracker → treat as idle */
+  }
+  try {
+    restoring = !!tracker?._restoringState;
+  } catch {
+    restoring = false;
+  }
+  try {
+    loading = !!tracker?.constructor?.isLoadingGraph;
+  } catch {
+    loading = false;
+  }
+  try {
+    const n = Number(graph?.last_change_time ?? graph?._version);
+    if (Number.isFinite(n)) extra = n;
+  } catch {
+    extra = 0;
+  }
+  return { changeCount, restoring, loading, extra };
+}
+
+export function graphStampBusy(rev) {
+  return !!rev && (rev.changeCount > 0 || rev.restoring || rev.loading);
+}
+
+export function sameGraphStampRevision(a, b) {
+  return (
+    !!a &&
+    !!b &&
+    a.changeCount === b.changeCount &&
+    a.restoring === b.restoring &&
+    a.loading === b.loading &&
+    a.extra === b.extra
+  );
+}
+
 export async function dispatchScopedRun({
   app,
   apiTarget,
@@ -1798,7 +2139,7 @@ export async function dispatchScopedRun({
   onPromptId = null,
   onAcceptedNodeErrors = null,
 } = {}) {
-  const mark = queueMark ?? newScopedQueueMark();
+  let mark = queueMark ?? newScopedQueueMark();
   // #1565 — ONE DEADLINE FOR THE WHOLE DISPATCH, so the per-attempt bounds COMPOSE.
   //
   // Every wait in this function used to start its own fresh clock: four argument
@@ -1901,41 +2242,75 @@ export async function dispatchScopedRun({
   // No hash ⇒ no attribution ⇒ fail closed BEFORE dispatch. The canonical
   // form is RETAINED (contentCanon) so a graph_changed refusal can say WHAT
   // differed instead of asserting a cause (#659).
-  let contentHash = null;
-  let contentCanon = null;
-  let volatileInputs = null;
-  // #1571 — KEEP what was thrown. The refusal below is the only thing the caller sees,
-  // and without this the serializer's own message (which names the offending node) was
-  // discarded at exactly the moment it was needed.
-  let fingerprintCause = null;
-  try {
-    if (typeof app.graphToPrompt === "function") {
-      // This panel's live root is app.graph (r8) — app.rootGraph only as a
-      // fallback for frontends that expose it instead.
-      volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
-      // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
-      // does that the read path never does, and an extension's serializeValue that never
-      // settles held the command open with no bound at all. A serializer that will not
-      // answer leaves no fingerprint, which is already the fail-closed state below:
-      // `unverifiable`, nothing queued, and the cause named.
-      const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
-      if (built === TIMED_OUT) {
-        throw new Error(
-          `app.graphToPrompt did not answer within this run's command budget — the ` +
-            `frontend could not serialize the workflow, so nothing was queued`,
-        );
+  //
+  // #572 recurrence — subgraph-exit / node-activate edits can still be
+  // flushing when this stamp runs (ChangeTracker.changeCount > 0, or the
+  // first graphToPrompt itself rematerialises a nested link). Snapshot after
+  // that window closes, and restamp once if the revision moved during the
+  // first fingerprint. A genuine mid-window user edit still mismatches and
+  // is refused (#556).
+  const fingerprintOnce = async () => {
+    let contentHash = null;
+    let contentCanon = null;
+    let volatileInputs = null;
+    let fingerprintCause = null;
+    try {
+      if (typeof app.graphToPrompt === "function") {
+        // Prefer the workflow root when the canvas is still inside a subgraph
+        // view: prompt keys are root-relative colon paths.
+        volatileInputs = collectVolatileInputs(app?.rootGraph ?? app?.graph ?? null);
+        // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
+        // does that the read path never does, and an extension's serializeValue that never
+        // settles held the command open with no bound at all. A serializer that will not
+        // answer leaves no fingerprint, which is already the fail-closed state below:
+        // `unverifiable`, nothing queued, and the cause named.
+        const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
+        if (built === TIMED_OUT) {
+          throw new Error(
+            `app.graphToPrompt did not answer within this run's command budget — the ` +
+              `frontend could not serialize the workflow, so nothing was queued`,
+          );
+        }
+        // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
+        // used to propagate out of here, and a bound must not swallow it.
+        if ("error" in built) throw built.error;
+        contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
+        contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
       }
-      // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
-      // used to propagate out of here, and a bound must not swallow it.
-      if ("error" in built) throw built.error;
-      contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
-      contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
+    } catch (err) {
+      contentHash = null;
+      contentCanon = null;
+      fingerprintCause = err;
     }
-  } catch (err) {
-    contentHash = null;
-    contentCanon = null;
-    fingerprintCause = err;
+    return { contentHash, contentCanon, volatileInputs, fingerprintCause };
+  };
+  const yieldStampTurn = async () => {
+    if (hasBudget && typeof budget.exhausted === "function" && budget.exhausted()) return TIMED_OUT;
+    return boundedStep(new Promise((resolve) => setTimeout(resolve, 0)), boundedBy(1));
+  };
+
+  let rev = graphStampRevision(app);
+  await yieldStampTurn();
+  let revSettled = graphStampRevision(app);
+  if (graphStampBusy(revSettled) || !sameGraphStampRevision(rev, revSettled)) {
+    await yieldStampTurn();
+    revSettled = graphStampRevision(app);
   }
+
+  let fp = await fingerprintOnce();
+  const revAfterStamp = graphStampRevision(app);
+  if (
+    fp.contentHash &&
+    (!sameGraphStampRevision(revSettled, revAfterStamp) || graphStampBusy(revSettled))
+  ) {
+    const again = await fingerprintOnce();
+    if (again.contentHash) fp = again;
+  }
+
+  let contentHash = fp.contentHash;
+  let contentCanon = fp.contentCanon;
+  let volatileInputs = fp.volatileInputs;
+  const fingerprintCause = fp.fingerprintCause;
   if (!contentHash) {
     return {
       outcome: "unverifiable",
@@ -1949,7 +2324,7 @@ export async function dispatchScopedRun({
   // post-hash outcome so the caller can report the coverage gap truthfully
   // instead of implying full-graph drift proof (see collectVolatileInputs'
   // ACCEPTED RESIDUAL note).
-  const volatileList = volatileInputs ? [...volatileInputs].sort() : [];
+  let volatileList = volatileInputs ? [...volatileInputs].sort() : [];
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
   const runTag = Symbol("cmcp-scoped-run");
   try {
@@ -1958,8 +2333,23 @@ export async function dispatchScopedRun({
     // non-extensible array — cancellation will report 0 and the sentinel covers it.
   }
   let dropped = null;
-  const attempts = queuePromptScopeAttempts(execIds);
-  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
+  let restampUsed = false;
+  // #1998 — restore a dropped third argument through live 1.41.21-shaped
+  // queuePrompt wrappers for this run's mark only. Request-body repair stays
+  // the last attempt when a wrapper never calls through.
+  const adapterMarks = { mark };
+  const restoreQueuePromptAdapter = installQueuePromptScopeAdapter({
+    app,
+    api: apiTarget,
+    targets: execIds,
+    queueMarkRef: adapterMarks,
+  });
+  try {
+  for (;;) {
+    let restampAgain = false;
+    dropped = null;
+    const attempts = queuePromptScopeAttempts(execIds);
+    for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
     const { arg: scopeArg, repair } = attempts[attemptIndex];
     const isLastAttempt = attemptIndex === attempts.length - 1;
     dropped = null;
@@ -2016,8 +2406,14 @@ export async function dispatchScopedRun({
       // is the state the give-up path below already exists for — it cancels the still-
       // pending queue item and, either way, CLOSES this guard, so a post the abandoned
       // queuePrompt emits later still meets the fence and is refused rather than
-      // dispatched scopeless. A throw is re-thrown unchanged (boundedStep keeps it).
-      const queued = await boundedStep(app.queuePrompt(mark, batch, scopeArg), boundedBy(attemptMs));
+      // dispatched scopeless. An Error throw is decorated with its browser stack;
+      // non-Error throws retain their existing identity.
+      const queued = await boundedStep(
+        withScopedQueueItemTargets(app, { queueMark: mark, execIds }, () =>
+          invokeQueuePromptWithBrowserStack(app, mark, batch, scopeArg),
+        ),
+        boundedBy(attemptMs),
+      );
       // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
       if (queued !== TIMED_OUT && "error" in queued) throw queued.error;
       if (!guard.verdictReached()) {
@@ -2205,7 +2601,35 @@ export async function dispatchScopedRun({
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
     // Terminal refusal naming that the graph changed under the deferred item.
+    //
+    // #572 — one exception, and only this one: the refused body already equals
+    // a fresh serialization of the now-idle canvas. The first stamp was stale
+    // (subgraph-exit / node-activate still flushing); nothing was queued. Adopt
+    // the settled snapshot on a NEW mark so the closed first-attempt sentinel
+    // still blocks the old identity, and dispatch once. A live graph that does
+    // not match the refused body is a real concurrent edit and still refuses.
     if (guard.state.observed === 0 && guard.state.droppedReason === "graph_changed") {
+      if (!restampUsed) {
+        const live = await fingerprintOnce();
+        const bodyHash = live.contentHash
+          ? promptContentHashFromBody(guard.state.droppedBody, live.volatileInputs)
+          : null;
+        if (
+          live.contentHash &&
+          bodyHash === live.contentHash &&
+          !graphStampBusy(graphStampRevision(app))
+        ) {
+          restampUsed = true;
+          restampAgain = true;
+          contentHash = live.contentHash;
+          contentCanon = live.contentCanon;
+          volatileInputs = live.volatileInputs;
+          volatileList = volatileInputs ? [...volatileInputs].sort() : [];
+          mark = newScopedQueueMark();
+          adapterMarks.mark = mark;
+          break;
+        }
+      }
       return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: guard.state.dropped };
     }
     // A corrupted post with ZERO verified posts means this argument SHAPE was
@@ -2235,6 +2659,11 @@ export async function dispatchScopedRun({
         graphChanged: guard.state.droppedReason === "graph_changed",
       }),
     };
+    }
+    if (restampAgain) continue;
+    return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
   }
-  return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
+  } finally {
+    restoreQueuePromptAdapter();
+  }
 }

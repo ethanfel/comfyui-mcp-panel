@@ -36,18 +36,31 @@ import { commandIsCanvasIndependent } from "../../web/js/lib/workflow-chat-ident
 import { sealProvenRootBinding } from "../../web/js/lib/graph-binding.js";
 import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
-import { describeNodeDefRefresh } from "../../web/js/lib/node-def-refresh.js";
+import { describeNodeDefRefresh, describeStaleBundleRefresh } from "../../web/js/lib/node-def-refresh.js";
 import { confirmCanvasNavigation } from "../../web/js/lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,
   waitForReconnectHandshakeBeforeOpen,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
   graphMutationReconnectGate,
 } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  shouldReregisterWorkflowTabChannel,
+  watchReconnectTabChannel,
+  ensureWorkflowTabChannel,
+} from "../../web/js/lib/reconnect-tab-channel.js";
 import {
   snapshotGraphState,
   describeInputLink,
   verifyDisconnect,
 } from "../../web/js/lib/disconnect-verify.js";
+import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
+  settleOwnedOpenedTmpRoutingKey,
+  settleOwnedOpenedWorkflowActive,
+} from "../../web/js/lib/settle-open-active.js";
 
 // --- Mirror the shared bounded-step edge (#648) --------------------------------------
 // run-completion-frame.js and media-preview.js BOTH import withTimeout from here. If
@@ -96,18 +109,34 @@ test("panel ↔ media-preview.js / run-completion-frame.js ↔ bounded-step.js e
   assert.equal(typeof withTimeout, "function");
 });
 
-test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.js edges link (#635/#619/#663/#646/#1641)", () => {
+test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.js edges link (#635/#619/#663/#646/#1641/#1914)", () => {
   assert.equal(typeof describeNodeDefRefresh, "function");
+  assert.equal(typeof describeStaleBundleRefresh, "function");
   assert.equal(typeof confirmCanvasNavigation, "function");
   assert.equal(typeof watchPostReconnectSettle, "function");
   assert.equal(typeof waitForReconnectHandshakeBeforeOpen, "function");
+  assert.equal(typeof workflowOpenReadinessRefusalError, "function");
+  assert.equal(typeof readWorkflowOpenReadinessRefusal, "function");
   assert.equal(typeof graphMutationReconnectGate, "function");
+});
+
+test("panel ↔ reconnect-tab-channel.js module edge links (#2030)", () => {
+  assert.equal(typeof shouldReregisterWorkflowTabChannel, "function");
+  assert.equal(typeof watchReconnectTabChannel, "function");
+  assert.equal(typeof ensureWorkflowTabChannel, "function");
 });
 
 test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
   assert.equal(typeof snapshotGraphState, "function");
   assert.equal(typeof describeInputLink, "function");
   assert.equal(typeof verifyDisconnect, "function");
+});
+
+test("panel ↔ settle-open-active.js tmp: reconnect edges link (#2022)", () => {
+  assert.equal(typeof settleOwnedOpenedWorkflowActive, "function");
+  assert.equal(typeof settleOwnedOpenedTmpRoutingKey, "function");
+  assert.equal(typeof isUnsavedTmpOpenSelector, "function");
+  assert.equal(typeof appliedTmpOpenShouldFailClosed, "function");
 });
 
 /**

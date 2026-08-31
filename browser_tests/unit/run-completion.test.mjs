@@ -22,6 +22,7 @@ import {
 import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { runCompletionKeyMatchesContext } from "../../web/js/lib/run-completion-persistence.js";
+import { collectNodeOutputMedia } from "../../web/js/lib/node-output-media.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
 function makeHarness({ debounceMs = 1500, maxRearms = 40 } = {}) {
@@ -600,6 +601,10 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     "appendStoryboardCacheBust",
     "appendImageCacheBust",
     "NO_PROMPT_KEY",
+    "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
     `return (runCompletion) => [
       (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
       (${panelSrc.slice(
@@ -623,7 +628,11 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     // by inline-image-cache-bust.test.mjs. Kept identity-ish so the image refs
     // buffered below stay comparable.
     (url) => url,
-  NO_PROMPT_KEY,
+    NO_PROMPT_KEY,
+    collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
   );
 
   const registrationStart = panelSrc.indexOf(

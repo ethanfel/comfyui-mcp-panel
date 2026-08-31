@@ -47,9 +47,13 @@
     "name": "Show RunPod / Local",
     "tooltip": "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch back to local. Off by default; the flag is also sent to a connected mobile app."
   },
+  "comfyui-mcp_chatMedia": {
+    "name": "Generated media in chat",
+    "tooltip": "Show generated images, videos, and audio as cards in the chat transcript. Turn off to keep the transcript text-only; the agent still receives the outputs (including storyboards and completion frames). Applies to media generated after the change. Cards already in the chat stay; suppressed cards are not saved and will not reappear after a reload."
+  },
   "comfyui-mcp_videoPreviews": {
-    "name": "Video previews in chat",
-    "tooltip": "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with its first frame and filename, and clicking it opens the full video in the lightbox. Applies to videos generated after the change; cards already in the chat keep their player."
+    "name": "Inline video playback in chat",
+    "tooltip": "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with its first frame and filename, and clicking it opens the full video in the lightbox. This does not hide videos from the chat — use Generated media in chat for that. Applies to videos generated after the change; cards already in the chat keep their player."
   },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Get the beta app",
@@ -61,7 +65,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Render stall warning (seconds)",
-    "tooltip": "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged (e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator next starts — Disconnect then Connect (or /restart) to change it for a running agent."
+    "tooltip": "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged (e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps are legitimately slow, so keep this generous. Default 600s; range 15–3600. Applies when the orchestrator next starts — Disconnect then Connect (or /restart) to change it for a running agent."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "Remote ComfyUI URL (advanced)",

@@ -28,6 +28,7 @@ import { readFileSync } from "node:fs";
 import { appendImageCacheBust } from "../../web/js/lib/storyboard-cache-identity.js";
 import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
 import { NO_PROMPT_KEY } from "../../web/js/lib/run-completion.js";
+import { collectNodeOutputMedia } from "../../web/js/lib/node-output-media.js";
 
 const panelSrc = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
@@ -56,6 +57,10 @@ function productionOnExecuted() {
     "appendStoryboardCacheBust",
     "appendImageCacheBust",
     "NO_PROMPT_KEY",
+    "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
     `return (${panelSrc.slice(start, end).trim()});`,
   )(
     (m) =>
@@ -72,6 +77,10 @@ function productionOnExecuted() {
     (url) => url,
     appendImageCacheBust,
     NO_PROMPT_KEY,
+    collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
   );
   return { onExecuted, painted, buffered };
 }

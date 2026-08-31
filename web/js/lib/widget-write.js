@@ -1,7 +1,8 @@
 import { fireNodeWidgetChanged } from "./node-widget-changed.js";
-import { pressableWidgetHint } from "./pressable-widget.js";
+import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
+import { isPromotedContainer } from "./graph-read.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
@@ -1127,6 +1128,16 @@ export function coerceWidgetValue(
     }
     // STRICT typed membership first: an exact-typed option is always writable.
     if (options.includes(value)) return value;
+    // #2010: an already-empty combo is already the requested clear. VHS_LoadVideo's
+    // video dropdown lists filenames and no "", yet the live widget is video="".
+    // That no-op must succeed; a populated combo still refuses "" below.
+    if (value === "") {
+      try {
+        if (widget.value === "") return value;
+      } catch {
+        /* unreadable current value stays an off-list refusal */
+      }
+    }
     // #667: NUMERIC-LABELLED options (VHS ProRes profile ["lt",…,"4444",…], ffv1
     // level ["0","1","3"]). The tool's `value` param is string|number|boolean, so a
     // numeric-looking label can arrive as the NUMBER 4444 after upstream JSON
@@ -1145,13 +1156,14 @@ export function coerceWidgetValue(
     // installed is caught here instead of failing 40 seconds into a run. The message says
     // which of the two happened, so an agent can tell "your value is wrong" apart from
     // "the panel could not look" and stop treating them as the same failure.
-    const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
         `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
         `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
-        `rejected VALUE, not an unreadable list. Valid options (${options.length}): ${preview}` +
-        (options.length > 40 ? ", …" : ""),
+        `rejected VALUE, not an unreadable list. The valid option values are intentionally ` +
+        `omitted from this diagnostic because combo values may contain private filenames ` +
+        `or paths. Choose a value from the widget's current dropdown (refreshing its ` +
+        `options first if needed) and retry.`,
       { combo: true },
     );
   }
@@ -1258,6 +1270,15 @@ export function coerceWidgetValue(
  * no authenticated rail object exists. So we accept ONLY a candidate that is an
  * actual widget OBJECT AND is `===` a live member of `node.widgets`, and otherwise
  * FAIL CLOSED (return null) — never write inner or parent on a name-only stub.
+ *
+ * #366 recurrence hardening: during a promoted-input rebind, `_widget` can remain
+ * attached to the old/link-driven projection while the host input's `widgetId` and
+ * the newly materialized parent rail point at another live widget. When the host
+ * carries a key, it is the stronger identity: choose exactly one live projection
+ * whose own `widgetId` is that key before applying the legacy `_widget`/`widget`
+ * order. A mismatched keyed projection is ignored; an ambiguous or keyless set
+ * remains fail-closed unless an unkeyed, directly identity-linked legacy projection
+ * is available. This is still relationship authentication, never a name fallback.
  */
 export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
   if (!subgraphNode || !hostInput) return [];
@@ -1293,7 +1314,600 @@ export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
       out.push(cand);
     }
   }
-  return out;
+
+  // Newer ComfyUI frontends make the host input's widgetId the serialization
+  // binding. A stale `_widget` can still be a live member of node.widgets while
+  // belonging to the link-driven inner projection, so object identity alone is
+  // insufficient to decide which identity-linked member is the parent rail.
+  const hostWidgetId = readHostWidgetId(hostInput);
+  if (!hostWidgetId) return out;
+
+  const described = out.map((widget) => ({ widget, id: readProjectionWidgetId(widget) }));
+  // The projection list can be rebuilt independently of the host input object.
+  // Include a newly materialized member by its exact host-owned key so a stale
+  // `_widget` cannot win just because it is still one of the input's references.
+  const keyedLive = inWidgets
+    .map((widget) => ({ widget, id: readProjectionWidgetId(widget) }))
+    .filter((entry) => entry.id === hostWidgetId);
+  const keyed = keyedLive;
+  if (keyed.length > 1) return [];
+  if (keyed.length === 1) {
+    // The canonical host-keyed projection is the primary safe target here. Keep
+    // the other directly identity-linked, unkeyed projections as display views:
+    // #477 requires them to be updated too, or the outer node can still render
+    // the old value. A keyed projection for a different identity is the stale
+    // link-driven view that triggered this recurrence and must not be promoted
+    // to a display target by name or list position.
+    const primary = keyed[0].widget;
+    const displays = described
+      .filter((entry) => entry.widget !== primary && entry.id === null)
+      .map((entry) => entry.widget);
+    return [primary, ...displays];
+  }
+  // A host key with only mismatched keyed projections is not evidence for any
+  // candidate. Legacy unkeyed identity links remain supported only when no
+  // competing keyed projection exists; a stale keyed object is never promoted
+  // to the rail by its name or list position.
+  if (described.some((entry) => entry.id !== null)) return [];
+  return described.map((entry) => entry.widget);
+}
+
+function readHostWidgetId(hostInput) {
+  try {
+    const id = hostInput?.widgetId;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function readProjectionWidgetId(widget) {
+  try {
+    const id = widget?.widgetId;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ComfyUI's SubgraphNode.widgets getter returns `_widget` first and never builds
+ * the host-keyed store projection while that handle still points at an INNER
+ * converted-to-input widget. That handle is the Primitive object itself, or a
+ * CLIPTextEncode.text clone that is a different object with the same name/value.
+ * Dropping the stale handle and re-reading widgets lets the getter materialize
+ * the rail queue compilation actually reads (#366).
+ */
+function rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
+  if (!subgraphNode || !hostInput || !innerWidget) return [];
+  const hostId = readHostWidgetId(hostInput);
+  if (!hostId) return [];
+  const current = hostInput._widget;
+  if (!current) return [];
+  // Already the host-keyed rail — do not drop a live serializing projection.
+  if (current !== innerWidget && readProjectionWidgetId(current) === hostId) return [];
+  const saved = hostInput._widget;
+  try {
+    hostInput._widget = undefined;
+    void subgraphNode.widgets;
+  } catch {
+    hostInput._widget = saved;
+    return [];
+  }
+  const next = resolveHostPromotedWidgets(subgraphNode, hostInput).filter(
+    (widget) => widget && widget !== innerWidget,
+  );
+  if (next.length) return next;
+  hostInput._widget = saved;
+  return [];
+}
+
+function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
+  const current = resolveHostPromotedWidgets(subgraphNode, hostInput).filter(
+    (widget) => widget && widget !== innerWidget,
+  );
+  const hostId = readHostWidgetId(hostInput);
+  const keyed = hostId ? current.filter((widget) => readProjectionWidgetId(widget) === hostId) : [];
+  if (keyed.length) {
+    const displays = current.filter(
+      (widget) => widget !== keyed[0] && readProjectionWidgetId(widget) == null,
+    );
+    return [keyed[0], ...displays];
+  }
+  // No host key: unkeyed identity-linked projections are the rail. A host key
+  // with only an unkeyed clone must rematerialize first — returning the clone
+  // here is the CLIPTextEncode.text recurrence (inner written, parent store stale).
+  if (!hostId && current.length) return current;
+  const rematerialized = rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
+  if (rematerialized.length) return rematerialized;
+  const recovered = recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
+  if (recovered.length) return recovered;
+  return current;
+}
+
+/**
+ * #2057 — after `loadGraphData`, host rails exist on `node.widgets` (outline
+ * lists them) while `input._widget` may still be unbound. Instance-scoped rails
+ * carry a widgetId; a same-named decoy does not, so it cannot win (#366).
+ */
+function recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget) {
+  if (!subgraphNode || !hostInput || hostInput.link != null) return [];
+  const widgets = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
+  const wantedName =
+    typeof hostInput.name === "string" && hostInput.name.length > 0
+      ? hostInput.name.toLowerCase()
+      : null;
+  if (!wantedName) return [];
+  const named = [];
+  for (const widget of widgets) {
+    if (!widget || widget === innerWidget) continue;
+    if (typeof widget.name !== "string" || widget.name.toLowerCase() !== wantedName) continue;
+    let widgetId = null;
+    try {
+      widgetId = typeof widget.widgetId === "string" && widget.widgetId.length > 0 ? widget.widgetId : null;
+    } catch {
+      widgetId = null;
+    }
+    if (!widgetId) continue;
+    named.push(widget);
+  }
+  return named.length === 1 ? named : [];
+}
+
+/** LiteGraph subgraph input-rail id. Same constant as subgraph-scope.js; kept
+ * local so this resolver does not take a graph-binding dependency. */
+const SUBGRAPH_INPUT_RAIL_ID = -10;
+
+function subgraphIoSlots(subgraph) {
+  if (Array.isArray(subgraph?.inputs) && subgraph.inputs.length) return subgraph.inputs;
+  if (Array.isArray(subgraph?.inputNode?.slots) && subgraph.inputNode.slots.length) {
+    return subgraph.inputNode.slots;
+  }
+  return [];
+}
+
+function slotLinkIds(slot) {
+  const ids = slot?.linkIds;
+  if (!ids) return [];
+  return Array.isArray(ids) ? ids : [...ids];
+}
+
+function subgraphNodeById(subgraph, id) {
+  if (id == null || !subgraph) return null;
+  if (typeof subgraph.getNodeById === "function") {
+    try {
+      const found = subgraph.getNodeById(id);
+      if (found) return found;
+    } catch {
+      /* fall through to the live node list */
+    }
+  }
+  return (subgraph._nodes ?? subgraph.nodes ?? []).find((node) => String(node?.id) === String(id)) ?? null;
+}
+
+function readSubgraphLink(subgraph, linkId) {
+  if (linkId == null || !subgraph) return null;
+  if (typeof subgraph.getLink === "function") {
+    try {
+      const link = subgraph.getLink(linkId);
+      if (link) return link;
+    } catch {
+      /* try the raw stores below */
+    }
+  }
+  const links = subgraph.links ?? subgraph._links;
+  if (!links) return null;
+  if (typeof links.get === "function") return links.get(linkId) ?? null;
+  if (Array.isArray(links)) {
+    return links.find((entry) => Number(entry?.id ?? entry?.[0]) === Number(linkId)) ?? null;
+  }
+  return links[linkId] ?? null;
+}
+
+function enumerateSubgraphLinks(subgraph) {
+  const links = subgraph?.links ?? subgraph?._links;
+  if (!links) return [];
+  if (typeof links.values === "function") return [...links.values()];
+  if (Array.isArray(links)) return links;
+  return Object.values(links);
+}
+
+function originIsInputRail(originId, subgraph) {
+  if (originId == null) return false;
+  if (Number(originId) === SUBGRAPH_INPUT_RAIL_ID) return true;
+  const inputNode = subgraph?.inputNode;
+  return inputNode != null && String(inputNode.id) === String(originId);
+}
+
+function sourceFromResolvedLink(subgraph, link) {
+  if (!link) return null;
+  const targetId = link.target_id ?? link[3];
+  const targetSlot = link.target_slot ?? link[4];
+  const innerNode = subgraphNodeById(subgraph, targetId);
+  if (!innerNode) return null;
+  const targetInput = Number.isInteger(targetSlot) ? innerNode.inputs?.[targetSlot] : null;
+  let targetWidget = null;
+  if (typeof innerNode.getWidgetFromSlot === "function" && targetInput) {
+    try {
+      targetWidget = innerNode.getWidgetFromSlot(targetInput);
+    } catch {
+      targetWidget = null;
+    }
+  }
+  if (!targetWidget && targetInput) {
+    const widgetName = targetInput.widget?.name ?? targetInput.name;
+    targetWidget = (innerNode.widgets ?? []).find((widget) => widget?.name === widgetName) ?? null;
+  }
+  const sourceWidgetName = targetWidget?.name ?? targetInput?.name;
+  if (typeof sourceWidgetName !== "string" || sourceWidgetName.length === 0) return null;
+  return { sourceNodeId: String(innerNode.id), sourceWidgetName };
+}
+
+function uniqueSlotMatchingAliases(subgraph, aliases) {
+  const wanted = new Set(
+    (aliases ?? []).map((alias) => String(alias).toLowerCase()).filter((alias) => alias.length > 0),
+  );
+  if (!wanted.size) return null;
+  const hits = [];
+  for (const slot of subgraphIoSlots(subgraph)) {
+    const names = [slot?.name, slot?.label]
+      .filter((value) => value != null && String(value).length > 0)
+      .map((value) => String(value).toLowerCase());
+    if (names.some((name) => wanted.has(name))) hits.push(slot);
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function liveSlotForHostInput(subgraphNode, hostInput, subgraphInput) {
+  const subgraph = subgraphNode?.subgraph;
+  const aliases = promotedInputAliases(hostInput, subgraphInput);
+  const byName = uniqueSlotMatchingAliases(subgraph, aliases);
+  if (byName) return byName;
+  const hostInputs = Array.isArray(subgraphNode?.inputs) ? subgraphNode.inputs : [];
+  const index = hostInputs.indexOf(hostInput);
+  const slots = subgraphIoSlots(subgraph);
+  if (index >= 0 && index < slots.length && hostInputs.length === slots.length) return slots[index];
+  return subgraphInput ?? null;
+}
+
+/**
+ * After load, SubgraphInput.linkIds can still be empty while inner widgets are
+ * already wired from the input rail (-10). Walk those known terminals instead of
+ * treating the promotion as unresolved (#2057).
+ */
+function sourcesFromInputRailSlot(subgraph, slot) {
+  const sources = [];
+  const seen = new Set();
+  const add = (source) => {
+    if (!source) return;
+    const key = `${source.sourceNodeId}\0${source.sourceWidgetName}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    sources.push(source);
+  };
+  for (const linkId of slotLinkIds(slot)) add(sourceFromResolvedLink(subgraph, readSubgraphLink(subgraph, linkId)));
+  const slots = subgraphIoSlots(subgraph);
+  const slotIndex = slots.indexOf(slot);
+  if (slotIndex < 0) return sources;
+  for (const link of enumerateSubgraphLinks(subgraph)) {
+    const originId = link?.origin_id ?? link?.[1];
+    const originSlot = link?.origin_slot ?? link?.[2];
+    if (!originIsInputRail(originId, subgraph) || Number(originSlot) !== slotIndex) continue;
+    add(sourceFromResolvedLink(subgraph, link));
+  }
+  for (const node of subgraph?._nodes ?? subgraph?.nodes ?? []) {
+    if (!node) continue;
+    for (const input of node.inputs ?? []) {
+      if (input?.link == null) continue;
+      const link = readSubgraphLink(subgraph, input.link);
+      if (!link) continue;
+      const originId = link.origin_id ?? link[1];
+      const originSlot = link.origin_slot ?? link[2];
+      if (!originIsInputRail(originId, subgraph) || Number(originSlot) !== slotIndex) continue;
+      add(sourceFromResolvedLink(subgraph, link));
+    }
+  }
+  return sources;
+}
+
+function uniqueRailBackedInnerWidget(subgraph, widgetName) {
+  const wanted = String(widgetName).toLowerCase();
+  if (!wanted) return null;
+  const hits = [];
+  for (const node of subgraph?._nodes ?? subgraph?.nodes ?? []) {
+    if (!node) continue;
+    const widget = (node.widgets ?? []).find((candidate) => candidate?.name?.toLowerCase() === wanted);
+    if (!widget) continue;
+    const input = (node.inputs ?? []).find((slot) => {
+      if (!slot || slot.link == null) return false;
+      const name = slot.name ?? slot.widget?.name;
+      if (typeof name !== "string" || name.toLowerCase() !== wanted) return false;
+      const link = readSubgraphLink(subgraph, slot.link);
+      if (!link) return false;
+      return originIsInputRail(link.origin_id ?? link[1], subgraph);
+    });
+    if (input) hits.push({ sourceNodeId: String(node.id), sourceWidgetName: widget.name });
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName) {
+  const subgraph = subgraphNode?.subgraph;
+  const wanted = String(widgetName).toLowerCase();
+  const widgets = Array.isArray(subgraphNode?.widgets) ? subgraphNode.widgets : [];
+  const hostHits = widgets.filter(
+    (widget) => widget && typeof widget.name === "string" && widget.name.toLowerCase() === wanted,
+  );
+  if (hostHits.length !== 1) return { promoted: false };
+  const source = uniqueRailBackedInnerWidget(subgraph, widgetName);
+  if (!source) return { promoted: false };
+  const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
+  const innerWidget = (innerNode?.widgets ?? []).find((widget) => widget?.name === source.sourceWidgetName);
+  if (!innerNode || !innerWidget) return { promoted: false };
+  const input = { name: hostHits[0].name, _widget: hostHits[0], widget: hostHits[0] };
+  const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
+  const parentWidget = parentWidgets[0] ?? null;
+  if (!parentWidget) return { promoted: false };
+  return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget, parentWidgets } };
+}
+
+function resolveLoadedPromotionSource(subgraphNode, hostInput, subgraphInput, widgetName, resolveSource) {
+  const subgraph = subgraphNode?.subgraph;
+  const liveSlot = liveSlotForHostInput(subgraphNode, hostInput, subgraphInput);
+  if (liveSlot && typeof resolveSource === "function") {
+    // #1560 — a throwing resolver is a malformed promotion, not a missing
+    // mapping. Swallowing it let collectPromotionIntermediates keep walking
+    // and return a partial type list. Incomplete (null) results still fall
+    // through to the inner-rail walk (#2057).
+    const resolved = resolveSource(subgraphNode, liveSlot);
+    if (resolved?.sourceNodeId != null && typeof resolved.sourceWidgetName === "string") return resolved;
+  }
+  if (liveSlot) {
+    const sources = sourcesFromInputRailSlot(subgraph, liveSlot);
+    if (sources.length === 1) return sources[0];
+    if (sources.length > 1) {
+      return {
+        error: `promoted widget "${widgetName}" is ambiguous — ${sources.length} inner rail terminals match; refusing to guess.`,
+      };
+    }
+  }
+  return uniqueRailBackedInnerWidget(subgraph, widgetName);
+}
+
+/**
+ * #1997 — the live text control a DOM-backed STRING widget actually reads.
+ *
+ * ComfyUI `addDOMWidget` wires `get value` / `set value` through `options.getValue`
+ * / `options.setValue`. Packs such as TTS-Audio-Suite's StringMultilineTagEditor
+ * implement `getValue` as "read the contenteditable" and make `setValue` a no-op
+ * once `onConfigure` has loaded the workflow — so `widget.value = x` appears to
+ * assign and then reverts. The control itself is `widget.inputEl` (or a textarea /
+ * contenteditable under `widget.element`). Writing that element is what an
+ * on-canvas edit does; `getValue` then returns the new string.
+ *
+ * Detection is structural, not by node type: a live textarea/input/contenteditable,
+ * never a guess at `node.properties`. Widgets whose getValue is a no-op (Pixaroma
+ * `pix_prompt_ui`) have no such control and stay on the #698 diagnosis path.
+ */
+function liveTextEditorElement(widget) {
+  if (!widget || typeof widget !== "object") return null;
+  const seen = [];
+  const push = (el) => {
+    if (el && typeof el === "object" && !seen.includes(el)) seen.push(el);
+  };
+  try {
+    push(widget.inputEl);
+  } catch {
+    /* unreadable inputEl is simply absent */
+  }
+  try {
+    push(widget.element);
+  } catch {
+    /* unreadable element is simply absent */
+  }
+  for (const el of seen) {
+    if (isLiveTextEditor(el)) return el;
+    let inner = null;
+    try {
+      if (typeof el.querySelector === "function") {
+        inner = el.querySelector(
+          "textarea, input[type='text'], input:not([type]), [contenteditable='true'], [contenteditable='']",
+        );
+      }
+    } catch {
+      inner = null;
+    }
+    if (inner && isLiveTextEditor(inner)) return inner;
+  }
+  return null;
+}
+
+function isLiveTextEditor(el) {
+  if (!el || typeof el !== "object") return false;
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  if (tag === "TEXTAREA") return true;
+  if (tag === "INPUT") {
+    const type = String(el.type || "text").toLowerCase();
+    return type === "text" || type === "search" || type === "url" || type === "email" || type === "password" || type === "";
+  }
+  if (el.isContentEditable === true || el.contentEditable === true || el.contentEditable === "true" || el.contentEditable === "") {
+    return true;
+  }
+  return typeof el.className === "string" && /\bcomfy-multiline-input\b/.test(el.className);
+}
+
+function dispatchDomEvent(el, type) {
+  try {
+    if (typeof el.dispatchEvent !== "function" || typeof Event !== "function") return;
+    el.dispatchEvent(new Event(type, { bubbles: true }));
+  } catch {
+    /* best-effort; verification still decides whether the value stuck */
+  }
+}
+
+function writeLiveTextEditor(el, text, { events = true } = {}) {
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  const editable =
+    el.isContentEditable === true ||
+    el.contentEditable === true ||
+    el.contentEditable === "true" ||
+    el.contentEditable === "" ||
+    (typeof el.className === "string" && /\bcomfy-multiline-input\b/.test(el.className));
+  if (tag === "TEXTAREA" || tag === "INPUT") {
+    el.value = text;
+  } else if (editable) {
+    el.textContent = text;
+  } else {
+    return false;
+  }
+  // StringMultilineTagEditor's input listener copies getPlainText() into state
+  // and localStorage; without this event the canvas shows the new text and a
+  // reload restores the old one. Skipped when the widget store already holds
+  // the value: ComfyUI's customtext input handler assigns `widget.value`, and
+  // that setter re-enters a callback that may never settle (#2020).
+  if (events) {
+    dispatchDomEvent(el, "input");
+    dispatchDomEvent(el, "change");
+  }
+  return true;
+}
+
+function widgetHoldsValue(widget, coerced) {
+  try {
+    return Object.is(widget.value, coerced);
+  } catch {
+    return false;
+  }
+}
+
+function readLiveTextEditorValue(el) {
+  try {
+    const tag = typeof el?.tagName === "string" ? el.tagName.toUpperCase() : "";
+    if (tag === "TEXTAREA" || tag === "INPUT") return el.value;
+    if (
+      el?.isContentEditable === true ||
+      el?.contentEditable === true ||
+      el?.contentEditable === "true" ||
+      el?.contentEditable === "" ||
+      (typeof el?.className === "string" && /\bcomfy-multiline-input\b/.test(el.className))
+    ) {
+      return el.textContent;
+    }
+  } catch {
+    /* unreadable editor is simply absent */
+  }
+  return undefined;
+}
+
+/**
+ * #2020 — a STRING widget whose live value is a textarea / contenteditable /
+ * `options.getValue` store, not a plain `.value` field.
+ *
+ * ComfyUI `addDOMWidget` (customtext) implements
+ * `set value(v) { options.setValue?.(v); callback?.(this.value) }`. Vue and
+ * AnimaPromptPlus callbacks on that path can fail to settle, so a programmatic
+ * write must not assign `.value` or await the callback.
+ */
+function isLiveCustomTextWidget(widget) {
+  if (!widget || typeof widget !== "object") return false;
+  if (liveTextEditorElement(widget)) return true;
+  const t = String(widget.type ?? "").toLowerCase();
+  if (t !== "customtext" && t !== "textarea" && t !== "text" && t !== "string") return false;
+  try {
+    const opts = widget.options;
+    return !!(opts && (typeof opts.getValue === "function" || typeof opts.setValue === "function"));
+  } catch {
+    return false;
+  }
+}
+
+function customTextHolds(widget, coerced) {
+  if (widgetHoldsValue(widget, coerced)) return true;
+  const el = liveTextEditorElement(widget);
+  if (!el) return false;
+  try {
+    return Object.is(readLiveTextEditorValue(el), coerced);
+  } catch {
+    return false;
+  }
+}
+
+/** When a string write did not stick on `.value`, copy it into the live editor. */
+function syncDomBackedTextIfNeeded(widget, coerced) {
+  if (typeof coerced !== "string") return;
+  if (widgetHoldsValue(widget, coerced)) return;
+  const el = liveTextEditorElement(widget);
+  if (!el) return;
+  writeLiveTextEditor(el, coerced);
+}
+
+/**
+ * Drive a live customtext widget without the DOM `.value` setter.
+ *
+ * `options.setValue` updates the widget-value store (what serializes). The
+ * visible textarea is written directly. `input`/`change` fire only when the
+ * store did not take the value, which is the #1997 no-op-setValue case.
+ */
+function assignLiveCustomText(widget, coerced) {
+  let setValueStuck = false;
+  try {
+    const setValue = widget.options?.setValue;
+    if (typeof setValue === "function") {
+      setValue.call(widget, coerced);
+      setValueStuck = widgetHoldsValue(widget, coerced);
+    }
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+  const el = liveTextEditorElement(widget);
+  if (el) {
+    try {
+      writeLiveTextEditor(el, coerced, { events: !setValueStuck });
+    } catch {
+      /* verification below still decides whether the value stuck */
+    }
+  }
+  if (!customTextHolds(widget, coerced)) {
+    try {
+      widget.value = coerced;
+    } catch {
+      /* verification below still decides whether the value stuck */
+    }
+  }
+}
+
+/** Assign a widget value and drive options.setValue when present (store-backed rails). */
+function detachThenable(value) {
+  if (value == null || typeof value.then !== "function") return;
+  try {
+    value.then(undefined, () => {});
+  } catch {
+    /* a throwing then() is not a write verdict */
+  }
+}
+
+function assignWidgetValue(widget, coerced) {
+  if (typeof coerced === "string" && isLiveCustomTextWidget(widget)) {
+    assignLiveCustomText(widget, coerced);
+    return;
+  }
+  widget.value = coerced;
+  try {
+    const setValue = widget.options?.setValue;
+    if (typeof setValue === "function") detachThenable(setValue.call(widget, coerced));
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+  try {
+    syncDomBackedTextIfNeeded(widget, coerced);
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+}
+
+/** Restore a captured prior value, including a DOM-backed editor this write updated. */
+function restoreWidgetValue(widget, previous) {
+  assignWidgetValue(widget, previous);
 }
 
 /**
@@ -1404,8 +2018,11 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
     if (aliases.includes(wanted)) matches.push({ input, subgraphInput });
   }
 
-  // No matching host input at all ⇒ a genuine non-promoted own-widget.
-  if (matches.length === 0) return { promoted: false };
+  // No matching host input at all ⇒ usually a genuine non-promoted own-widget.
+  // After load, outline can still list the host rail while configure has not
+  // rebound `_subgraphSlot` onto a host input; a unique inner input-rail
+  // terminal of the same name is that promotion (#2057).
+  if (matches.length === 0) return resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName);
   if (matches.length > 1) {
     return {
       promoted: true,
@@ -1415,23 +2032,29 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   }
 
   const { input, subgraphInput } = matches[0];
-  // It IS a promoted widget, but its backing subgraph slot is absent — we
-  // cannot reach the inner target, so refuse rather than corrupt the parent.
-  if (!subgraphInput) {
+  const liveSlot = liveSlotForHostInput(subgraphNode, input, subgraphInput);
+  // It IS a promoted widget. Prefer the live subgraph-input / input-rail slot
+  // (which may exist even when `_subgraphSlot` was not rebound after load).
+  // Still fail closed when neither that slot nor a unique inner rail terminal
+  // can name the inner (node, widget) — never write the shifted parent slot.
+  const source = resolveLoadedPromotionSource(subgraphNode, input, liveSlot, widgetName, resolveSource);
+  if (source?.error) {
+    return { promoted: true, target: null, error: source.error };
+  }
+  if (!liveSlot && !source) {
     return {
       promoted: true,
       target: null,
       error: `promoted widget "${widgetName}" has no backing subgraph slot (_subgraphSlot missing) — cannot resolve inner target.`,
     };
   }
-  if (typeof resolveSource !== "function") {
+  if (!source && typeof resolveSource !== "function") {
     return {
       promoted: true,
       target: null,
       error: `no resolver available for promoted widget "${widgetName}".`,
     };
   }
-  const source = resolveSource(subgraphNode, subgraphInput);
   if (!source) {
     return {
       promoted: true,
@@ -1439,10 +2062,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
       error: `promoted widget "${widgetName}" has no resolvable inner link (stale/empty linkIds).`,
     };
   }
-  const innerNode =
-    typeof subgraph.getNodeById === "function"
-      ? subgraph.getNodeById(source.sourceNodeId)
-      : (subgraph._nodes ?? []).find((n) => String(n?.id) === String(source.sourceNodeId));
+  const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
   if (!innerNode) {
     return {
       promoted: true,
@@ -1464,7 +2084,9 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   // (e.g. the widget is further promoted OUTWARD to an enclosing subgraph and is
   // exposed here as an input with no settable widget); the caller FAILS CLOSED on
   // null rather than write inner-only and render silently stale.
-  const parentWidgets = resolveHostPromotedWidgets(subgraphNode, input);
+  // The inner Primitive widget is never a parent rail, even when a stale `_widget`
+  // handle still points at it and the computed widgets getter therefore lists it.
+  const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
   const parentWidget = parentWidgets[0] ?? null;
   return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget, parentWidgets } };
 }
@@ -1499,7 +2121,7 @@ export function followPromotionToConcrete(target, resolveSource) {
   let widget = target?.widget ?? null;
   const seen = new Set();
   let depth = 0;
-  while (node && node.subgraph) {
+  while (node && isPromotedContainer(node)) {
     if (seen.has(node)) return { node, widget, cycle: true };
     if (depth >= MAX_PROMOTION_CHAIN_DEPTH) {
       return {
@@ -1538,6 +2160,101 @@ export function promotedInputAliases(input, subgraphInput = input?._subgraphSlot
     .map((value) => String(value));
 }
 
+/** Hard cap on graphs visited while locating the enclosing SubgraphNode. A
+ *  `node.subgraph` getter that yields a new object each time would otherwise
+ *  walk forever on the inner-write retarget path (#2109). */
+const MAX_ENCLOSING_SUBGRAPH_WALKS = 10000;
+
+/**
+ * The SubgraphNode whose inner graph is `innerNode.graph`. MCP's promoted-write
+ * protocol addresses the INNER terminal after entering the subgraph; locating
+ * the wrapper is what lets the write retarget onto the serializing parent rail.
+ */
+export function findEnclosingSubgraphNode(innerNode, rootGraph) {
+  const subgraph = innerNode?.graph;
+  if (!subgraph || typeof subgraph !== "object") return null;
+  const directCandidates = [
+    subgraph.parentNode,
+    subgraph.ownerNode,
+    subgraph._subgraphNode,
+    subgraph.subgraphNode,
+  ];
+  for (const candidate of directCandidates) {
+    if (candidate && candidate !== innerNode && candidate.subgraph === subgraph) return candidate;
+  }
+  const roots = [rootGraph, subgraph.rootGraph, subgraph.root];
+  const stack = [];
+  for (const root of roots) {
+    if (root && typeof root === "object") stack.push(root);
+  }
+  const seen = new Set();
+  let walks = 0;
+  while (stack.length) {
+    if (++walks > MAX_ENCLOSING_SUBGRAPH_WALKS) break;
+    const graph = stack.pop();
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (!node || node === innerNode) continue;
+      if (node.subgraph === subgraph) return node;
+      if (node.subgraph) stack.push(node.subgraph);
+    }
+  }
+  return null;
+}
+
+/**
+ * #2109 — when the caller addressed an INNER widget that is the terminal of a
+ * promotion, resolve the enclosing subgraph node's promoted alias so the write
+ * can run the parent-rail path (#366) instead of mutating the link-driven inner
+ * widget alone.
+ *
+ * Returns `{ owner, widgetName, resolution }` when a unique enclosing promotion
+ * maps onto this inner `(node, widget)`, otherwise null. Pure: no mutation.
+ */
+export function resolveEnclosingPromotedWrite(innerNode, widgetName, { rootGraph, resolveSource } = {}) {
+  if (!innerNode || widgetName == null || widgetName === "") return null;
+  if (isPromotedContainer(innerNode)) return null;
+  const owner = findEnclosingSubgraphNode(innerNode, rootGraph);
+  if (!owner || owner === innerNode || !isPromotedContainer(owner)) return null;
+  const wantedNode = String(innerNode.id);
+  const wantedWidget = String(widgetName);
+  const tried = new Set();
+  const consider = (alias) => {
+    if (typeof alias !== "string" || alias.length === 0 || tried.has(alias)) return null;
+    tried.add(alias);
+    let resolution;
+    try {
+      resolution = resolvePromotedInnerTarget(owner, alias, resolveSource);
+    } catch {
+      return null;
+    }
+    if (!resolution?.promoted || !resolution.target) return null;
+    if (String(resolution.target.node?.id) !== wantedNode) return null;
+    if (resolution.target.widget?.name !== wantedWidget) return null;
+    return { owner, widgetName: alias, resolution };
+  };
+  for (const input of owner.inputs ?? []) {
+    for (const alias of promotedInputAliases(input, input?._subgraphSlot)) {
+      const hit = consider(alias);
+      if (hit) return hit;
+    }
+  }
+  let widgets;
+  try {
+    widgets = owner.widgets;
+  } catch {
+    widgets = null;
+  }
+  if (Array.isArray(widgets)) {
+    for (const widget of widgets) {
+      const hit = consider(widget?.name) || consider(widget?.label);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 /**
  * Collect EVERY INTERMEDIATE virtual SubgraphNode traversed from `target` (the
  * immediate promoted inner) down to — but EXCLUDING — the ultimate concrete node. A
@@ -1554,7 +2271,7 @@ export function collectPromotionIntermediates(target, resolveSource) {
   let widget = target?.widget ?? null;
   const seen = new Set();
   let depth = 0;
-  while (node && node.subgraph) {
+  while (node && isPromotedContainer(node)) {
     if (seen.has(node)) break;
     if (depth >= MAX_PROMOTION_CHAIN_DEPTH) break;
     seen.add(node);
@@ -1594,8 +2311,8 @@ export function resolveWidgetWrite(
   // name contains a dot is never hijacked.
   let subFieldPath = null;
 
-  if (node?.subgraph) {
-    // Reuse a promotion resolution the caller already computed (graph_set_widget
+  if (isPromotedContainer(node)) {
+    // Reuse a promotion resolution the caller already computed (graph_set_widget)
     // resolves it ONCE up front to fresh-authorize the inner target, #458), so the
     // write targets the IDENTICAL inner node it authorized — a relink between the
     // async /object_info fetch and the write can't swap in an unauthorized target.
@@ -1686,7 +2403,7 @@ export function resolveWidgetWrite(
     // all) always wins — the split is never taken when an exact match exists.
     widget = resolveWidgetByName(targetNode, widgetName);
   }
-  if (!widget && node?.subgraph) {
+  if (!widget && isPromotedContainer(node)) {
     // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
     // promotion alias must NOT fall through to the base-name dotted fallback below —
     // that would write the parent's projected RAIL widget DIRECTLY, bypassing the
@@ -1735,14 +2452,11 @@ export function resolveWidgetWrite(
     }
   }
   if (!widget) {
-    const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
-    throw new WidgetWriteError(
-      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).` +
-        // #757 — the available list may already contain the answer without saying
-        // so: a button that CREATES the missing slot. Empty for a node with no
-        // pressable widget, which is the ordinary typo case.
-        pressableWidgetHint(targetNode, widgetName),
-    );
+    // #757 — pressable-widget hint for a button that CREATES the missing slot.
+    // #1956 — if the name is a node PROPERTY (rgthree Fast Groups matchTitle/…),
+    // point at panel_set_property instead of a click dead-end, and list each
+    // available widget name once (Fast Groups repeats RGTHREE_TOGGLE_AND_NAV).
+    throw new WidgetWriteError(missingWidgetMessage(targetNode, widgetName));
   }
 
   // Gate on the RESOLVED target BEFORE coercion (#458). coerceWidgetValue reads —
@@ -1814,6 +2528,28 @@ export function applyWidgetWrite(
       // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
     });
+
+  // The rail object captured before /object_info may be a stale inner Primitive
+  // handle. Re-read the live host projections at write time so the store-backed
+  // rail (what serializes) is the one assigned.
+  if (promotedFrom && promotedHostInput) {
+    const liveRails = liveHostPromotedWidgets(node, promotedHostInput, w);
+    if (liveRails.length) {
+      promotedParentWidget = liveRails[0];
+      promotedParentWidgets = liveRails;
+    } else if (promotedParentWidget === w) {
+      throw new WidgetWriteError(
+        `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
+          `widget, but its AUTHORITATIVE parent rail widget could not be identified (the value ` +
+          `that serializes at queue time). This happens when the widget is further promoted to ` +
+          `an enclosing subgraph (fed by an outer link / exposed as an input, not a settable ` +
+          `widget), the promotion metadata is malformed, or its name is duplicated. Refusing to ` +
+          `write the inner widget alone, which would silently render the OLD value (#366). Edit ` +
+          `this widget from the outermost subgraph node, or disconnect the inner input to make ` +
+          `the inner value authoritative.`,
+      );
+    }
+  }
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
   // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in
@@ -2041,6 +2777,19 @@ export function applyWidgetWrite(
         typeof actual === "object" &&
         Object.keys(expected).every((k) => JSON.stringify(actual[k]) === JSON.stringify(expected[k]))
       : actual === expected;
+  // #2020 — a live customtext may serialize from the textarea / getValue store
+  // even when a Vue `.value` accessor has not caught up. Read the editor too.
+  const widgetMatchesExpected = (widget) => {
+    let actual;
+    try {
+      actual = widget?.value;
+    } catch {
+      actual = undefined;
+    }
+    if (matchesExpected(actual)) return true;
+    return typeof expected === "string" && isLiveCustomTextWidget(widget) && customTextHolds(widget, expected);
+  };
+  const liveCustomTextWrite = typeof coerced === "string" && isLiveCustomTextWidget(valueWidget);
 
   // Snapshot the PRIOR values AND deep clones of them. Rollback restores the prior
   // OBJECT REFERENCE (`previous`), but a subsequent afterChange hook could mutate
@@ -2222,14 +2971,14 @@ export function applyWidgetWrite(
       if (fastBypasserAction) {
         Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
       } else {
-        w.value = coerced;
+        assignWidgetValue(w, coerced);
       }
     }
-    if (parentWidget) parentWidget.value = coerced;
+    if (parentWidget) assignWidgetValue(parentWidget, coerced);
     // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
     // promoted value (no semantic callback of their own — the inner target's fires
     // once below), so we assign their value directly, same as the rail.
-    for (const dw of displayWidgets) dw.value = coerced;
+    for (const dw of displayWidgets) assignWidgetValue(dw, coerced);
     // #1268 / comfyui-mcp#1658 — drive the BOUND PROPERTY, in litegraph's own position:
     // `BaseWidget.setValue` assigns the widget, then calls `node.setProperty(...)`, then
     // fires the callback. Placed here so a programmatic write leaves the node in the SAME
@@ -2297,13 +3046,25 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    if (!fastBypasserAction) {
+    // #2020 — do not invoke (and therefore cannot await) a custom textarea's
+    // widget.callback. ComfyUI DOM widgets already fire it from the `.value`
+    // setter; AnimaPromptPlus / Vue customtext callbacks can fail to settle,
+    // which wedged panel_set_widget until the client timed out. The live
+    // editor + options.setValue path above is what serializes; read-back
+    // still decides whether the write stuck.
+    if (!fastBypasserAction && !liveCustomTextWrite) {
       widgetCallback = valueWidget.callback;
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
-        reflectApply(widgetCallback, valueWidget, callbackArgs);
+        const callbackRet = reflectApply(widgetCallback, valueWidget, callbackArgs);
         threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+        // #2001/#2020 — a callback that RETURNS a thenable (subgraph navigation,
+        // Vue nextTick, customtext, an openSubgraph receipt) has already been
+        // invoked. Awaiting it would own the command reply for as long as that
+        // work stays pending. Detach: a later rejection must not become an
+        // unhandled-rejection, and the assignment above is the receipt.
+        detachThenable(callbackRet);
       }
     }
     // #1533 — AFTER the callback, still inside this envelope so afterChange
@@ -2381,7 +3142,7 @@ export function applyWidgetWrite(
   // Only an EXACTLY reproducible snap counts. If the config does not explain the
   // observed value, this stays the failure it was — no tolerance, because a
   // tolerance would eventually swallow a real revert that landed nearby.
-  const normalization = matchesExpected(valueWidget.value)
+  const normalization = widgetMatchesExpected(valueWidget)
     ? null
     : explainNumericNormalization(expected, valueWidget.value, valueWidget);
   // comfyui-mcp#1707 — the SHARED DEFINITION must be exactly as it was.
@@ -2396,7 +3157,7 @@ export function applyWidgetWrite(
   // did not perform. Compared structurally against the pre-mutation clone, so a
   // callback mutating a captured object in place is caught too.
   const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
-  if (!matchesExpected(valueWidget.value) && !normalization) {
+  if (!widgetMatchesExpected(valueWidget) && !normalization) {
     failure =
       `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(valueWidget.value)}.` +
@@ -2444,7 +3205,7 @@ export function applyWidgetWrite(
       actual: boundPropertyActual,
       unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
     });
-  } else if (parentWidget && parentWidget !== valueWidget && !matchesExpected(parentWidget.value)) {
+  } else if (parentWidget && parentWidget !== valueWidget && !widgetMatchesExpected(parentWidget)) {
     // comfyui-mcp#1707 — `parentWidget !== valueWidget` because on an instance-scoped
     // promoted write the rail IS the widget this write assigned, and the branch above
     // has already verified it — with the #805 normalization allowance this one does not
@@ -2457,11 +3218,11 @@ export function applyWidgetWrite(
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
       `${JSON.stringify(parentWidget.value)}. Refusing to report success with a stale rail that ` +
       `would render the OLD value (#366).`;
-  } else if (displayWidgets.some((dw) => !matchesExpected(dw.value))) {
+  } else if (displayWidgets.some((dw) => !widgetMatchesExpected(dw))) {
     // #477: a parent-facing display proxy did not retain the value. Fail closed +
     // roll back rather than report success while the parent node still shows/queries
     // the OLD value (the exact stale-outer-widget symptom).
-    const bad = displayWidgets.find((dw) => !matchesExpected(dw.value));
+    const bad = displayWidgets.find((dw) => !widgetMatchesExpected(dw));
     failure =
       `Promoted display widget "${bad.name}" on subgraph node ${node.id} did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(bad.value)}. ` +
@@ -2718,14 +3479,14 @@ export function applyWidgetWrite(
       // The read-back below still compares it against the captured clone either way.
       if (!instanceScoped || definitionMoved) {
         try {
-          w.value = previous;
+          restoreWidgetValue(w, previous);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
       }
       if (parentWidget) {
         try {
-          parentWidget.value = previousParent;
+          restoreWidgetValue(parentWidget, previousParent);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
@@ -2734,7 +3495,7 @@ export function applyWidgetWrite(
       // the just-written value after a failed write.
       for (let i = 0; i < displayWidgets.length; i++) {
         try {
-          displayWidgets[i].value = previousDisplays[i];
+          restoreWidgetValue(displayWidgets[i], previousDisplays[i]);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }

@@ -43,11 +43,97 @@ export const MAX_CHARS_FLOOR = 500;
 /** Widget values are clipped to this in the `compact` projection (a FIXED cap). */
 export const COMPACT_VALUE_CLIP = 60;
 
+/** Placeholder for a widget value that must not be JSON.stringified on a live read. */
+export const HEAVY_WIDGET_PLACEHOLDER = "[binary]";
+
+/**
+ * #2003 — values a live graph read must NEVER fully serialize.
+ *
+ * PreviewImage / VHS videopreview / canvas widgets can hold ImageData, a typed
+ * array of pixels, or a canvas element. `JSON.stringify` of those walks every
+ * byte into a JSON number array and is how `panel_graph_outline` misses its 20s
+ * RPC window after a manual canvas edit — then every retry does the same walk.
+ *
+ * Positive evidence only: a small plain object or a short string is not heavy.
+ * One own-property level is enough for the `{ width, height, data }` ImageData
+ * shape; a nested pixel bag still trips via `data`.
+ */
+function heavyPayload(value) {
+  if (value == null || typeof value !== "object") return false;
+  if (ArrayBuffer.isView(value)) return true;
+  if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return true;
+  // Pixel bags land as long primitive arrays. ResolutionMaster-style preset
+  // lists are arrays of objects and must still stringify so #609 can clip them.
+  if (Array.isArray(value) && value.length > 256) {
+    const first = value[0];
+    return first == null || typeof first === "number" || typeof first === "string" || typeof first === "boolean";
+  }
+  if (typeof value.byteLength === "number" && Number(value.byteLength) > 256) return true;
+  if (typeof value.toDataURL === "function" || typeof value.getContext === "function") return true;
+  const name = value.constructor?.name;
+  return (
+    name === "ImageData" ||
+    name === "HTMLCanvasElement" ||
+    name === "OffscreenCanvas" ||
+    name === "ImageBitmap"
+  );
+}
+
+export function isHeavyLiveWidgetValue(value) {
+  if (value == null || typeof value !== "object") return false;
+  try {
+    if (heavyPayload(value)) return true;
+    // ImageData-shaped bags expose pixels on `data` without being instanceof ImageData
+    // in this unit-test environment (no DOM). Skip arrays: Object.keys on a long array
+    // is itself the cost this helper exists to avoid.
+    if (Array.isArray(value)) return false;
+    for (const key of Object.keys(value)) {
+      if (heavyPayload(value[key])) return true;
+    }
+    return false;
+  } catch {
+    // Unreadable host object — do not stringify it.
+    return true;
+  }
+}
+
 /** #1748: frontend node types whose widget value IS on-canvas prose — the place
  *  workflow authors put trigger words, download paths and usage instructions. A
  *  clipped value on one of these is lost instructions, not a re-queryable detail,
  *  so the outline footer names them instead of folding them into a bare count. */
 export const NOTE_NODE_TYPES = new Set(["Note", "MarkdownNote"]);
+
+/**
+ * True when `node` is a live promoted-widget container (a SubgraphNode with an
+ * inner graph). MCP's panel_set_widget probe treats a boolean `is_subgraph` and
+ * graph_get_subgraph's "is not a subgraph" line as the ordinary-vs-container
+ * classification. Two leftovers must not look like a container:
+ *
+ *   #1941 — a truthy `.subgraph` that is not a live inner graph (`{}`, a name
+ *           bag) used to skip the definitive throw.
+ *   #2006 — a root PrimitiveNode is a frontend-only value source. It is never
+ *           a subgraph container, even when a leftover `.subgraph` looks live
+ *           or its getter throws. Treating it as one makes graph_get_subgraph
+ *           return a malformed envelope (or a non-definitive throw), and MCP
+ *           then refuses the ordinary `value` write.
+ *
+ * Never throws: an unreadable subgraph accessor is not a container.
+ */
+export function isPromotedContainer(node) {
+  try {
+    if (!node || typeof node !== "object") return false;
+    if (node.type === "PrimitiveNode") return false;
+    const sub = node.subgraph;
+    if (!sub || typeof sub !== "object") return false;
+    return (
+      Array.isArray(sub._nodes) ||
+      Array.isArray(sub.nodes) ||
+      typeof sub.getNodeById === "function"
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * #809 (codex gate): "raise `X` up to N" is ITSELF a dead retry when the caller is
@@ -141,6 +227,9 @@ export function drivenTag(src) {
  *  naming how many raw chars were dropped. */
 export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinity, fixedCap = cap) {
   if (value == null) return value;
+  // #2003 — never JSON.stringify a pixel buffer / canvas / ImageData on the live
+  // read path. The clip below still runs, against the placeholder.
+  if (isHeavyLiveWidgetValue(value)) return HEAVY_WIDGET_PLACEHOLDER;
   const isString = typeof value === "string";
   const s = isString ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
   if (typeof s !== "string") return value;
@@ -311,6 +400,15 @@ export function fitDetailLine(line, stub, maxChars) {
     id: clipF(stub?.id),
     type: clipF(stub?.type),
     ...(stub?.title != null ? { title: clipF(stub.title) } : {}),
+    // artokun/comfyui-mcp#2436 — a BOOLEAN classification survives the degrade.
+    // #2314 gave the detail projection an always-boolean `is_subgraph` precisely so a
+    // consumer could tell ordinary-node from cannot-classify. This stub then dropped it,
+    // reintroducing the same absence one layer down. The orchestrator requires
+    // `typeof is_subgraph === "boolean"` and treats anything else as INDETERMINATE, so a
+    // node wide enough to degrade became unwritable: every ordinary panel_set_widget on
+    // it was refused by the promoted-write fence (KSampler (Efficient) in the report).
+    // Costs ~18 chars, is bounded by construction, and cannot flood.
+    ...(typeof stub?.is_subgraph === "boolean" ? { is_subgraph: stub.is_subgraph } : {}),
   };
   const s = JSON.stringify({
     ...safe,
@@ -369,8 +467,23 @@ export function truncationTail(shown, matchedCount, hasExplicitIds, truncatedBy,
  *  footer note can name the lever (`fields`:"detail") instead of leaving a bare "…" on
  *  every value. The 60-char clip itself is FIXED; no parameter raises it. */
 export function clipCompactValue(v, n = COMPACT_VALUE_CLIP) {
-  const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
-  return s.length > n ? { text: s.slice(0, n - 1) + "…", clipped: true } : { text: s, clipped: false };
+  const cap = Number.isFinite(n) && n > 0 ? Math.floor(n) : COMPACT_VALUE_CLIP;
+  // #2003 — clip BEFORE stringify for pixel/canvas values. The outline used to
+  // JSON.stringify the whole ImageData and THEN slice to 60 chars, which is how
+  // a PreviewImage widget edit stalled panel_graph_outline past the 20s RPC window.
+  if (isHeavyLiveWidgetValue(v)) {
+    const text = HEAVY_WIDGET_PLACEHOLDER;
+    return text.length > cap
+      ? { text: text.slice(0, Math.max(1, cap - 1)) + "…", clipped: true }
+      : { text, clipped: true };
+  }
+  let s;
+  try {
+    s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+  } catch {
+    s = String(v);
+  }
+  return s.length > cap ? { text: s.slice(0, cap - 1) + "…", clipped: true } : { text: s, clipped: false };
 }
 
 /** #809: the one-line footer for compact rows whose values were clipped.

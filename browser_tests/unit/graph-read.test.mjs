@@ -29,6 +29,8 @@ import {
   // #809
   clipCompactValue,
   compactClipNote,
+  isHeavyLiveWidgetValue,
+  HEAVY_WIDGET_PLACEHOLDER,
   OUTLINE_DETAIL_LEVELS,
   OUTLINE_MAX_CHARS_DEFAULT,
   OUTLINE_MAX_CHARS_FLOOR,
@@ -42,6 +44,7 @@ import {
   MAX_CHARS_CEILING,
   // #1748
   NOTE_NODE_TYPES,
+  isPromotedContainer,
 } from "../../web/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
@@ -660,6 +663,29 @@ test("#1634 the clip note names the cap actually in force", () => {
   assert.equal(compactClipNote(0, WIDGET_VALUE_CAP), "", "still silent when nothing clipped");
 });
 
+test("#2003 clipCompactValue does not stringify pixel buffers or canvas-like values", () => {
+  const pixels = new Uint8ClampedArray(1024 * 1024 * 4);
+  assert.equal(isHeavyLiveWidgetValue(pixels), true);
+  const started = Date.now();
+  const clipped = clipCompactValue({ width: 1024, height: 1024, data: pixels });
+  const elapsed = Date.now() - started;
+  assert.equal(clipped.clipped, true);
+  assert.equal(clipped.text, HEAVY_WIDGET_PLACEHOLDER);
+  assert.ok(elapsed < 50, `pixel bags must clip without a full stringify (${elapsed}ms)`);
+
+  const huge = new Array(8_000).fill(7);
+  const arrStarted = Date.now();
+  const arr = clipCompactValue(huge);
+  const arrElapsed = Date.now() - arrStarted;
+  assert.equal(arr.clipped, true);
+  assert.equal(arr.text, HEAVY_WIDGET_PLACEHOLDER);
+  assert.ok(arrElapsed < 50, `long arrays must not be JSON.stringified (${arrElapsed}ms)`);
+
+  assert.equal(isHeavyLiveWidgetValue("a short prompt"), false);
+  assert.equal(isHeavyLiveWidgetValue({ seed: 42 }), false);
+  assert.equal(capWidgetValue({ data: pixels }), HEAVY_WIDGET_PLACEHOLDER);
+});
+
 test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {
   const prompt = "m".repeat(300);
   // Survey cap starves it...
@@ -745,4 +771,67 @@ test("liveLinkTargetInput never throws on malformed nodes (#342)", () => {
   // Holes in the inputs array are skipped, not crashed on.
   assert.equal(liveLinkTargetInput({ inputs: [null, undefined] }, 3), null);
   assert.deepEqual(liveLinkTargetInput({ inputs: [null, { link: 3 }] }, 3), { index: 1, name: undefined });
+});
+
+// ---- #2006: PrimitiveNode is never a promoted container --------------------
+
+test("#2006 a root PrimitiveNode is not a promoted container", () => {
+  assert.equal(
+    isPromotedContainer({ id: 198, type: "PrimitiveNode", isVirtualNode: true, widgets: [{ name: "value" }] }),
+    false,
+  );
+});
+
+test("#2006 leftover live-looking subgraph on PrimitiveNode is still not a container", () => {
+  assert.equal(
+    isPromotedContainer({
+      id: 198,
+      type: "PrimitiveNode",
+      subgraph: { _nodes: [{ id: 1 }], getNodeById() { return null; } },
+    }),
+    false,
+  );
+});
+
+test("#2006 a throwing subgraph getter is not a container", () => {
+  assert.equal(
+    isPromotedContainer({
+      id: 198,
+      type: "PrimitiveNode",
+      get subgraph() {
+        throw new Error("boom");
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isPromotedContainer({
+      id: 74,
+      type: "VHS_VideoCombine",
+      get subgraph() {
+        throw new Error("boom");
+      },
+    }),
+    false,
+  );
+});
+
+test("#2006 a live inner graph is still a container", () => {
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { _nodes: [{ id: 12 }] } }),
+    true,
+  );
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { nodes: [] } }),
+    true,
+  );
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { getNodeById() { return null; } } }),
+    true,
+  );
+});
+
+test("#1941 leftover subgraph that is not a live inner graph is not a container", () => {
+  assert.equal(isPromotedContainer({ id: 74, type: "VHS_VideoCombine", subgraph: {} }), false);
+  assert.equal(isPromotedContainer({ id: 74, type: "VHS_VideoCombine", subgraph: { name: "not-a-graph" } }), false);
 });

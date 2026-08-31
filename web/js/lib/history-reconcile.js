@@ -1,3 +1,10 @@
+import {
+  collectNodeOutputMedia,
+  mergeAudioMedia,
+  mergeModel3dMedia,
+  mergeWithheldMedia,
+} from "./node-output-media.js";
+
 // Parse a ComfyUI `/history/<prompt_id>` entry into a terminal completion batch.
 //
 // The run-completion tracker keys delivery on live WS lifecycle events
@@ -15,15 +22,24 @@
 
 /**
  * @param {object|null} entry  The per-prompt value from `/history/<id>` — i.e.
- *   `historyResponse[promptId]`, shape `{ outputs:{[nodeId]:{images?,gifs?,videos?}},
- *   status:{status_str?, completed?} }`. Pass `null` when absent.
+ *   `historyResponse[promptId]`, shape `{ outputs:{[nodeId]:{images?,gifs?,videos?,…}},
+ *   status:{status_str?, completed?} }`. Pass `null` when absent. Extra keys
+ *   ending in images/gifs/videos (CompareFrames `a_images`/`b_images`) are
+ *   counted on `withheld` and never copied into `images`/`videos` (#1934).
+ *   ComfyUI's own `audio` bag comes back on `audio` — never on `images`, or a
+ *   recovered SaveAudio run would reach the agent as an inline image (#2126/#710).
+ *   3D outputs (SaveGLB's `3d` descriptors, and the bare path string a
+ *   Save3DAdvanced puts in `result`) come back on `models3d`, for the same reason
+ *   and on the same terms (#2128).
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
  * @param {() => number} [opts.now]  Clock (epoch ms) used ONLY to reject a
  *   timestamp implausibly far in the future. Injectable for tests.
  * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
- *   images:object[], videos:{m:object,nodeId:string}[],
+ *   images:object[], videos:{m:object,nodeId:string}[], audio:object[],
+ *   models3d:object[],
+ *   withheld:({ count:number, keys:string[], types:string[] }|null),
  *   startedAt:(number|null), finishedAt:(number|null) }}
  *   `null` when there's no usable entry. `startedAt`/`finishedAt` are epoch ms
  *   recovered from the entry's own lifecycle messages, or null when this entry
@@ -58,16 +74,19 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
 
   const images = [];
   const videos = [];
+  let audio = [];
+  let models3d = [];
+  let withheld = null;
   const outputs = entry.outputs && typeof entry.outputs === "object" ? entry.outputs : {};
   for (const [nodeId, out] of Object.entries(outputs)) {
     if (!out || typeof out !== "object") continue;
-    const media = [
-      ...(Array.isArray(out.images) ? out.images : []),
-      ...(Array.isArray(out.gifs) ? out.gifs : []),
-      ...(Array.isArray(out.videos) ? out.videos : []),
-    ];
-    for (const m of media) {
-      if (!m || !m.filename) continue;
+    const collected = collectNodeOutputMedia(out);
+    withheld = mergeWithheldMedia(withheld, collected.withheld);
+    if (collected.audio.length) audio = mergeAudioMedia(audio, collected.audio);
+    // #2128 — merged across nodes, and merged at all because one prompt can carry a
+    // SaveGLB and a Save3DAdvanced whose `result` names the very same file.
+    if (collected.models3d.length) models3d = mergeModel3dMedia(models3d, collected.models3d);
+    for (const m of collected.deliverable) {
       if (typeof isVideo === "function" && isVideo(m)) videos.push({ m, nodeId: String(nodeId) });
       else images.push(m);
     }
@@ -85,6 +104,9 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
     status: isError ? "error" : isInterrupted ? "interrupted" : isSuccess ? "success" : "unknown",
     images,
     videos,
+    audio,
+    models3d,
+    withheld,
     startedAt,
     finishedAt,
   };

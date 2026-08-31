@@ -15,14 +15,22 @@
 //      on a genuinely-resolved direct node (never a placeholder).
 //   3. applyWidgetWrite with the resolved-target registry guard, which runs
 //      BEFORE value coercion and any mutation/callback.
-// Post-write, inside the same synchronous boundary (#1282): refresh the node's
-// dynamic input slots via its own "Update inputs"-style control when it exposes
-// one — disclosed on the success result, never thrown over a verified write.
+// Post-write, inside the same synchronous boundary (#1282, #1932): refresh the
+// node's dynamic input slots via its own "Update inputs"-style control when it
+// exposes one, and rebuild generated custom-widget rows that view hidden
+// backend widgets — disclosed on the success result, never thrown over a
+// verified write.
+// After that stretch returns, #1922 waits for a frontend flush (microtask + rAF)
+// and re-reads the written widget: a just-added primitive can pass the immediate
+// check and then be cleared by Vue mount / widget-store init. The first write is
+// re-applied once after that overwrite; if it still does not hold, the call
+// refuses instead of reporting success.
 
 import {
   applyWidgetWrite,
   WidgetWriteError,
   resolvePromotedInnerTarget,
+  resolveEnclosingPromotedWrite,
   followPromotionToConcrete,
   collectPromotionIntermediates,
 } from "./widget-write.js";
@@ -38,8 +46,9 @@ import {
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
-import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { isPromotedContainer, linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
+import { refreshCustomGeneratedWidgetsAfterWrite } from "./custom-generated-widgets-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
@@ -48,6 +57,8 @@ import {
   serverDeclaresEmptyComboOptions,
   serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
+import { withTimeout } from "./bounded-step.js";
+import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -92,6 +103,210 @@ function coerceAdvisoryMessage(err) {
  * call so the two can never disagree.
  */
 export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
+
+/**
+ * #1922 — wait until a just-added node's frontend widget store has had a chance
+ * to initialize.
+ *
+ * Vue DOM widgets (PrimitiveStringMultiline `value` is one) capture their empty
+ * default at setup and write it back on mount, which lands on a microtask plus
+ * the next animation frame. The immediate post-write check in applyWidgetWrite
+ * therefore reports success, and a later init replaces the value with "".
+ *
+ * This is the smallest wait that observes that overwrite: one microtask, then
+ * one animation frame when the host has rAF, then another microtask so a mount
+ * that itself queues work is visible. No rAF in Node tests → two microtasks,
+ * so existing runSetWidget tests do not hang or grow a timer.
+ *
+ * #1995/#2001 — the wait is BOUNDED. After reconnect, or after an inner-subgraph
+ * widget write, a backgrounded tab / stopped canvas loop never fires rAF, so an
+ * unbounded frame wait held the reply until the relay timed out while the
+ * assignment had already stuck. The bound is long enough for a visible frame
+ * and short enough that an applied write still gets a receipt. Injectable
+ * timers so tests can fire the bound without sleeping.
+ */
+export const FRONTEND_WIDGET_FLUSH_MS = 250;
+
+export function awaitFrontendWidgetFlush(timers) {
+  const flush = new Promise((resolve) => {
+    queueMicrotask(() => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => queueMicrotask(resolve));
+      } else {
+        queueMicrotask(resolve);
+      }
+    });
+  });
+  return withTimeout(flush, FRONTEND_WIDGET_FLUSH_MS, () => undefined, timers);
+}
+
+const SET_WIDGET_ACK_TIMEOUT = Symbol("set-widget-ack-timeout");
+
+function widgetWriteOutcomeUnknownError() {
+  return new Error(
+    `panel_set_widget outcome is UNKNOWN after delivery: the requested widget value was ` +
+      `not observed in a live readback before the acknowledgement wait ended. The original ` +
+      `write was NOT retried. Call panel_query_graph to check the current value before ` +
+      `issuing this mutation again (#2035).`,
+  );
+}
+
+// #2035 — native dynamic-combo roots and custom widgets expose their live mutation through
+// a value setter, while an ordinary LiteGraph widget owns a plain data property. This is a
+// structural capability check, not a node-name allowlist: only a widget whose setter can
+// rebuild/customize the live canvas gets the early-unknown contract below.
+function hasValueSetter(widget) {
+  try {
+    let proto = widget;
+    while (proto && proto !== Object.prototype) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor) return typeof descriptor.set === "function";
+      proto = Object.getPrototypeOf(proto);
+    }
+  } catch {
+    /* an unreadable widget stays on the existing receipt/refusal path */
+  }
+  return false;
+}
+
+function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
+  try {
+    const widget = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    return widget?.type === "custom" || hasValueSetter(widget);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #2025 — never-throwing live read of one named widget. Used by the timeout
+ * readback so a missing node or a hostile getter cannot replace the ack.
+ */
+export function readLiveWidgetValue(node, widgetName) {
+  try {
+    const live = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    if (!live) return { found: false, value: undefined };
+    return { found: true, value: live.value };
+  } catch {
+    return { found: false, value: undefined };
+  }
+}
+
+/**
+ * #2025 — flush and correlate a graph_set_widget result once the write
+ * resolves, and fall back to an idempotent live-widget readback when the
+ * outer wait ends after delivery.
+ *
+ * `writePromise` is the SAME runSetWidget call the handler awaits. A refusal
+ * still throws. A resolved receipt is passed through honestWidgetAck so an
+ * applied write is never a hard timeout with no receipt. A timeout after
+ * delivery reads the targeted widget and returns "applied and verified"
+ * when it equals the requested value.
+ *
+ * The original write is not cancelled: withTimeout never cancels, and a
+ * rejection handler is attached immediately so an abandoned late throw
+ * cannot become an unhandled rejection.
+ *
+ * @param {Promise<any>|any} writePromise
+ * @param {{
+ *   node?: any,
+ *   widget?: any,
+ *   requested?: any,
+ *   timeoutMs?: number,
+ *   timers?: { setTimer?: Function, clearTimer?: Function },
+ *   delivered?: boolean,
+ *   abandonOnTimeout?: boolean,
+ *   onTimeout?: () => void,
+ *   onLateSuccess?: (result: object) => void,
+ * }} [opts]
+ */
+export async function awaitSetWidgetAck(writePromise, {
+  node,
+  widget,
+  requested,
+  timeoutMs,
+  timers,
+  delivered = true,
+  abandonOnTimeout = false,
+  onTimeout,
+  onLateSuccess,
+} = {}) {
+  const tracked = Promise.resolve(writePromise);
+  tracked.then(() => {}, () => {});
+  const captured = tracked.then(
+    (result) => ({ ok: true, result }),
+    (error) => ({ ok: false, error }),
+  );
+  const noteLateSuccess = (result) => {
+    if (typeof onLateSuccess !== "function" || !result) return;
+    try {
+      onLateSuccess(result);
+    } catch {
+      /* bookkeeping only; never rewrite the ack */
+    }
+  };
+  const raced = await withTimeout(captured, timeoutMs, () => SET_WIDGET_ACK_TIMEOUT, timers);
+  if (raced !== SET_WIDGET_ACK_TIMEOUT) {
+    if (raced?.ok) return honestWidgetAck(raced.result);
+    throw raced.error;
+  }
+  // #2116 — the original write is not cancelled. If it applies after this
+  // bound, persist that receipt so retry_of can resolve the outcome without
+  // a second mutation.
+  captured.then((settled) => {
+    if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
+  }, () => {});
+  const live = readLiveWidgetValue(node, widget);
+  const verified = widgetWriteTimeoutReadback({
+    requested,
+    actual: live.value,
+    found: live.found,
+    node_id: node?.id,
+    widget,
+    delivered,
+  });
+  // Only short-circuit when the live widget already equals the request. A
+  // timeout before the write must still surface the inner worded refusal
+  // (stale combo, hung /view probe) rather than inventing outcome-unknown.
+  if (verified.applied && verified.verified) {
+    noteLateSuccess(verified);
+    return verified;
+  }
+  // #2035 — the production wrapper can safely stop waiting here only if the original
+  // body also has a cooperative write fence. Without that fence, returning an unknown
+  // reply would let the still-running body reach applyWidgetWrite later and a caller's
+  // state read/retry could race a delayed mutation. The direct helper keeps its older
+  // refusal-preserving default for callers that do not provide that fence.
+  if (abandonOnTimeout && delivered) {
+    try {
+      onTimeout?.();
+    } catch {
+      /* abandonment is a safety latch; a diagnostic hook must not reopen the wait */
+    }
+    throw widgetWriteOutcomeUnknownError();
+  }
+  const settled = await captured;
+  if (settled?.ok) {
+    const ack = honestWidgetAck(settled.result);
+    noteLateSuccess(ack);
+    return ack;
+  }
+  throw settled.error;
+}
+
+function widgetValuesMatch(expected, actual) {
+  if (
+    (expected !== null && typeof expected === "object") ||
+    (actual !== null && typeof actual === "object")
+  ) {
+    try {
+      return JSON.stringify(expected) === JSON.stringify(actual);
+    } catch {
+      return false;
+    }
+  }
+  return Object.is(expected, actual);
+}
 
 /**
  * #1413/#1418 — the refusal for a stale-combo recovery that never revalidated the value.
@@ -178,7 +393,42 @@ export function scopedAuthorizationTypes(node, promotedResolution, isResolvedPro
   return types;
 }
 
-export async function runSetWidget(
+const ACK_WRAPPED = Symbol("set-widget-ack-wrapped");
+const ACK_STATE = Symbol("set-widget-ack-state");
+
+export async function runSetWidget(node, widgetName, value, opts = {}) {
+  if (!opts[ACK_WRAPPED]) {
+    const ackState = { abandoned: false };
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName);
+    return awaitSetWidgetAck(
+      runSetWidgetBody(node, widgetName, value, {
+        ...opts,
+        [ACK_WRAPPED]: true,
+        [ACK_STATE]: ackState,
+      }),
+      {
+        node,
+        widget: widgetName,
+        requested: value,
+        timeoutMs: opts.timeoutMs,
+        timers: opts.ackTimers,
+        delivered: opts.delivered !== false,
+        onLateSuccess: opts.onLateSuccess,
+        abandonOnTimeout,
+        ...(abandonOnTimeout
+          ? {
+              onTimeout: () => {
+                ackState.abandoned = true;
+              },
+            }
+          : {}),
+      },
+    );
+  }
+  return runSetWidgetBody(node, widgetName, value, opts);
+}
+
+async function runSetWidgetBody(
   node,
   widgetName,
   value,
@@ -192,6 +442,9 @@ export async function runSetWidget(
     // cause it never established.
     describeObjectInfoFailure,
     resolveSource,
+    // #2109 — live root used to locate the enclosing SubgraphNode when the
+    // caller addressed an inner promoted terminal (MCP's enter-then-write path).
+    rootGraph,
     canvas,
     beforeChange,
     afterChange,
@@ -281,8 +534,29 @@ export async function runSetWidget(
     // than done by the caller before this function, so the mutation lands at the write
     // boundary below where NO await follows it — see the note at `write`.
     prepareWriteTarget,
+    // #1922 — wait for the frontend widget store / Vue mount to finish before
+    // treating a verified write as retained. Production uses awaitFrontendWidgetFlush;
+    // unit tests inject a flush that reproduces the later empty overwrite.
+    awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
+    [ACK_STATE]: ackState,
+    clear,
   } = {},
 ) {
+  const assertNotAbandoned = () => {
+    if (ackState?.abandoned) throw widgetWriteOutcomeUnknownError();
+  };
+  if (clear !== undefined && clear !== true && clear !== false) {
+    throw new Error("panel_set_widget clear must be a boolean");
+  }
+  if (clear === true) {
+    if (value !== undefined && value !== null && value !== "") {
+      throw new Error(
+        `panel_set_widget cannot combine clear:true with a non-empty value on widget "${widgetName}"`,
+      );
+    }
+    value = "";
+  }
+
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
   // built, and a caller that answers differently per call is answering about a different
   // fetch. A non-function is the unwired default ("live", see above); a THROWING one, or one
@@ -416,9 +690,39 @@ export async function runSetWidget(
 
   // Resolve the promoted inner target ONCE (PURE — no coercion/mutation). Threaded
   // into applyWidgetWrite so the write never re-resolves to a different node.
-  const promotedResolution = node?.subgraph
+  let promotedResolution = isPromotedContainer(node)
     ? resolvePromotedInnerTarget(node, widgetName, resolveSource)
     : null;
+  // #2109 — MCP's promoted-write protocol addresses the INNER terminal after
+  // entering the subgraph (node 289 `length`, not wrapper 322 `frame_counts`).
+  // That path never ran #366, so the enclosing rail stayed stale, the inner
+  // widget is link-driven from rail -10, and the reply reported applied with a
+  // link-driven warning. Retarget through the enclosing subgraph node's
+  // promoted widget so the serializing parent rail is written. If the promotion
+  // is observed but the rail cannot be identified, refuse rather than write
+  // inner-only.
+  if (!(promotedResolution && promotedResolution.promoted && promotedResolution.target)) {
+    const enclosing = resolveEnclosingPromotedWrite(node, widgetName, {
+      rootGraph,
+      resolveSource,
+    });
+    if (enclosing?.resolution?.promoted && enclosing.resolution.target) {
+      if (!enclosing.resolution.target.parentWidget) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `promoted widget "${enclosing.widgetName}" on subgraph node ${enclosing.owner?.id} ` +
+            `resolves to this inner widget, but its AUTHORITATIVE parent rail widget could not ` +
+            `be identified (the value that serializes at queue time). Refusing to write the ` +
+            `inner widget alone, which would silently render the OLD value (#2109). Edit this ` +
+            `widget from the enclosing subgraph node, or disconnect the inner input to make ` +
+            `the inner value authoritative.`,
+        );
+      }
+      node = enclosing.owner;
+      widgetName = enclosing.widgetName;
+      promotedResolution = enclosing.resolution;
+    }
+  }
   const isResolvedPromotion = !!(
     promotedResolution &&
     promotedResolution.promoted &&
@@ -532,16 +836,17 @@ export async function runSetWidget(
   let concreteWidgetName;
   // #1126 — is the promotion NESTED (outer → intermediate subgraph → … → concrete), as
   // opposed to a single hop straight to the concrete node? Keyed on exactly what
-  // followPromotionToConcrete's own `while (node && node.subgraph)` loop keys on, so the
-  // two can never disagree about whether the chain continues past the immediate target.
-  // Read only by the #1126 unreadable fallback; see its refusal for why it matters.
+  // followPromotionToConcrete's own `while (node && isPromotedContainer(node))` loop
+  // keys on, so the two can never disagree about whether the chain continues past
+  // the immediate target. Read only by the #1126 unreadable fallback; see its
+  // refusal for why it matters.
   let nestedPromotion = false;
   if (promotedButUnresolvable) {
     authTarget = null;
   } else if (isResolvedPromotion) {
-    nestedPromotion = Boolean(promotedResolution.target?.node?.subgraph);
+    nestedPromotion = isPromotedContainer(promotedResolution.target?.node);
     const concrete = followPromotionToConcrete(promotedResolution.target, resolveSource);
-    if (concrete.node && !concrete.node.subgraph && typeof concrete.node.type === "string") {
+    if (concrete.node && !isPromotedContainer(concrete.node) && typeof concrete.node.type === "string") {
       // Reached a genuine concrete backend node WITH a real type string — authorize it.
       // (assertTypeAgainstFreshBackend below then always runs for a promoted write.)
       authTarget = concrete.node;
@@ -603,7 +908,7 @@ export async function runSetWidget(
     //
     // "Could not determine whether this is a promoted widget on a subgraph" is not
     // "determined it is not" — the same fold this cluster exists to correct.
-    if (node?.subgraph && isVirtualSubgraphContainer(node)) {
+    if (isPromotedContainer(node) && isVirtualSubgraphContainer(node)) {
       const containerVerdict = backendHistoryVerdict(node?.type, wasTypeEverDefined);
       // An UNAVAILABLE map is could-not-determine, NOT "the backend lacks this type" —
       // freshBackendDefinesType returns false for both, so the two must be told apart
@@ -711,6 +1016,7 @@ export async function runSetWidget(
   // (2) Repair positional UNKNOWN/UNKNOWN_n widget names against the live def so
   //     the caller's real widget name resolves (#199) — resolved direct node only.
   if (reconcile) {
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     reconcileUnknownWidgetNames(node);
   }
@@ -749,6 +1055,7 @@ export async function runSetWidget(
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     // #757 — CREATE A MISSING TARGET HERE, INSIDE THE SAME SYNCHRONOUS STRETCH.
     //
@@ -839,21 +1146,48 @@ export async function runSetWidget(
       // never thrown over a verified write. The press runs inside its own
       // before/afterChange bracket so the slot changes join the command's undo
       // history.
-      const refresh = refreshDynamicInputsAfterWrite(resolvedTargetNode ?? node, {
+      const targetNode = resolvedTargetNode ?? node;
+      const refresh = refreshDynamicInputsAfterWrite(targetNode, {
         canvas,
         beforeChange,
         afterChange,
         setDirty,
       });
-      if (!refresh) return set;
-      if (refresh.failed) {
-        return {
-          ...set,
+      // #1932 — REBUILD GENERATED CUSTOM WIDGETS after the write. Deno Multi LoRA
+      // (and the LTX sibling) hide the backend widgets panel_set_widget writes and
+      // draw serialize:false custom rows on top. Their redraw() only dirties the
+      // canvas, so active_loras 1→3 reported success while the visible rows/height
+      // stayed at 1 until the subgraph was left and re-entered. Keyed on that
+      // pattern, not a node-type list — see lib/custom-generated-widgets-refresh.js.
+      // Same containment as the #1282 press: a rebuild failure is DISCLOSED on
+      // the success result, never thrown over a verified write.
+      const generated = refreshCustomGeneratedWidgetsAfterWrite(targetNode, {
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+      });
+      let out = set;
+      if (refresh?.failed) {
+        out = {
+          ...out,
           dynamic_inputs_refresh_failed: refresh.failed,
           ...(refresh.inputs ? { dynamic_inputs: refresh.inputs } : {}),
         };
+      } else if (refresh?.refreshed) {
+        out = { ...out, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
       }
-      return { ...set, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
+      if (generated?.failed) {
+        return {
+          ...out,
+          generated_widgets_refresh_failed: generated.failed,
+          ...(generated.widgets ? { generated_widgets: generated.widgets } : {}),
+        };
+      }
+      if (generated?.refreshed) {
+        return { ...out, generated_widgets_refreshed: true, generated_widgets: generated.widgets };
+      }
+      return out;
     } catch (err) {
       // The write refused over a target this attempt had just created. Undo it in the same
       // synchronous stretch, so the graph the refusal is reported over is the graph the
@@ -889,6 +1223,76 @@ export async function runSetWidget(
       throw err;
     }
   };
+
+  const flushFrontendWidgets =
+    typeof awaitFrontendWidgetFlushInjected === "function"
+      ? awaitFrontendWidgetFlushInjected
+      : awaitFrontendWidgetFlush;
+
+  function readLiveWritten(set) {
+    // For an instance-scoped promoted write, the host rail selected during the
+    // authorization pass is the value the frontend serializes. Do not re-find a
+    // same-named widget by list order: a stale/link-driven projection can remain
+    // in `node.widgets` during a promotion rebind and otherwise make retention
+    // checking validate the wrong value after the real rail was updated (#366).
+    const promotedRail =
+      isResolvedPromotion &&
+      set?.promoted_from?.value_scope === "instance"
+        ? promotedResolution?.target?.parentWidget
+        : null;
+    if (promotedRail) {
+      try {
+        return { found: true, value: promotedRail.value };
+      } catch {
+        return { found: false, value: undefined };
+      }
+    }
+    const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
+    const prefer = hosts.filter((host) => host.id === set?.node_id);
+    const rest = hosts.filter((host) => host.id !== set?.node_id);
+    for (const host of [...prefer, ...rest]) {
+      const live = host.widgets?.find((candidate) => candidate?.name === set?.widget);
+      if (live) return { found: true, value: live.value };
+    }
+    return { found: false, value: undefined };
+  }
+
+  function widgetStillHolds(set) {
+    const live = readLiveWritten(set);
+    return live.found && widgetValuesMatch(set?.value, live.value);
+  }
+
+  /**
+   * #1922 — applyWidgetWrite verifies synchronously. A just-added primitive's
+   * Vue/widget-store init can still replace the value on the next frame, so a
+   * success here would be a lie. Wait for that flush; if the value vanished,
+   * write once more (the init has now run, which is why the reporter's second
+   * call stuck); if it still does not hold, refuse.
+   */
+  async function retainVerifiedWrite(set, rewrite) {
+    await flushFrontendWidgets();
+    assertNotAbandoned();
+    assertTargetStillCurrentNow();
+    if (widgetStillHolds(set)) return set;
+    assertNotAbandoned();
+    const retried = rewrite();
+    await flushFrontendWidgets();
+    assertNotAbandoned();
+    assertTargetStillCurrentNow();
+    if (widgetStillHolds(retried)) return retried;
+    const live = readLiveWritten(retried);
+    throw new WidgetWriteError(
+      `Widget "${retried?.widget}" on node ${retried?.node_id} (${node?.type}) did not retain the ` +
+        `requested value after the frontend widget store initialized: wrote ${JSON.stringify(retried?.value)} ` +
+        `but it became ${JSON.stringify(live.found ? live.value : undefined)}. ` +
+        `Nothing is being reported as success. Retry panel_set_widget now that the node is on the canvas.`,
+    );
+  }
+
+  async function succeedWrite(extra = {}, extraResult = {}) {
+    const set = await retainVerifiedWrite(write(extra), () => write(extra));
+    return withWarning(honestWidgetAck({ set, ...extraResult }));
+  }
 
   // #558: the value widget being written may be governed by a non-`fixed`
   // control_after_generate (seed randomize/increment/…), which SILENTLY overwrites
@@ -1054,7 +1458,7 @@ export async function runSetWidget(
   };
 
   try {
-    return withWarning({ set: write() });
+    return await succeedWrite();
   } catch (err) {
     // Only a COMBO rejection is EVER retryable — every other WidgetWriteError
     // (numeric/boolean/promotion/composite/stuck-check) fails closed immediately.
@@ -1116,7 +1520,7 @@ export async function runSetWidget(
         );
       }
       try {
-        return withWarning({ set: write(), refreshed: true });
+        return await succeedWrite({}, { refreshed: true });
       } catch (retryErr) {
         if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
         // A NON-combo failure on the retry is terminal — fail closed loudly.
@@ -1132,7 +1536,7 @@ export async function runSetWidget(
     // #387: server-confirmed upload asset (e.g. a subfolder-nested LoadImage image).
     if (await tryUploadAssetAccept()) {
       try {
-        return withWarning({ set: write(), refreshed: true, server_confirmed: true });
+        return await succeedWrite({}, { refreshed: true, server_confirmed: true });
       } catch (confErr) {
         if (confErr instanceof WidgetWriteError) {
           throw refusalFrame(confErr, " after confirming the uploaded asset exists on the server");
@@ -1178,11 +1582,13 @@ export async function runSetWidget(
         concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
       )
     ) {
-      return withWarning({
-        set: write({ acceptEmptyComboOptions: true }),
-        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
-        empty_option_list: true,
-      });
+      return await succeedWrite(
+        { acceptEmptyComboOptions: true },
+        {
+          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+          empty_option_list: true,
+        },
+      );
     }
 
     // #1126 UNREADABLE OPTION LIST — the sibling of the #507 branch above, and decided
@@ -1405,7 +1811,10 @@ export async function runSetWidget(
           // this call hoped for: an empty final read discloses `empty_option_list` (and carries
           // #507's rail label-adoption rule, correctly, because an empty list really does admit
           // any scalar), an unreadable one discloses `option_list_unreadable`.
-          set = write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true });
+          set = await retainVerifiedWrite(
+            write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true }),
+            () => write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true }),
+          );
         } catch (unreadableErr) {
           // A validation refusal from THIS attempt (a non-string value, a rail whose own
           // list is real and lacks the value) must arrive framed like every other refusal:
@@ -1419,7 +1828,7 @@ export async function runSetWidget(
           }
           throw unreadableErr;
         }
-        return withWarning({
+        return withWarning(honestWidgetAck({
           set,
           ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
           // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
@@ -1459,7 +1868,7 @@ export async function runSetWidget(
                   `itself — may show it as out-of-range.`,
               }
             : {}),
-        });
+        }));
       }
       // The shape test said the server does NOT declare this input's list empty — but when the
       // only schema available is #1223's snapshot, that "no" is not the server publishing a

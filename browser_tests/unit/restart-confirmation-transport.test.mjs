@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { waitForAdultConsentAnswer } from "../../web/js/lib/adult-consent-wait.js";
 
 const PANEL = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const source = readFileSync(PANEL, "utf8").replace(/\r\n/g, "\n");
@@ -107,6 +108,7 @@ function makeQuestionPainter({ record = () => {}, onReveal = () => {} } = {}) {
     "retireInteractiveCard",
     "tr",
     "INTERACTIVE_ABANDONED",
+    "waitForAdultConsentAnswer",
     `${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
   )(
     document,
@@ -125,6 +127,7 @@ function makeQuestionPainter({ record = () => {}, onReveal = () => {} } = {}) {
     () => {},
     (key, fallback) => fallback,
     Symbol("abandoned"),
+    waitForAdultConsentAnswer,
   );
   return { log, paintQuestion };
 }
@@ -157,7 +160,7 @@ test("#1764 the real question painter settles the command before history persist
 test("#1764 production caller path keeps the original ask rid on the answer", () => {
   const bridge = namedFunctionSource(source, "createBridgeClient");
   assert.match(bridge, /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\)/);
-  assert.match(bridge, /reply = \{ rid: msg\.rid, ok: true, result \}/);
+  assert.match(bridge, /reply = \{ rid: msg\.rid, ok: true, result: withViewingWitness\(result\) \}/);
   assert.match(bridge, /thisSock\["send"\]\(JSON\.stringify\(reply\)\)/);
   assert.match(bridge, /settleRid\(reply\)/);
 });

@@ -44,7 +44,13 @@ import {
   isRailLinkPersisted,
   landedAfterThrowWarning,
   readStoredLink,
+  verifyConnect,
+  snapshotInputSlotLinks,
+  snapshotInputSlotNames,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
+import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
 import {
   captureNodeTitles,
   describeTitleRewrites,
@@ -55,7 +61,13 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
-import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "../../web/js/lib/dynamic-slot-reconcile.js";
+import { findExistingRailSlot, refuseConnectToRawRail } from "../../web/js/lib/rail-slot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -120,6 +132,8 @@ function autoMatchSlots(origin, target, from_output, to_input) {
 
 const slotDiagnostic = () => "slot diagnostic";
 const loopbackRefusalReason = () => "loopback";
+const unresolvedWildcardPairReason = () => "wildcard pair";
+const isWildcardSlotType = () => false;
 const findSubgraphHostNode = () => null;
 const uniqueSubgraphOutputName = (_g, base) => base;
 const uniqueSubgraphInputName = (_g, base) => base;
@@ -133,10 +147,13 @@ function buildExecutors(graph, canvas = {}) {
     "railIntent",
     "isEmptyRailSlotRef",
     "findExistingRailSlot",
+    "refuseConnectToRawRail",
     "findSubgraphHostNode",
     "autoMatchSlots",
     "slotDiagnostic",
     "loopbackRefusalReason",
+    "unresolvedWildcardPairReason",
+    "isWildcardSlotType",
     "uniqueSubgraphOutputName",
     "uniqueSubgraphInputName",
     "isLinkPersisted",
@@ -149,12 +166,22 @@ function buildExecutors(graph, canvas = {}) {
     "findLandedRailLink",
     "isRailLinkPersisted",
     "landedAfterThrowWarning",
+    "snapshotGraphState",
+    "snapshotInputSlotLinks",
+    "snapshotInputSlotNames",
+    "verifyConnect",
+    "connectCollateralBullets",
+    "connectCollateralWarning",
     "captureNodeTitles",
     "describeTitleRewrites",
     "titleRewriteWarning",
     "captureSlotNames",
     "describeSlotRewrites",
     "slotRewriteWarning",
+    "isDynamicPrefixSlotName",
+    "captureNamedSlotLinks",
+    "findSlotIndexByName",
+    "reconcileDynamicPrefixSlots",
     `const GRAPH_TOOL_EXECUTORS = {
 ${connectSrc}
 ${exposeOutSrc}
@@ -170,10 +197,13 @@ return GRAPH_TOOL_EXECUTORS;`,
     railIntent,
     isEmptyRailSlotRef,
     findExistingRailSlot,
+    refuseConnectToRawRail,
     findSubgraphHostNode,
     autoMatchSlots,
     slotDiagnostic,
     loopbackRefusalReason,
+    unresolvedWildcardPairReason,
+    isWildcardSlotType,
     uniqueSubgraphOutputName,
     uniqueSubgraphInputName,
     isLinkPersisted,
@@ -186,12 +216,22 @@ return GRAPH_TOOL_EXECUTORS;`,
     findLandedRailLink,
     isRailLinkPersisted,
     landedAfterThrowWarning,
+    snapshotGraphState,
+    snapshotInputSlotLinks,
+    snapshotInputSlotNames,
+    verifyConnect,
+    connectCollateralBullets,
+    connectCollateralWarning,
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,
     captureSlotNames,
     describeSlotRewrites,
     slotRewriteWarning,
+    isDynamicPrefixSlotName,
+    captureNamedSlotLinks,
+    findSlotIndexByName,
+    reconcileDynamicPrefixSlots,
   );
 }
 

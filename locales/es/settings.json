@@ -47,9 +47,13 @@
     "name": "Mostrar RunPod / Local",
     "tooltip": "Muestra el botón de host RunPod / Local en la barra de herramientas: desplegar, iniciar, detener o conectar un pod con GPU en la nube, o volver a lo local. Desactivado por defecto; la opción también se envía a la app móvil conectada."
   },
+  "comfyui-mcp_chatMedia": {
+    "name": "Multimedia generada en el chat",
+    "tooltip": "Muestra las imágenes, videos y audio generados como tarjetas en el chat. Desactívalo para dejar el transcript solo en texto; el agente sigue recibiendo las salidas (incluidos storyboards y marcos de finalización). Se aplica al media generado después del cambio. Las tarjetas ya presentes se quedan; las omitidas no se guardan y no reaparecen al recargar."
+  },
   "comfyui-mcp_videoPreviews": {
-    "name": "Vistas previas de video en el chat",
-    "tooltip": "Reproduce los videos generados dentro del chat. Desactívalo para ahorrar RAM: el video aparece entonces como un marcador con su primer fotograma y nombre de archivo, y al hacer clic se abre el video completo en el visor. Se aplica a los videos generados después del cambio; las tarjetas ya presentes en el chat conservan su reproductor."
+    "name": "Reproducción de video en el chat",
+    "tooltip": "Reproduce los videos generados dentro del chat. Desactívalo para ahorrar RAM: el video aparece entonces como un marcador con su primer fotograma y nombre de archivo, y al hacer clic se abre el video completo en el visor. Esto no oculta los videos del chat: usa Multimedia generada en el chat para eso. Se aplica a los videos generados después del cambio; las tarjetas ya presentes en el chat conservan su reproductor."
   },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Consigue la app beta",
@@ -61,7 +65,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Aviso de render atascado (segundos)",
-    "tooltip": "Cuánto tiempo puede un render de ComfyUI no avanzar NADA antes de avisar al agente de que su render parece atascado o bloqueado (por ejemplo, un paso del sampler colgado por falta de memoria) y pedirle que lo cancele o lo reinicie en lugar de poner otra ejecución en cola. Los pasos de video son legítimamente lentos, así que sé generoso con este valor. Por defecto 180 s; rango 15–3600. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar (o /restart) para cambiarlo en un agente en marcha."
+    "tooltip": "Cuánto tiempo puede un render de ComfyUI no avanzar NADA antes de avisar al agente de que su render parece atascado o bloqueado (por ejemplo, un paso del sampler colgado por falta de memoria) y pedirle que lo cancele o lo reinicie en lugar de poner otra ejecución en cola. Los pasos de video son legítimamente lentos, así que sé generoso con este valor. Por defecto 600 s; rango 15–3600. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar (o /restart) para cambiarlo en un agente en marcha."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "URL de ComfyUI remoto (avanzado)",

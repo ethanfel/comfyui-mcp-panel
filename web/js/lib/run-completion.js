@@ -47,6 +47,7 @@
 
 import { mediaSignature, createCompletionDeduper } from "./completion-dedupe.js";
 import { parseHistoryEntry } from "./history-reconcile.js";
+import { mergeAudioMedia, mergeModel3dMedia, mergeWithheldMedia } from "./node-output-media.js";
 
 export const NO_PROMPT_KEY = "__no_prompt__";
 
@@ -127,7 +128,7 @@ export function createRunCompletionTracker({
   const key = (id) => (id == null ? NO_PROMPT_KEY : String(id));
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
   const deduper = createCompletionDeduper({ ttlMs: duplicateWindowMs, now });
-  const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
+  const buffers = new Map(); // key -> { images: any[], videos: any[], audio: any[], models3d: any[], timer, rearms }
   // A live PreviewImage completion is retained until the caller CONFIRMS its
   // frame reached the agent. If the bridge send fails after execution_success,
   // replay this exact executed batch before falling back to /history. This
@@ -620,6 +621,17 @@ export function createRunCompletionTracker({
         promptId,
         images: Array.isArray(payload?.images) ? [...payload.images] : [],
         videos: Array.isArray(payload?.videos) ? [...payload.videos] : [],
+        // #2126 (codex gate P1) — a held completion is replayed to the agent after a
+        // reload, so dropping the audio here restores the images and silently loses
+        // the file the run also produced. The frame would then name outputs it did
+        // attach and none of the one it could not, which is the same half-truth the
+        // rest of this change removes.
+        ...(payload?.audio?.length ? { audio: [...payload.audio] } : {}),
+        // #2128 — and the 3D refs, for the identical reason. A panel_run whose
+        // /prompt response is delayed past the dispatch hold has its batch retained
+        // for replay; dropping these here restores the previews and silently loses
+        // the .glb, leaving the frame naming only the outputs it could attach.
+        ...(payload?.models3d?.length ? { models3d: [...payload.models3d] } : {}),
         durationMs: Number.isFinite(payload?.durationMs) ? payload.durationMs : null,
         finishedAt: Number.isFinite(payload?.finishedAt) ? payload.finishedAt : null,
         ...(typeof payload?.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
@@ -758,6 +770,9 @@ export function createRunCompletionTracker({
       videos: buf.videos,
       durationMs,
       finishedAt: now(),
+      ...(buf.audio?.length ? { audio: buf.audio } : {}),
+      ...(buf.models3d?.length ? { models3d: buf.models3d } : {}),
+      ...(buf.withheld ? { withheld: buf.withheld } : {}),
       // #986 — the agent is TOLD this output was already announced, never denied it.
       // Which of a replay or a fast re-render it is cannot be proven, so the panel
       // reports what it observed and lets the reader decide.
@@ -809,7 +824,7 @@ export function createRunCompletionTracker({
   function ensureBuffer(k) {
     let buf = buffers.get(k);
     if (!buf) {
-      buf = { images: [], videos: [], timer: null, rearms: 0 };
+      buf = { images: [], videos: [], audio: [], models3d: [], withheld: null, timer: null, rearms: 0 };
       buffers.set(k, buf);
     }
     return buf;
@@ -1002,6 +1017,9 @@ export function createRunCompletionTracker({
         // Epoch ms of the REAL finish, or null when history records none (#1199).
         finishedAt: historyFinishedAt,
         reconciled: true,
+        ...(parsed.audio?.length ? { audio: parsed.audio } : {}),
+        ...(parsed.models3d?.length ? { models3d: parsed.models3d } : {}),
+        ...(parsed.withheld ? { withheld: parsed.withheld } : {}),
         ...(mediaLessQueued ? { noMedia: true } : {}),
       });
     }
@@ -1142,10 +1160,17 @@ export function createRunCompletionTracker({
     /**
      * ComfyUI `executed` (per output node) — buffer this prompt's outputs.
      * @param {string|null} id
-     * @param {{images?: any[], videos?: any[]}} outputs
+     * @param {{images?: any[], videos?: any[], audio?: any[], models3d?: any[], withheld?: { count:number, keys:string[], types:string[] }|null}} outputs
      */
-    onExecuted(id, { images = [], videos = [] } = {}) {
-      if (!images.length && !videos.length) return;
+    onExecuted(id, { images = [], videos = [], audio = [], models3d = [], withheld = null } = {}) {
+      const extra = withheld?.count > 0 ? withheld : null;
+      // #2126 — ComfyUI's `audio` bag. Buffered like `withheld`: it is CONTENT the
+      // completion frame has to report, but it is never attached, so it must not be
+      // the reason an otherwise-empty batch flushes.
+      const audioRefs = Array.isArray(audio) ? audio.filter((m) => m && m.filename) : [];
+      // #2128 — the 3D bags, on exactly those terms.
+      const model3dRefs = Array.isArray(models3d) ? models3d.filter((m) => m && m.filename) : [];
+      if (!images.length && !videos.length && !audioRefs.length && !model3dRefs.length && !extra) return;
       // Idempotency fence: if this prompt already reached TERMINAL (a /history
       // reconcile beat the live WS, which then replayed a late `executed`), do NOT
       // re-buffer it — otherwise the trailing execution_success would flush a
@@ -1164,7 +1189,16 @@ export function createRunCompletionTracker({
       const buf = ensureBuffer(k);
       if (images.length) buf.images.push(...images);
       if (videos.length) buf.videos.push(...videos);
-      arm(k);
+      if (audioRefs.length) buf.audio = mergeAudioMedia(buf.audio, audioRefs);
+      if (model3dRefs.length) buf.models3d = mergeModel3dMedia(buf.models3d, model3dRefs);
+      if (extra) buf.withheld = mergeWithheldMedia(buf.withheld, extra);
+      // Withheld-only must not arm the orphan timer: flush() of an empty
+      // images/videos batch deletes the buffer and would drop the count
+      // before execution_success can report it. Audio-only is the same shape
+      // for the same reason (#2126) — its refs live on the buffer that flush()
+      // would delete without emitting, so onExecutionSuccess is what reports it.
+      // 3D-only likewise (#2128): a Save3DAdvanced attaches nothing either.
+      if (images.length || videos.length) arm(k);
     },
 
     /** ComfyUI `execution_success` — the authoritative flush for THIS prompt. */
@@ -1197,8 +1231,21 @@ export function createRunCompletionTracker({
       // the duration start. A keyed panel_run remains pending until its receipt.
       // Snapshot this before flush(): flush() consumes the media buffers, so
       // checking hasBufferedMedia(k) afterwards would misclassify a media run
-      // as a late media-less success.
+      // as a late media-less success. Withheld CompareFrames bags live on the
+      // same buffer and must be read here too — flush() of an empty images/
+      // videos batch returns without emitting, which is what we want (attach
+      // none) but would otherwise drop the count (#1934).
       const hasMedia = hasBufferedMedia(k);
+      const withheld = buffers.get(k)?.withheld ?? null;
+      // #2126 — read with `withheld`, and for the same reason: flush() drops an
+      // images/videos-empty buffer, so an audio-only run's refs have to be taken
+      // BEFORE it or the completion frame reports a run that produced nothing.
+      const audio = buffers.get(k)?.audio ?? null;
+      // #2128 — same read, same reason: a Save3DAdvanced-only run buffers no
+      // images/videos, so flush() drops the buffer without emitting and these refs
+      // have to be taken off it first or the frame reports a run that produced
+      // nothing while a 16 MB .glb sits in output/3D/.
+      const models3d = buffers.get(k)?.models3d ?? null;
       const mediaLess = !hasMedia && panelQueued.has(k);
       const mediaLessStart = mediaLess ? starts.get(k) : null;
       flush(k);
@@ -1226,6 +1273,9 @@ export function createRunCompletionTracker({
           durationMs: mediaLessStart != null ? now() - mediaLessStart : null,
           finishedAt: now(),
           noMedia: true,
+          ...(audio?.length ? { audio } : {}),
+          ...(models3d?.length ? { models3d } : {}),
+          ...(withheld ? { withheld } : {}),
         });
         terminalNoMediaSuccess.delete(k);
       } else if (!hasMedia) {
@@ -1238,6 +1288,9 @@ export function createRunCompletionTracker({
           durationMs: starts.has(k) ? finishedAt - starts.get(k) : null,
           finishedAt,
           at: finishedAt,
+          ...(audio?.length ? { audio } : {}),
+          ...(models3d?.length ? { models3d } : {}),
+          ...(withheld ? { withheld } : {}),
         });
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
@@ -1284,7 +1337,25 @@ export function createRunCompletionTracker({
      */
     onExecutingNull() {
       for (const k of [...buffers.keys()]) {
-        if (!active.has(k)) flush(k);
+        // #2126 (codex gate P1) — only a buffer with something to ATTACH has
+        // anything to salvage here. flush() of an images/videos-empty batch cannot
+        // emit; all it does is DELETE the buffer, taking the audio/models3d/withheld
+        // refs that onExecutionSuccess reads off it for the completion frame. The 3D
+        // channel (#2128) depends on this guard exactly as the audio one does: a
+        // Save3DAdvanced-only run buffers nothing attachable either. Queue-idle
+        // routinely arrives before execution_success for a run whose start and
+        // `executing(node)` frames were dropped, and destroying the refs there
+        // re-creates the reported defect exactly: a run that produced a file,
+        // reported to the agent as producing none. Reproduced by execution before
+        // this guard existed — onQueued/onExecuted(audio)/onExecutingNull/
+        // onExecutionSuccess flushed `{audio: null, noMedia: true}`.
+        //
+        // Retention is bounded: onExecuted put the key in `pending`, so reconcile
+        // or the give-up eviction deletes the buffer if no terminal signal ever
+        // comes, the next run's sequential flush in onExecutionStart clears it (and
+        // there the refs ARE recoverable — that run reconciles from /history), and
+        // execution_success itself deletes it via flush()'s empty-batch path.
+        if (!active.has(k) && hasBufferedMedia(k)) flush(k);
       }
     },
 
@@ -1392,6 +1463,9 @@ export function createRunCompletionTracker({
           durationMs: lateSuccess.durationMs,
           finishedAt: lateSuccess.finishedAt,
           noMedia: true,
+          ...(lateSuccess.audio?.length ? { audio: lateSuccess.audio } : {}),
+          ...(lateSuccess.models3d?.length ? { models3d: lateSuccess.models3d } : {}),
+          ...(lateSuccess.withheld ? { withheld: lateSuccess.withheld } : {}),
         });
       }
       return nextKey;
@@ -1543,6 +1617,18 @@ export function createRunCompletionTracker({
         promptId: k,
         images: Array.isArray(payload.images) ? [...payload.images] : [],
         videos: Array.isArray(payload.videos) ? [...payload.videos] : [],
+        // #2126 — restored only when it is genuinely an array of refs; a persisted
+        // record from an older build simply has no `audio` key, and must not become
+        // an `audio: []` the composer then reasons about.
+        ...(Array.isArray(payload.audio) && payload.audio.length
+          ? { audio: [...payload.audio] }
+          : {}),
+        // #2128 — restored on the same terms: only from a genuine non-empty array,
+        // so a record persisted by a build without the key does not gain a
+        // `models3d: []` the composer then reasons about.
+        ...(Array.isArray(payload.models3d) && payload.models3d.length
+          ? { models3d: [...payload.models3d] }
+          : {}),
         durationMs: Number.isFinite(payload.durationMs) ? payload.durationMs : null,
         finishedAt: Number.isFinite(payload.finishedAt) ? payload.finishedAt : null,
         ...(typeof payload.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),

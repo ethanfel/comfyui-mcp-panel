@@ -14,6 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -39,6 +40,10 @@ import {
   readScopeFromBody,
   cancelPendingScopedQueueItem,
   dispatchScopedRun,
+  invokeQueuePromptWithBrowserStack,
+  queueItemScopeIds,
+  unwrapExactScopeTargets,
+  withScopedQueueItemTargets,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
@@ -176,9 +181,473 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
   return app;
 }
 
+// A production-shaped queue chain with the exact #1782 topology: both methods
+// are shadowed by instance properties, while their prototypes carry the native
+// scope plumbing. The forwarding variant proves that shadowing alone is not a
+// Panel defect. The dropping variant models an external wrapper that changes
+// the queue contract; the panel must keep its safe body-repair fallback rather
+// than bypassing that wrapper and silently skipping its queue behavior.
+function makeShadowedQueueFrontend({ dropArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, batch, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return true;
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = apiTarget.fetchApi;
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  api.queuePrompt = dropArgs
+    ? async function (number, batch) {
+        return nativeApiQueuePrompt.call(api, number, batch);
+      }
+    : async function (...args) {
+        return nativeApiQueuePrompt.apply(api, args);
+      };
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+      this.graph = null;
+    }
+
+    async queuePrompt(number, batch, arg) {
+      const queueNodeIds = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const options = queueNodeIds?.length
+        ? { partialExecutionTargets: queueNodeIds }
+        : undefined;
+      return this.api.queuePrompt(number, batch, options);
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  app.queuePrompt = dropArgs
+    ? async function (number, batch) {
+        return nativeAppQueuePrompt.call(app, number, batch);
+      }
+    : async function (...args) {
+        return nativeAppQueuePrompt.apply(app, args);
+      };
+  return { app, api };
+}
+
+// Frontend 1.49.6 ComfyApp.queuePrompt: push {number, batchCount, queueNodeIds},
+// then the processor reads that array as partialExecutionTargets. An own-property
+// wrapper that calls through with only (number, batch) still reaches this loop —
+// it just pushes queueNodeIds: undefined. Filling the item (not bypassing the
+// wrapper) is how the panel delivers scope natively on that build (#1782).
+function makeFrontend1496({ dropAppArgs = false, dropApiArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, data, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output: data?.output ?? output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { prompt_id: "native" };
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = (...a) => apiTarget.fetchApi(...a);
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  api.queuePrompt = dropApiArgs
+    ? async function (number, data) {
+        return nativeApiQueuePrompt.call(api, number, data);
+      }
+    : async function (...args) {
+        return nativeApiQueuePrompt.apply(api, args);
+      };
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.queueItems = [];
+      this.processingQueue = false;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+      this.graph = null;
+    }
+
+    async queuePrompt(number, batchCount = 1, optionsOrQueueNodeIds = {}) {
+      const options = Array.isArray(optionsOrQueueNodeIds)
+        ? { queueNodeIds: optionsOrQueueNodeIds }
+        : optionsOrQueueNodeIds && typeof optionsOrQueueNodeIds === "object"
+          ? optionsOrQueueNodeIds
+          : {};
+      this.queueItems.push({
+        number,
+        batchCount,
+        queueNodeIds: options.queueNodeIds,
+        requestId: 1,
+      });
+      if (this.processingQueue) return false;
+      this.processingQueue = true;
+      try {
+        while (this.queueItems.length) {
+          const item = this.queueItems.pop();
+          const p = await this.graphToPrompt();
+          await this.api.queuePrompt(item.number, p, {
+            partialExecutionTargets: item.queueNodeIds,
+          });
+        }
+      } finally {
+        this.processingQueue = false;
+      }
+      return true;
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  app.queuePrompt = dropAppArgs
+    ? async function (number, batch) {
+        return nativeAppQueuePrompt.call(app, number, batch);
+      }
+    : async function (...args) {
+        return nativeAppQueuePrompt.apply(app, args);
+      };
+  return { app, api };
+}
+
+// 1.41.21 topology: native app.queuePrompt pushes {number, batchCount, queueNodeIds}
+// then later calls api.queuePrompt(number, prompt, { partialExecutionTargets }).
+// Two-arg own-property wrappers capture the original function and omit the third
+// argument — the field report on frontend 1.41.21.
+function makeFrontend14121({ dropAppArgs = false, dropApiArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, data, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output: data?.output ?? output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { prompt_id: "x" };
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = apiTarget.fetchApi;
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  if (dropApiArgs) {
+    api.queuePrompt = async function (number, prompt) {
+      return nativeApiQueuePrompt.apply(api, [number, prompt]);
+    };
+  } else {
+    api.queuePrompt = async function (...args) {
+      return nativeApiQueuePrompt.apply(api, args);
+    };
+  }
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.queueItems = [];
+      this.processingQueue = false;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+    }
+
+    async queuePrompt(number, batchCount = 1, queueNodeIds) {
+      this.queueItems.push({ number, batchCount, queueNodeIds });
+      if (this.processingQueue) return false;
+      this.processingQueue = true;
+      try {
+        while (this.queueItems.length) {
+          const item = this.queueItems.pop();
+          const p = await this.graphToPrompt();
+          const options = item.queueNodeIds?.length
+            ? { partialExecutionTargets: item.queueNodeIds }
+            : undefined;
+          await this.api.queuePrompt(item.number, p, options);
+        }
+      } finally {
+        this.processingQueue = false;
+      }
+      return true;
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  if (dropAppArgs) {
+    app.queuePrompt = async function (number, batch) {
+      return nativeAppQueuePrompt.apply(app, [number, batch]);
+    };
+  } else {
+    app.queuePrompt = async function (...args) {
+      return nativeAppQueuePrompt.apply(app, args);
+    };
+  }
+  return { app, api };
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+test("#248 queuePrompt invocation keeps the original browser stack for sync and async throws", async () => {
+  const browserStack = [
+    "TypeError: Cannot convert undefined or null to object",
+    "    at app.queuePrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)",
+  ].join("\n");
+  for (const queuePrompt of [
+    () => {
+      const error = new TypeError("Cannot convert undefined or null to object");
+      error.stack = browserStack;
+      throw error;
+    },
+    () => {
+      const error = new TypeError("Cannot convert undefined or null to object");
+      error.stack = browserStack;
+      return Promise.reject(error);
+    },
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }, 0, 1, undefined),
+      (error) => {
+        assert.match(error.message, /^app\.queuePrompt failed:\n/);
+        assert.match(error.message, /Cannot convert undefined or null to object/);
+        assert.match(error.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 a non-Error with a readable stack keeps its identity and message", async () => {
+  const thrown = {
+    name: "QueueWrapperFailure",
+    message: "structured queue failure",
+    stack: "QueueWrapperFailure: structured queue failure\n    at extension://queue-wrapper.js:17:9",
+  };
+  for (const queuePrompt of [
+    () => {
+      throw thrown;
+    },
+    () => Promise.reject(thrown),
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+      (received) => {
+        assert.equal(received, thrown);
+        assert.equal(received.message, thrown.message);
+        assert.equal(received.stack, thrown.stack);
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 a non-Error with a spoofed Error toStringTag keeps its identity and message", async () => {
+  for (const thrown of [
+    {
+      [Symbol.toStringTag]: "Error",
+      name: "SpoofedQueueFailure",
+      message: "structured spoofed queue failure",
+      stack: "SpoofedQueueFailure: structured spoofed queue failure\n    at extension://queue-wrapper.js:23:9",
+    },
+    Object.assign(Object.create({ [Symbol.toStringTag]: "Error" }), {
+      name: "InheritedSpoofedQueueFailure",
+      message: "structured inherited spoofed queue failure",
+      stack: "InheritedSpoofedQueueFailure: structured inherited spoofed queue failure\n    at extension://queue-wrapper.js:29:9",
+    }),
+  ]) {
+    for (const queuePrompt of [
+      () => {
+        throw thrown;
+      },
+      () => Promise.reject(thrown),
+    ]) {
+      await assert.rejects(
+        () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+        (received) => {
+          assert.equal(received, thrown);
+          assert.equal(received.message, thrown.message);
+          assert.equal(received.stack, thrown.stack);
+          return true;
+        },
+      );
+    }
+  }
+});
+
+test("#248 a finite dynamic toStringTag Proxy keeps non-Error identity and message", async () => {
+  const thrown = new Proxy(
+    {},
+    {
+      get(target, property, receiver) {
+        if (property === Symbol.toStringTag) return "Error";
+        if (property === "message") return "structured dynamic proxy queue failure";
+        if (property === "stack") return "structured dynamic proxy stack";
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  for (const queuePrompt of [
+    () => {
+      throw thrown;
+    },
+    () => Promise.reject(thrown),
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+      (received) => {
+        assert.equal(received, thrown);
+        assert.equal(received.message, "structured dynamic proxy queue failure");
+        assert.equal(received.stack, "structured dynamic proxy stack");
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 hostile or non-string stacks cannot mask the original queue failure", async () => {
+  for (const stack of [Symbol("hostile stack"), { toString: () => { throw new Error("coercion"); } }]) {
+    const error = new TypeError("Cannot convert undefined or null to object");
+    error.stack = stack;
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(error) }),
+      (received) => {
+        assert.equal(received, error);
+        assert.equal(received.message, "Cannot convert undefined or null to object");
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 huge stacks are bounded and credential-shaped text is redacted", async () => {
+  const error = new TypeError("Cannot convert undefined or null to object");
+  error.stack = [
+    error.message,
+    "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)",
+    `    at fetch (https://example.test/?opaque=${"a".repeat(64)})`,
+    "    at noisy-frame ".repeat(100_000),
+  ].join("\n");
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(error) }),
+    (wrapped) => {
+      assert.ok(wrapped.message.length <= 4096, `message must be bounded, got ${wrapped.message.length}`);
+      assert.match(wrapped.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+      assert.match(wrapped.message, /browser stack truncated/);
+      assert.match(wrapped.message, /«redacted»/);
+      assert.doesNotMatch(wrapped.message, /opaque=aaaa/);
+      return true;
+    },
+  );
+});
+
+test("#248 a Proxy getPrototypeOf trap cannot replace the original thrown value", async () => {
+  let prototypeReads = 0;
+  const hostile = new Proxy({}, {
+    getPrototypeOf() {
+      prototypeReads += 1;
+      throw new Error("getPrototypeOf trap should not run");
+    },
+  });
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 0);
+});
+
+test("#248 a Proxy cannot hang or spoof Error classification through a cyclic prototype", async () => {
+  let prototypeReads = 0;
+  let hostile;
+  hostile = new Proxy({}, {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return hostile;
+    },
+  });
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 1);
+});
+
+test("#248 a Proxy cannot force an unbounded Error prototype scan", async () => {
+  let prototypeReads = 0;
+  const handler = {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return new Proxy({}, handler);
+    },
+  };
+  const hostile = new Proxy({}, handler);
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 33);
+});
+
+test("#248 cross-realm Error-shaped values retain their browser stack", async () => {
+  const crossRealmError = runInNewContext(`(() => {
+    const error = new TypeError("Cannot convert undefined or null to object");
+    error.stack = "TypeError: Cannot convert undefined or null to object\\n" +
+      "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)";
+    return error;
+  })()`);
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(crossRealmError) }),
+    (wrapped) => {
+      assert.match(wrapped.message, /^app\.queuePrompt failed:\n/);
+      assert.match(wrapped.message, /Cannot convert undefined or null to object/);
+      assert.match(wrapped.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+      return true;
+    },
+  );
+});
 
 test("#1782 queuePromptScopeArgs: no scope ⇒ [undefined]; 1.49.6 options carry both queue layers", () => {
   assert.deepEqual(queuePromptScopeArgs(undefined), [undefined]);
@@ -3801,6 +4270,236 @@ test("#1782 frontend 1.49.6 shapes reach /prompt natively and dropped wrappers s
       app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
     });
     assert.equal(result.outcome, "dispatched", "a dropping wrapper remains safe and useful");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(result.repaired, 1);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 actual queue path: shadowed forwarding preserves scope; dropping wrappers stay on repair", async () => {
+  const stop = keepAlive();
+  try {
+    const forwardingServer = makeServer();
+    const forwarding = makeShadowedQueueFrontend({ apiTarget: { fetchApi: forwardingServer } });
+    const native = await dispatchScopedRun({
+      app: forwarding.app,
+      apiTarget: forwarding.api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(forwarding.app, "queuePrompt"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(forwarding.api, "queuePrompt"), true);
+    assert.equal(native.outcome, "dispatched");
+    assert.equal(native.scopeAppliedBy, "frontend", "shadowing alone does not force repair");
+    assert.equal(native.repaired, 0);
+    assert.equal(forwardingServer.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(forwardingServer.calls[0].options.body).partial_execution_targets,
+      ["14"],
+    );
+
+    const droppingServer = makeServer();
+    const dropping = makeShadowedQueueFrontend({
+      dropArgs: true,
+      apiTarget: { fetchApi: droppingServer },
+    });
+    const repaired = await dispatchScopedRun({
+      app: dropping.app,
+      apiTarget: dropping.api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(dropping.app, "queuePrompt"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(dropping.api, "queuePrompt"), true);
+    assert.equal(repaired.outcome, "dispatched");
+    assert.equal(repaired.scopeAppliedBy, "request_body_repair");
+    assert.equal(repaired.repaired, 1);
+    assert.equal(dropping.api.posted.length, 4, "three fenced scope-less attempts, then repair");
+    assert.equal(droppingServer.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(droppingServer.calls[0].options.body).partial_execution_targets,
+      ["14"],
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 queueItemScopeIds / unwrapExactScopeTargets: option objects are the same ids, not a different request", () => {
+  assert.deepEqual(queueItemScopeIds(["76:34"]), ["76:34"]);
+  assert.deepEqual(queueItemScopeIds({ queueNodeIds: ["76:34"] }), ["76:34"]);
+  assert.deepEqual(queueItemScopeIds({ partialExecutionTargets: ["76:34"] }), ["76:34"]);
+  assert.equal(queueItemScopeIds(null), null);
+  assert.equal(queueItemScopeIds("14"), null);
+  assert.equal(queueItemScopeIds({ queueNodeIds: [] }), null);
+  assert.deepEqual(unwrapExactScopeTargets({ queueNodeIds: ["14"] }, ["14"]), ["14"]);
+  assert.deepEqual(unwrapExactScopeTargets({ partialExecutionTargets: [14] }, ["14"]), ["14"]);
+  assert.equal(unwrapExactScopeTargets({ queueNodeIds: ["9"] }, ["14"]), null, "wrong ids stay a mismatch");
+  assert.equal(unwrapExactScopeTargets(["14", "9"], ["14"]), null, "extra ids stay a mismatch");
+  assert.equal(unwrapExactScopeTargets("14", ["14"]), null, "a bare string is not the option shape");
+});
+
+test("#1782 withScopedQueueItemTargets: a dropped 3rd arg is restored on THIS run's item only", async () => {
+  const items = [];
+  const app = { queueItems: items };
+  const execIds = ["14"];
+  const other = { number: MARK_B, requestId: 9, queueNodeIds: undefined };
+  items.push(other);
+  await withScopedQueueItemTargets(app, { queueMark: MARK_A, execIds }, () => {
+    items.push({ number: MARK_A, batchCount: 1, requestId: 1, queueNodeIds: undefined });
+    items.push({ number: MARK_A, requestId: 2, queueNodeIds: { queueNodeIds: ["14"] } });
+    items.push({ number: MARK_A, requestId: 3, queueNodeIds: ["9"] });
+    items.push({ number: MARK_A, queueNodeIds: undefined });
+  });
+  assert.deepEqual(items[0].queueNodeIds, undefined, "a different run's item is never touched");
+  assert.equal(items[1].queueNodeIds, execIds, "the missing array is restored by reference so the ownership tag survives");
+  assert.equal(items[2].queueNodeIds, execIds, "an options object naming the exact roots is flattened to the array 1.49.6 reads");
+  assert.deepEqual(items[3].queueNodeIds, ["9"], "a present array naming different roots is not overwritten");
+  assert.equal(items[4].queueNodeIds, undefined, "an item without ComfyApp's requestId is left for body repair");
+});
+
+test("#1782 frontend 1.49.6: dropping app.queuePrompt still delivers scope natively via queueItems", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend1496({
+      dropAppArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(app, "queuePrompt"), true);
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(
+      result.scopeAppliedBy,
+      "frontend",
+      "1.49.6's own processor wrote partial_execution_targets after the item was restored — not request_body_repair",
+    );
+    assert.equal(result.repaired, 0);
+    assert.equal(server.calls.length, 1, "the first native attempt is enough");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 frontend 1.49.6: a dropping api.queuePrompt still exact-target repairs rather than false-rejecting", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend1496({
+      dropAppArgs: true,
+      dropApiArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(result.repaired, 1);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(server.calls[0].options.body).partial_execution_targets,
+      ["14"],
+      "the fallback still writes EXACTLY the requested roots, never a full-graph post",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 exact-target fallback: a store-layer options object in the body is rewritten, not false-rejected", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server,
+      execIds: ["14"],
+      contentHash: OUR_HASH,
+      batch: 1,
+      toNodeId: 14,
+      queueMark: MARK_A,
+      repairScope: true,
+    });
+    const res = await guard(
+      ...promptPost({
+        prompt: OUR_OUTPUT,
+        client_id: "x",
+        number: MARK_A,
+        partial_execution_targets: { queueNodeIds: ["14"], partialExecutionTargets: ["14"] },
+      }),
+    );
+    assert.equal(res.status, 200, "exact ids in the store-layer shape are not a refusal");
+    assert.equal(guard.state.repaired, 1);
+    assert.equal(guard.state.dropped, null);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1998 1.41.21 two-arg app wrapper still delivers the target through queuePrompt", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend14121({
+      dropAppArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(app, "queuePrompt"), true);
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "frontend", "queue item restore reaches api.queuePrompt before body repair");
+    assert.equal(result.repaired, 0);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1998 captured two-arg api wrapper still falls through to request-body repair", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend14121({
+      dropAppArgs: true,
+      dropApiArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(result.outcome, "dispatched");
     assert.equal(result.scopeAppliedBy, "request_body_repair");
     assert.equal(result.repaired, 1);
     assert.equal(server.calls.length, 1);

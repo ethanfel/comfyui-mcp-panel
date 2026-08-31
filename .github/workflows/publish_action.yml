@@ -8,6 +8,13 @@ on:
     paths:
       - "pyproject.toml"
 
+# After a successful Registry publish, --ensure --push writes the archival
+# `v<X>` tag. contents: write is that push; the job still cannot trigger a
+# second publish — GitHub does not run a branches-filtered workflow for a tag
+# ref, and GITHUB_TOKEN pushes do not re-fire workflows anyway (#1882).
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -176,6 +183,16 @@ jobs:
           print(f"scanned {len(archive)} shipped files", file=sys.stderr)
           sys.exit(1 if bad else 0)
           PY
+
+      # The YARA step above covers SVG onload/onerror and process-spawn literals ONLY.
+      # It knows nothing about python_network_operations — which is exactly how ten
+      # consecutive releases shipped with this job GREEN while the registry flagged
+      # every one of them (#1886). The replica scans the published archive (git-tracked
+      # minus .comfyignore), never the repo: tests and scripts still contain every
+      # trigger, and a repo-wide read would have called the clean 0.15.113 dirty.
+      # Ratcheted to ZERO. This number must never go up.
+      - name: Security scan (Comfy Registry parity — network rules)
+        run: node scripts/check-registry-yara.mjs --allow 0
 
       # 0.6.2 proved the scanner also matches call-shaped literals in shipped
       # markdown PROSE (CHANGELOG.md quoting the removed spawn call → flagged,
@@ -373,3 +390,11 @@ jobs:
             echo "::warning::Registry publish with --changelog-file failed — retrying WITHOUT the changelog so the release still ships."
           fi
           comfy node publish --token "$REGISTRY_TOKEN"
+
+      # Inverse of release-tag-guard.yml: that workflow hangs off the tag push,
+      # so a publish that never gets a tag (0.15.97, 0.15.111–0.15.113) is
+      # silent. This runs because the publish ran. --ensure creates the
+      # annotated tag on the commit that cut the version when it is missing;
+      # --push is what makes the operand visible to `git tag` afterwards.
+      - name: Published version must have a git tag
+        run: node scripts/check-release-tag.mjs --published --ensure --push
