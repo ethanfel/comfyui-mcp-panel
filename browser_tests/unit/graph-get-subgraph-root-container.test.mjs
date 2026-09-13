@@ -20,6 +20,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { isPromotedContainer } from "../../web/js/lib/graph-read.js";
+import { resolveLiveNode } from "../../web/js/lib/node-id.js";
+import { resolvePromotedContainerForRead } from "../../web/js/lib/subgraph-scope.js";
 
 const PANEL_SRC = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
@@ -53,6 +55,7 @@ function loadGetSubgraph() {
       "summarizeNode",
       "promotedTerminalWitnesses",
       "isPromotedContainer",
+      "resolvePromotedContainerForRead",
       `return ({${method}}).graph_get_subgraph;`,
     )(
       () => ({ graph: {} }),
@@ -66,6 +69,7 @@ function loadGetSubgraph() {
       (inner) => ({ id: inner.id, type: inner.type }),
       () => [],
       isPromotedContainer,
+      resolvePromotedContainerForRead,
     );
 }
 
@@ -206,4 +210,141 @@ test("#1941 a live inner graph is still a container — the throw does not fire"
   assert.equal(out.node_count, 1);
   assert.equal(out.nodes[0].id, 12);
   assert.deepEqual(out.promoted_terminals, []);
+  assert.equal(out.truncated, false, "a complete ownership envelope must emit truncated:false, not omit it");
+});
+
+/** MCP's promoted-write fence: missing `truncated` used to be `!== false` and
+ *  a veto; current MCP still vetoes any asserted truncation and any
+ *  node_count/nodes length mismatch. Copied from
+ *  describePromotedSubgraphEnvelope so a listing cap cannot look like a
+ *  complete witness. */
+function mcpAcceptsOwnershipEnvelope(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  // Older MCP: `truncated !== false` (unset is a veto).
+  if (payload.truncated !== false) return false;
+  if (!Number.isSafeInteger(payload.node_count) || payload.node_count < 0) return false;
+  if (!Array.isArray(payload.nodes)) return false;
+  if (payload.nodes.length !== payload.node_count) return false;
+  return true;
+}
+
+test("#2057 a 162-node subgraph still publishes a complete ownership envelope", () => {
+  // The reporter's wrapper 6066 had 162 inner nodes. graph_get_subgraph used to
+  // slice at MAX_STATE_NODES (50 in this harness, 100 in production) and set
+  // truncated:true — MCP then refused panel_set_widget on the promoted
+  // model_name before graph_set_widget dispatch.
+  const inner = Array.from({ length: 162 }, (_, i) => ({
+    id: i + 1,
+    type: i === 0 ? "UNETLoader" : "CLIPTextEncode",
+  }));
+  const getSubgraph = loadGetSubgraph()({
+    id: 6066,
+    type: "SubgraphNode",
+    title: "wrapper",
+    subgraph: { _nodes: inner },
+  });
+  const out = getSubgraph({ node_id: 6066 });
+  assert.equal(out.truncated, false, "truncated must be exactly false, not unset and not true");
+  assert.equal(out.node_count, 162);
+  assert.equal(out.nodes.length, 162);
+  assert.equal(out.nodes[0].id, 1);
+  assert.equal(out.nodes[161].id, 162);
+  assert.equal(out.truncation_hint, undefined);
+  assert.ok(mcpAcceptsOwnershipEnvelope(out), "MCP's ownership fence must accept this envelope");
+});
+
+test("#2057 graph_get_subgraph does not cap the inner list used as an ownership envelope", () => {
+  const src = PANEL_SRC.slice(
+    PANEL_SRC.indexOf("graph_get_subgraph({ node_id }) {"),
+    PANEL_SRC.indexOf("async graph_add_node(", PANEL_SRC.indexOf("graph_get_subgraph({ node_id }) {")),
+  );
+  assert.doesNotMatch(
+    src,
+    /inner\.slice\s*\(\s*0\s*,\s*MAX_STATE_NODES\s*\)/,
+    "slicing the inner list makes node_count disagree with nodes[] and vetoes the write",
+  );
+  assert.doesNotMatch(
+    src,
+    /truncated:\s*inner\.length\s*>\s*MAX_STATE_NODES/,
+    "asserting truncated:true is a promoted-write veto even when promoted_terminals is complete",
+  );
+  assert.match(src, /truncated:\s*false/, "complete ownership envelopes emit truncated:false");
+  assert.match(
+    src,
+    /resolvePromotedContainerForRead\(graph, rootGraph \?\? graph, node_id\)/,
+    "MCP's classifier must find the HOST while the canvas is inside it",
+  );
+});
+
+test("#2057 resolvePromotedContainerForRead finds the host while viewing its inner graph", () => {
+  const inner = { _nodes: [{ id: 139, type: "PrimitiveBoolean" }] };
+  const host = { id: 140, type: "SubgraphNode", subgraph: inner };
+  const root = { _nodes: [host] };
+  assert.equal(resolveLiveNode(inner, 140), null);
+  assert.equal(resolvePromotedContainerForRead(inner, root, 140), host);
+  assert.equal(resolvePromotedContainerForRead(inner, root, "140"), host);
+});
+
+test("#2057 graph_get_subgraph classifies the host from inside instead of a missing-id throw", () => {
+  const innerNode = { id: 139, type: "PrimitiveBoolean" };
+  const inner = { _nodes: [innerNode] };
+  const host = { id: 140, type: "SubgraphNode", title: "Image to Video (MiniMax H3)", subgraph: inner };
+  const root = { _nodes: [host] };
+  const start = PANEL_SRC.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = PANEL_SRC.indexOf("async graph_add_node(", start);
+  const method = PANEL_SRC.slice(start, end).replace(/,\s*$/, "");
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "describeActiveGraph",
+    "subgraphValueProvenance",
+    "redactWidgetValue",
+    "graphViewIdentityFor",
+    "MAX_STATE_NODES",
+    "fixedCapNote",
+    "summarizeNode",
+    "promotedTerminalWitnesses",
+    "isPromotedContainer",
+    "resolvePromotedContainerForRead",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph: inner, rootGraph: root }),
+    (graph, nodeId) => {
+      const found = resolveLiveNode(graph, nodeId);
+      if (!found) throw new Error(`No node with id ${nodeId} in the current graph`);
+      return found;
+    },
+    () => ({ scope: "subgraph", owner_node_id: 140, graph_identity: "graph:inner" }),
+    () => ({}),
+    () => ({}),
+    () => "graph:inner",
+    50,
+    () => "truncation note",
+    (n) => ({ id: n.id, type: n.type }),
+    () => [],
+    isPromotedContainer,
+    resolvePromotedContainerForRead,
+  );
+  const out = getSubgraph({ node_id: 140 });
+  assert.equal(out.subgraph_of.node_id, 140);
+  assert.equal(out.truncated, false);
+  assert.equal(out.node_count, 1);
+  assert.equal(out.nodes[0].id, 139);
+});
+
+test("#2057 an inner ordinary node still throws the definitive non-container line", () => {
+  const innerNode = { id: 139, type: "PrimitiveBoolean" };
+  const inner = { _nodes: [innerNode] };
+  const host = { id: 140, type: "SubgraphNode", subgraph: inner };
+  const root = { _nodes: [host] };
+  assert.equal(resolvePromotedContainerForRead(inner, root, 139), innerNode);
+  const getSubgraph = loadGetSubgraph()(innerNode);
+  assert.throws(
+    () => getSubgraph({ node_id: 139 }),
+    (err) => {
+      assert.match(String(err.message), /Node 139 \(PrimitiveBoolean\) is not a subgraph/);
+      assert.match(asOrchestratorError(err), DEFINITIVE_NON_SUBGRAPH_RE);
+      return true;
+    },
+  );
 });

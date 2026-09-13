@@ -3,11 +3,13 @@ import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 import { isPromotedContainer } from "./graph-read.js";
+import { widgetOccurrenceOf, widgetAtOccurrence, occurrenceLabelOf } from "./widget-occurrence.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
   boundPropertyUnverifiedNote,
 } from "./widget-bound-property.js";
+import { optionsIncludeFileLike } from "./live-combo-availability.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -219,6 +221,45 @@ export function comboOptions(widget) {
   return readComboOptions(widget).options;
 }
 
+/**
+ * #2265 / #2547 — the diagnostic half of an off-list combo refusal.
+ *
+ * #2547 omitted every option value because a LoadImage/checkpoint list can name
+ * private files. That rule was applied to EVERY combo, so a 3-value `device`
+ * enum refused "auto" while naming the count and none of the choices. Redact
+ * only when ANY live option looks like a file (`optionsIncludeFileLike`);
+ * generic enums (device/precision/sampler) list the values so a stale guess
+ * can be corrected. Majority `optionsLookLikeFiles` is the missing-asset
+ * classifier, not a privacy gate — mixed None/disabled/path lists still leak.
+ */
+function describeOffListCombo(name, value, options) {
+  const count = options.length;
+  const head =
+    `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
+    `"${name}". Its option list WAS read successfully and holds ${count} ` +
+    `option${count === 1 ? "" : "s"}, none of them this value — so this is a ` +
+    `rejected VALUE, not an unreadable list. `;
+  if (optionsIncludeFileLike(options)) {
+    return (
+      head +
+      `The valid option values are intentionally omitted from this diagnostic because ` +
+      `combo values may contain private filenames or paths. Choose a value from the ` +
+      `widget's current dropdown (refreshing its options first if needed) and retry.`
+    );
+  }
+  let listed = null;
+  try {
+    listed = options.map((o) => JSON.stringify(o)).join(", ");
+  } catch {
+    // unknown-ok: a hostile option must not replace the off-list refusal
+    listed = null;
+  }
+  if (!listed) {
+    return head + `Choose a value from the widget's current dropdown and retry.`;
+  }
+  return head + `Valid options: ${listed}.`;
+}
+
 /** #1126 — the human-readable half of a `readComboOptions` UNREADABLE outcome. */
 function describeUnreadable(read) {
   const why = read?.detail ? ` (${read.detail})` : "";
@@ -294,6 +335,101 @@ function restoreFiniteNumberIfUnstored(widget, expected) {
   }
   if (actual == null || (typeof actual === "number" && !Number.isFinite(actual))) {
     widget.value = expected;
+  }
+}
+
+// #1533 — VHS_LoadVideo replaces custom_width/custom_height.options when its format
+// changes, then replays the same VHSINT callback. Keep the finite value across that
+// later replay too; the one-shot restore below this write cannot protect future callbacks.
+const guardedVhsDimensionCallbacks = new WeakSet();
+
+function guardVhsDimensionCallback(node, widget) {
+  let type;
+  let name;
+  let widgets;
+  try {
+    if (String(node?.type ?? "").toLowerCase() !== "vhs_loadvideo") {
+      return { matched: false };
+    }
+    type = String(widget?.type ?? "").toLowerCase();
+    name = widget?.name;
+    widgets = node?.widgets;
+  } catch {
+    return { matched: false };
+  }
+  if (
+    !Array.isArray(widgets) ||
+    !widgets.includes(widget) ||
+    type !== "vhs.annotated" ||
+    (name !== "custom_width" && name !== "custom_height")
+  ) {
+    return { matched: false };
+  }
+
+  const callback = widget.callback;
+  if (typeof callback !== "function" || guardedVhsDimensionCallbacks.has(callback)) {
+    return { matched: true, callback };
+  }
+
+  const guarded = function (...args) {
+    let previous;
+    try {
+      previous = this?.value;
+    } catch {
+      previous = undefined;
+    }
+    try {
+      return reflectApply(callback, this, args);
+    } finally {
+      try {
+        restoreFiniteNumberIfUnstored(this, previous);
+      } catch {
+        /* the enclosing write's verification remains authoritative */
+      }
+    }
+  };
+  guardedVhsDimensionCallbacks.add(guarded);
+  try {
+    widget.callback = guarded;
+    return { matched: true, callback: guarded };
+  } catch {
+    return { matched: true, callback };
+  }
+}
+
+function guardVhsDimensionCallbacksOnNode(node, skipWidget = null) {
+  let nodeType;
+  let triggerType;
+  let triggerName;
+  try {
+    nodeType = String(node?.type ?? "").toLowerCase();
+    triggerType = String(skipWidget?.type ?? "").toLowerCase();
+    triggerName = skipWidget?.name;
+  } catch {
+    return;
+  }
+  const triggerIsDimension =
+    triggerType === "vhs.annotated" && (triggerName === "custom_width" || triggerName === "custom_height");
+  if (nodeType !== "vhs_loadvideo" || (triggerName !== "format" && !triggerIsDimension)) return;
+
+  let widgets;
+  try {
+    widgets = node?.widgets;
+  } catch {
+    return;
+  }
+  try {
+    if (!Array.isArray(widgets)) return;
+    for (const widget of widgets) {
+      if (widget === skipWidget) continue;
+      try {
+        guardVhsDimensionCallback(node, widget);
+      } catch {
+        /* the normal callback path remains authoritative for unreadable widgets */
+      }
+    }
+  } catch {
+    /* the normal callback path remains authoritative for an unreadable widget list */
   }
 }
 
@@ -412,10 +548,37 @@ export function isCompositeObjectWidget(widget) {
  * Resolve a widget name without silently choosing between case-colliding
  * widgets. Exact spelling always wins; a case-insensitive fallback remains for
  * older callers, but only when it names exactly one widget (#524).
+ *
+ * `occurrence` (#2143) is set ONLY when the caller EXPLICITLY addressed one of several
+ * widgets sharing `widgetName` — "NAME[1]", or a display label that names exactly one row.
+ * Its `index` is a POSITION IN `node.widgets`, the same number `duplicate_widgets`
+ * publishes, not an ordinal counted over same-named rows. When it is set, three things
+ * change and nothing else does:
+ *
+ *   * the widget AT that position is returned, and only if it still carries the requested
+ *     name AND is still the row that was addressed — `widgetAtOccurrence` weighs the
+ *     pinned identity, then the row count, then the label, and it is SHARED with the ack
+ *     readback so the write and the readback cannot name different widgets;
+ *   * anything it will not vouch for returns null rather than the first match — the
+ *     caller's dotted/base retry gets its turn and, failing that, the refusal below fires.
+ *     Silently writing row 0 for an address that named row 1 is the defect, not an
+ *     acceptable fallback;
+ *   * the case-insensitive fallback is SKIPPED, because a position pinned against an
+ *     exact name means nothing against a differently-cased one.
+ *
+ * With no `occurrence` — every call that existed before #2143 — this function is
+ * byte-identical to what it was.
  */
-function resolveWidgetByName(node, widgetName) {
+function resolveWidgetByName(node, widgetName, occurrence = null) {
   const wanted = String(widgetName);
   const widgets = node?.widgets ?? [];
+  if (occurrence) {
+    // Shared with the ack readback (widgetAtOccurrence), so the row this write lands on and
+    // the row a timed-out readback reports on can never be two different widgets. The label
+    // pin is deliberately NOT applied here: a mismatch gets its own worded refusal below,
+    // which is more useful than "that index is not one of them".
+    return widgetAtOccurrence(node, wanted, occurrence.index, occurrence);
+  }
   const exact = widgets.find((cand) => cand?.name === wanted);
   if (exact) return exact;
 
@@ -439,6 +602,38 @@ const FAST_GROUPS_BYPASSER_TYPE = "Fast Groups Bypasser (rgthree)";
 const FAST_GROUPS_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
 const NODE_MODE_REPEATER_TYPE = "Mute / Bypass Repeater (rgthree)";
 const NODE_MODE_RELAY_TYPE = "Mute / Bypass Relay (rgthree)";
+
+// #2151 — rgthree's NON-group Fast Bypasser / Fast Muter rows are the same kind of action
+// control, reached through a different mechanism, and they were left on the ordinary
+// assign-then-fire-the-callback path. That path is actively destructive here, because the row's
+// callback IGNORES the value the write just assigned. From the pack's own
+// `base_node_mode_changer.js` (shipped, unminified), one row per linked node:
+//
+//     widget.doModeChange = (forceValue, skipOtherNodeCheck) => {
+//       let newValue = forceValue == null ? linkedNode.mode === this.modeOff : forceValue;
+//       ...
+//       changeModeOfNodes(linkedNode, (newValue ? this.modeOn : this.modeOff));
+//       widget.value = newValue;
+//     };
+//     widget.callback = () => { widget.doModeChange(); };
+//
+// The callback takes NO arguments, so `forceValue == null` always, so the new value is derived
+// from THE LINKED NODE'S CURRENT MODE. The row's callback is a TOGGLE, not a setter.
+//
+// Measured against this module before the fix, with a fixture transcribed from that file:
+//   - write `false` to a row whose linked node is ALWAYS  -> toggles to bypass. Correct BY LUCK.
+//   - write `false` to a row whose linked node is already BYPASSED -> toggles it back to
+//     ALWAYS. The read-back then fails and rolls the ROW value back, but nothing rolls the
+//     linked node's mode back, so the caller is told the write failed while the node they
+//     asked to disable has been silently RE-ENABLED and renders (#2151).
+//   - write `true` to an already-enabled row -> the same inversion in the other direction:
+//     the node is silently BYPASSED.
+//
+// So the requested value only has to AGREE with the row for the write to invert the graph. The
+// fix drives `doModeChange(requested)` — the pack's own forced-value entry point, the one
+// `forceWidgetOn`/`forceWidgetOff` use — and journals the reachable modes for rollback, exactly
+// as #2146 does for the group rows.
+const FAST_MODE_CHANGER_TYPES = new Set(["Fast Bypasser (rgthree)", "Fast Muter (rgthree)"]);
 
 function runtimeNodeType(node) {
   try {
@@ -466,11 +661,190 @@ function isModePassThrough(node) {
 }
 
 function modeTransactionFailure(node, detail) {
+  // #2151 — names the node's OWN type instead of always saying "Fast Groups Bypasser". The
+  // journal now covers Fast Bypasser / Fast Muter too, and a refusal that names the wrong node
+  // kind sends the reader to the wrong pack code.
+  const kind = runtimeNodeType(node) || "rgthree mode changer";
   return new WidgetWriteError(
-    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the Fast Groups ` +
-      `Bypasser mode rollback boundary (${detail}); refusing before the callback can mutate ` +
-      `linked node modes (#2146).`,
+    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the ${kind} ` +
+      `mode rollback boundary (${detail}); refusing before the row action can mutate ` +
+      `linked node modes (#2146/#2151).`,
   );
+}
+
+/**
+ * #2151 — which mode-journal seeding this node+row needs, or null when it needs none.
+ *
+ *   "groups" — Fast Groups Bypasser: seed from each toggle row's matched GROUP (#2146).
+ *   "linked" — Fast Bypasser / Fast Muter: seed from the nodes wired into this node's inputs,
+ *              which is the set its rows' `doModeChange` closures can reach.
+ *
+ * The "linked" arm is keyed on the node type AND on the row exposing a callable `doModeChange`,
+ * deliberately. The type alone would hijack any other widget these nodes may carry; the method
+ * alone would claim an unrelated node that happens to define one. `doModeChange` is rgthree's
+ * own row API (`forceWidgetOn`/`forceWidgetOff` call it), so its presence is what makes the row
+ * a mode-changer row — the NAME cannot be used, because the pack mints it from the linked node's
+ * title (`Enable ${linkedNode.title}`) and it is different on every row of every graph.
+ */
+function fastModeTransactionKind(node, widget) {
+  const type = runtimeNodeType(node);
+  if (type === FAST_GROUPS_BYPASSER_TYPE) {
+    return normalizedWidgetBaseName(widget?.name) === FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
+      ? "groups"
+      : null;
+  }
+  if (!FAST_MODE_CHANGER_TYPES.has(type)) return null;
+  let doModeChange;
+  try {
+    doModeChange = widget?.doModeChange;
+  } catch {
+    // An unreadable accessor on a node type whose rows DO mutate modes is exactly the case that
+    // must not fall through to the naive path.
+    throw modeTransactionFailure(node, "the row's mode action is unreadable");
+  }
+  return typeof doModeChange === "function" ? "linked" : null;
+}
+
+/**
+ * #2151 — the linked nodes of a Fast Bypasser / Fast Muter, in the pack's OWN order.
+ *
+ * A faithful transcription of `getConnectedInputNodesAndFilterPassThroughs` (rgthree
+ * `utils.ts` → `getConnectedNodesInfo` + `filterOutPassthroughNodes`), because the row-to-node
+ * mapping is POSITIONAL — `handleLinkedNodesStabilization` pairs `this.widgets[index]` with
+ * `linkedNodes[index]` — so an order that merely contains the right nodes is not enough.
+ *
+ * The pack's walk, reproduced exactly: input slots in order; push each link's origin; if that
+ * origin is a pass-through (Reroute / Node Combiner / Node Collector) recurse into it and append
+ * what it reaches, depth-first; dedupe by node identity GLOBALLY across slots; then drop the
+ * pass-throughs from the result. A Node Collector therefore contributes several entries for one
+ * slot, which is why this cannot be simplified to one node per slot.
+ */
+function linkedNodesInOrder(node, owner) {
+  const ordered = [];
+  const seen = new Set();
+  const walk = (current) => {
+    let slots;
+    try {
+      slots = current?.inputs;
+    } catch {
+      throw modeTransactionFailure(owner, `node ${current?.id ?? "?"}'s inputs are unreadable`);
+    }
+    if (!Array.isArray(slots)) return;
+    let graph;
+    try {
+      graph = current?.graph ?? owner?.graph;
+    } catch {
+      throw modeTransactionFailure(owner, "a linked mode path is unreadable");
+    }
+    for (const slot of slots) {
+      let origin;
+      try {
+        const linkId = slot?.link;
+        if (typeof linkId !== "number") continue;
+        origin = graph?.getNodeById?.(graph?.links?.[linkId]?.origin_id);
+      } catch {
+        throw modeTransactionFailure(owner, "a linked mode path is unreadable");
+      }
+      if (!origin || seen.has(origin)) continue;
+      seen.add(origin);
+      if (isModePassThrough(origin)) walk(origin);
+      else ordered.push(origin);
+    }
+  };
+  walk(node);
+  return ordered;
+}
+
+/**
+ * #2151 — authenticate the row closures against the current linked-node list.
+ *
+ * rgthree's `doModeChange` closes over its linked node and exposes no target property.  A
+ * same-title rewire can therefore leave that closure pointing at a detached or foreign node.
+ * `handleLinkedNodesStabilization` is the pack's authoritative rebinding path: its `setWidget`
+ * arm installs the closure over the linked node supplied at the same position.  Force that arm
+ * for every row, then verify that the graph and widget identities did not move while it ran.
+ * Refuse before the forced action if the rebinding contract is unavailable or incomplete.
+ */
+function authenticateFastModeChangerRows(node, linkedTargets) {
+  let rows;
+  let stabilize;
+  try {
+    rows = node?.widgets;
+    stabilize = node?.handleLinkedNodesStabilization;
+  } catch {
+    throw modeTransactionFailure(node, "the row rebinding contract is unreadable");
+  }
+  if (!Array.isArray(rows) || rows.length !== linkedTargets.length) {
+    throw modeTransactionFailure(
+      node,
+      `the node carries ${Array.isArray(rows) ? rows.length : "an unreadable number of"} row(s) ` +
+        `for ${linkedTargets.length} linked node(s)`,
+    );
+  }
+  if (typeof stabilize !== "function") {
+    throw modeTransactionFailure(node, "the pack exposes no authoritative row rebinding method");
+  }
+
+  const snapshots = [];
+  let authenticated = false;
+  try {
+    for (const [index, row] of rows.entries()) {
+      snapshots.push({
+        row,
+        name: row?.name,
+        value: row?.value,
+        options: row?.options,
+        doModeChange: row?.doModeChange,
+        callback: row?.callback,
+      });
+      row.name = `\u0000cmcp-2151-rebind-${index}`;
+    }
+    Reflect.apply(stabilize, node, [linkedTargets]);
+
+    const reboundRows = node?.widgets;
+    if (!Array.isArray(reboundRows) || reboundRows.length !== linkedTargets.length) {
+      throw modeTransactionFailure(node, "the pack changed the row count during authoritative rebinding");
+    }
+    for (const [index, target] of linkedTargets.entries()) {
+      const row = reboundRows[index];
+      if (row !== snapshots[index].row) {
+        throw modeTransactionFailure(node, "the pack replaced a row during authoritative rebinding");
+      }
+      if (row?.name !== `Enable ${target?.title}` || typeof row?.doModeChange !== "function") {
+        throw modeTransactionFailure(node, "the pack did not rebuild every row over the current linked node");
+      }
+    }
+
+    const currentTargets = linkedNodesInOrder(node, node);
+    if (
+      currentTargets.length !== linkedTargets.length ||
+      currentTargets.some((target, index) => target !== linkedTargets[index])
+    ) {
+      throw modeTransactionFailure(node, "the linked-node wiring changed during authoritative rebinding");
+    }
+    authenticated = true;
+  } catch (error) {
+    if (error instanceof WidgetWriteError) throw error;
+    throw modeTransactionFailure(node, "the pack's authoritative row rebinding threw");
+  } finally {
+    // Rebinding initializes row values from the current modes. Restore the caller-visible values
+    // before applyWidgetWrite snapshots `previous`; the newly installed action/callback bindings
+    // intentionally stay in place on success. On refusal, restore the prior row shape as well.
+    for (const snapshot of snapshots) {
+      try {
+        if (!authenticated) {
+          snapshot.row.name = snapshot.name;
+          snapshot.row.doModeChange = snapshot.doModeChange;
+          snapshot.row.callback = snapshot.callback;
+        }
+        snapshot.row.value = snapshot.value;
+        snapshot.row.options = snapshot.options;
+      } catch {
+        // The refusal above remains authoritative; no forced mode action is invoked.
+      }
+    }
+  }
+  return rows;
 }
 
 function relayDispatchesMode(node, owner) {
@@ -502,37 +876,35 @@ function relayDispatchesMode(node, owner) {
  * This intentionally does not walk or snapshot the graph generally. The returned journal is
  * used to verify the canonical action changed a reachable mode and to roll it back on failure.
  */
-function captureFastBypasserModeTransaction(node, writtenWidget) {
-  if (
-    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
-    normalizedWidgetBaseName(writtenWidget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
-  ) {
-    return null;
-  }
+function captureFastBypasserModeTransaction(node, writtenWidget, authenticatedLinkedTargets = null) {
+  const kind = fastModeTransactionKind(node, writtenWidget);
+  if (!kind) return null;
 
-  const rows = [
-    writtenWidget,
-    ...(Array.isArray(node?.widgets) ? node.widgets : []),
-  ].filter((candidate, index, all) => {
-    if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
-      return false;
-    }
-    return all.indexOf(candidate) === index;
-  });
   const groups = [];
-  for (const row of rows) {
-    let group;
-    try {
-      group = row.group;
-    } catch {
-      throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+  if (kind === "groups") {
+    const rows = [
+      writtenWidget,
+      ...(Array.isArray(node?.widgets) ? node.widgets : []),
+    ].filter((candidate, index, all) => {
+      if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
+        return false;
+      }
+      return all.indexOf(candidate) === index;
+    });
+    for (const row of rows) {
+      let group;
+      try {
+        group = row.group;
+      } catch {
+        throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+      }
+      if (!group || (typeof group !== "object" && typeof group !== "function")) {
+        throw modeTransactionFailure(node, "a toggle row has no live group");
+      }
+      if (!groups.includes(group)) groups.push(group);
     }
-    if (!group || (typeof group !== "object" && typeof group !== "function")) {
-      throw modeTransactionFailure(node, "a toggle row has no live group");
-    }
-    if (!groups.includes(group)) groups.push(group);
+    if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
   }
-  if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
 
   const entries = [];
   const seenNodes = new Set();
@@ -659,6 +1031,27 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
     for (const groupNode of groupNodes) addNodeTree(groupNode);
   }
 
+  // #2151 — the direct Fast Bypasser / Fast Muter row closures were authenticated and rebound
+  // against the current linked-node list before this capture. Journal only those current graph
+  // targets and their reachable propagation; an opaque closure that was not rebound must never
+  // be invoked, because its detached target cannot be restored here.
+  if (kind === "linked") {
+    if (!Array.isArray(authenticatedLinkedTargets)) {
+      throw modeTransactionFailure(node, "the row closure was not authenticated against current wiring");
+    }
+    const linkedTargets = linkedNodesInOrder(node, node);
+    if (
+      linkedTargets.length !== authenticatedLinkedTargets.length ||
+      linkedTargets.some((target, index) => target !== authenticatedLinkedTargets[index])
+    ) {
+      throw modeTransactionFailure(node, "the linked-node wiring changed after closure authentication");
+    }
+    for (const linkedNode of linkedTargets) addNodeTree(linkedNode);
+    if (!entries.length) {
+      throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
+    }
+  }
+
   while (propagationQueue.length) {
     const current = propagationQueue.shift();
     const type = runtimeNodeType(current);
@@ -743,11 +1136,52 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
 }
 
 function resolveFastBypasserAction(node, widget, coerced, previous) {
-  if (
-    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
-    normalizedWidgetBaseName(widget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
-  ) {
-    return null;
+  const kind = fastModeTransactionKind(node, widget);
+  if (!kind) return null;
+  // #2151 — Fast Bypasser / Fast Muter row. Its value is a plain boolean and its canonical
+  // FORCED-VALUE entry point is `doModeChange(value)`, the same one the node's own
+  // `forceWidgetOn` / `forceWidgetOff` use. Its closure target is opaque, however, so the
+  // canonical action is safe only after the pack's authoritative stabilizer has rebound every
+  // row to the current linked-node list.
+  if (kind === "linked") {
+    if (typeof coerced !== "boolean") {
+      // Refuse rather than fall through: the fall-through IS the destructive path.
+      throw modeTransactionFailure(
+        node,
+        `the row action takes a boolean and the value is ${JSON.stringify(coerced)}`,
+      );
+    }
+    const linkedTargets = linkedNodesInOrder(node, node);
+    if (!linkedTargets.length) {
+      throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
+    }
+    authenticateFastModeChangerRows(node, linkedTargets);
+
+    let doModeChange;
+    try {
+      doModeChange = widget.doModeChange;
+    } catch {
+      throw modeTransactionFailure(node, "the row's mode action is unreadable");
+    }
+    if (typeof doModeChange !== "function") {
+      throw modeTransactionFailure(node, "the live row has no canonical mode action");
+    }
+    return {
+      action: doModeChange,
+      requested: coerced,
+      authenticatedLinkedTargets: linkedTargets,
+      // Deliberately FALSE, unlike the group arm. That assertion ("a reachable mode must have
+      // changed") is right for a toggle whose requested value differs from the row's, and wrong
+      // for a forced value: the row's value and its linked node's mode diverge routinely —
+      // bypassing the node on canvas with Ctrl+B moves the mode while the row keeps its old
+      // value, because the pack re-syncs a row only when its NAME changes. Forcing the already-
+      // correct mode is then a legitimate no-op repair, and asserting a mode change would fail
+      // it and roll back a write that did exactly what was asked.
+      //
+      // The action has already been authenticated against the current linked-node list, so the
+      // ordinary read-back plus the mode journal verify the current target and its propagation.
+      requiresModeChange: false,
+    };
   }
   if (
     coerced === null ||
@@ -769,7 +1203,7 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
     throw modeTransactionFailure(node, "the live row has no canonical toggle action");
   }
   return {
-    toggle,
+    action: toggle,
     requested: coerced.toggled,
     requiresModeChange: previous?.toggled !== coerced.toggled,
   };
@@ -1156,16 +1590,7 @@ export function coerceWidgetValue(
     // installed is caught here instead of failing 40 seconds into a run. The message says
     // which of the two happened, so an agent can tell "your value is wrong" apart from
     // "the panel could not look" and stop treating them as the same failure.
-    throw new WidgetWriteError(
-      `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
-        `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
-        `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
-        `rejected VALUE, not an unreadable list. The valid option values are intentionally ` +
-        `omitted from this diagnostic because combo values may contain private filenames ` +
-        `or paths. Choose a value from the widget's current dropdown (refreshing its ` +
-        `options first if needed) and retry.`,
-      { combo: true },
-    );
+    throw new WidgetWriteError(describeOffListCombo(name, value, options), { combo: true });
   }
 
   if (isNumericWidget(widget)) {
@@ -1414,6 +1839,32 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
     );
     return [keyed[0], ...displays];
   }
+  // comfyui-frontend's app-level promoted multiline widget is a live DOM
+  // projection owned by the host input. Its serialization binding is
+  // `hostInput.widgetId`; the DOM widget itself deliberately has no
+  // `widgetId` (createPromotedMultilineWidget returns it before the generic
+  // store projection is built). It is therefore safe to retain when it has a
+  // distinct editor from the shared inner widget. Dropping it would make the
+  // getter materialize the generic projection, whose cloned inner options can
+  // write through to the shared definition and trigger the #2689 refusal for
+  // an otherwise valid one-instance STRING write (#1707).
+  //
+  // The editor-identity check matters: a stale inner/link-driven handle can
+  // also be unkeyed and live in node.widgets. That object must still be
+  // rematerialized so the host-keyed store projection is selected (#366).
+  if (hostId && promotedValueScope(subgraphNode, hostInput) === "instance") {
+    const hostDom = current.find(
+      (widget) =>
+        readProjectionWidgetId(widget) == null &&
+        hasDistinctLiveTextEditor(widget, innerWidget),
+    );
+    if (hostDom) {
+      const displays = current.filter(
+        (widget) => widget !== hostDom && readProjectionWidgetId(widget) == null,
+      );
+      return [hostDom, ...displays];
+    }
+  }
   // No host key: unkeyed identity-linked projections are the rail. A host key
   // with only an unkeyed clone must rematerialize first — returning the clone
   // here is the CLIPTextEncode.text recurrence (inner written, parent store stale).
@@ -1423,6 +1874,13 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
   const recovered = recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
   if (recovered.length) return recovered;
   return current;
+}
+
+function hasDistinctLiveTextEditor(widget, innerWidget) {
+  const hostEditor = liveTextEditorElement(widget);
+  if (!hostEditor) return false;
+  const innerEditor = liveTextEditorElement(innerWidget);
+  return hostEditor !== innerEditor;
 }
 
 /**
@@ -1635,16 +2093,23 @@ function resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName) {
   const subgraph = subgraphNode?.subgraph;
   const wanted = String(widgetName).toLowerCase();
   const widgets = Array.isArray(subgraphNode?.widgets) ? subgraphNode.widgets : [];
-  const hostHits = widgets.filter(
-    (widget) => widget && typeof widget.name === "string" && widget.name.toLowerCase() === wanted,
-  );
+  const hostHits = widgets.filter((widget) => {
+    if (!widget) return false;
+    const name = typeof widget.name === "string" ? widget.name.toLowerCase() : "";
+    const label = typeof widget.label === "string" ? widget.label.toLowerCase() : "";
+    return name === wanted || label === wanted;
+  });
   if (hostHits.length !== 1) return { promoted: false };
-  const source = uniqueRailBackedInnerWidget(subgraph, widgetName);
+  const hostWidget = hostHits[0];
+  const slot = uniqueSlotMatchingAliases(subgraph, [widgetName, hostWidget.name, hostWidget.label]);
+  const fromSlot = slot ? sourcesFromInputRailSlot(subgraph, slot) : [];
+  const source =
+    fromSlot.length === 1 ? fromSlot[0] : uniqueRailBackedInnerWidget(subgraph, widgetName);
   if (!source) return { promoted: false };
   const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
   const innerWidget = (innerNode?.widgets ?? []).find((widget) => widget?.name === source.sourceWidgetName);
   if (!innerNode || !innerWidget) return { promoted: false };
-  const input = { name: hostHits[0].name, _widget: hostHits[0], widget: hostHits[0] };
+  const input = { name: hostWidget.name, _widget: hostWidget, widget: hostWidget };
   const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
   const parentWidget = parentWidgets[0] ?? null;
   if (!parentWidget) return { promoted: false };
@@ -1821,8 +2286,13 @@ function isLiveCustomTextWidget(widget) {
   }
 }
 
-function customTextHolds(widget, coerced) {
-  if (widgetHoldsValue(widget, coerced)) return true;
+/**
+ * #2233 — true when the widget's live textarea / contenteditable already holds
+ * `coerced`. Distinct from `.value`: a Vue getter can lag while the editor
+ * that query_graph reads is already committed.
+ */
+export function liveTextEditorHolds(widget, coerced) {
+  if (typeof coerced !== "string" || !widget || typeof widget !== "object") return false;
   const el = liveTextEditorElement(widget);
   if (!el) return false;
   try {
@@ -1830,6 +2300,11 @@ function customTextHolds(widget, coerced) {
   } catch {
     return false;
   }
+}
+
+function customTextHolds(widget, coerced) {
+  if (widgetHoldsValue(widget, coerced)) return true;
+  return liveTextEditorHolds(widget, coerced);
 }
 
 /** When a string write did not stick on `.value`, copy it into the live editor. */
@@ -2299,6 +2774,10 @@ export function resolveWidgetWrite(
   assertTargetWritable,
   promotedResolution,
   coerceOpts,
+  // #2143 — WHICH of several widgets sharing `widgetName` this write addressed, when the
+  // caller said so explicitly ("NAME[1]" or a unique display label; see widget-occurrence.js).
+  // Null on every other write, which is every write that existed before #2143.
+  occurrence = null,
 ) {
   let targetNode = node;
   let widget = null;
@@ -2325,6 +2804,20 @@ export function resolveWidgetWrite(
       if (!res.target) {
         throw new WidgetWriteError(
           res.error || `promoted widget "${widgetName}" could not be resolved to an inner widget.`,
+        );
+      }
+      // #2143 — a promotion resolves by NAME through the subgraph's promotion metadata,
+      // which has no notion of "the second widget called X"; #366 already refuses a
+      // promoted write whose name is duplicated. So an occurrence-addressed write that
+      // lands here would have its ordinal SILENTLY DROPPED and write occurrence 0's
+      // promotion — the exact silent-wrong-row this issue is about, one layer up. Refuse
+      // before any coercion or mutation.
+      if (occurrence) {
+        throw new WidgetWriteError(
+          `"${widgetName}" on subgraph node ${node.id} is a PROMOTED widget, and a promotion is ` +
+            `resolved by name — it cannot select index ${occurrence.index} of a duplicated ` +
+            `name. Nothing was written. Enter the subgraph (panel_enter_subgraph) and address ` +
+            `the row on the node that owns it (#2143).`,
         );
       }
       targetNode = res.target.node;
@@ -2401,7 +2894,7 @@ export function resolveWidgetWrite(
   if (!widget) {
     // EXACT-NAME FIRST: a widget whose own name is literally `widgetName` (dots and
     // all) always wins — the split is never taken when an exact match exists.
-    widget = resolveWidgetByName(targetNode, widgetName);
+    widget = resolveWidgetByName(targetNode, widgetName, occurrence);
   }
   if (!widget && isPromotedContainer(node)) {
     // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
@@ -2431,7 +2924,7 @@ export function resolveWidgetWrite(
     if (dot > 0) {
       const baseName = nameStr.slice(0, dot);
       const sub = nameStr.slice(dot + 1);
-      const baseWidget = resolveWidgetByName(targetNode, baseName);
+      const baseWidget = resolveWidgetByName(targetNode, baseName, occurrence);
       if (baseWidget) {
         if (sub === "") {
           throw new WidgetWriteError(
@@ -2452,6 +2945,39 @@ export function resolveWidgetWrite(
     }
   }
   if (!widget) {
+    // #2143 — AN INDEX IS ONLY AS GOOD AS THE LIST IT INDEXES, and this is where that bill
+    // comes due. The address was resolved at the command boundary; the write happens after
+    // `await getFreshObjectInfo()`. An rgthree Fast Groups node rebuilds its toggle rows
+    // whenever the groups it matches change, and a rebuild can REORDER them — so this
+    // position can hold a perfectly valid, same-named widget that is a DIFFERENT group.
+    // `widgetAtOccurrence` refuses that (identity first, then the pinned label), which lands
+    // here as an unresolved widget.
+    //
+    // The plain missing-widget refusal would then list the name as AVAILABLE — it is, just
+    // not at that position — which reads as a contradiction. Say what actually happened.
+    if (occurrence) {
+      const base = String(widgetName).split(".")[0];
+      const rows = (targetNode?.widgets ?? []).filter((cand) => cand?.name === base);
+      if (rows.length) {
+        const moved = (targetNode?.widgets ?? []).indexOf(occurrence.widget);
+        const stillNamed = (targetNode?.widgets ?? [])[occurrence.index]?.name === base;
+        throw new WidgetWriteError(
+          `Node ${targetNode?.id} (${targetNode?.type}) still carries ${rows.length} widget` +
+            `${rows.length === 1 ? "" : "s"} named "${base}", but index ${occurrence.index} no ` +
+            `longer names the row this call addressed` +
+            (moved >= 0
+              ? ` — the rows were REORDERED and it is now at index ${moved}`
+              : stillNamed
+                ? ` — the row at that index is a different one (${
+                    occurrenceLabelOf((targetNode?.widgets ?? [])[occurrence.index]) ??
+                    "no label"
+                  }, not "${occurrence.label ?? "no label"}")`
+                : ` — the node's rows changed`) +
+            `. Nothing was written; re-read panel_query_graph's duplicate_widgets and address ` +
+            `the row again (#2143).`,
+        );
+      }
+    }
     // #757 — pressable-widget hint for a button that CREATES the missing slot.
     // #1956 — if the name is a node PROPERTY (rgthree Fast Groups matchTitle/…),
     // point at panel_set_property instead of a click dead-end, and list each
@@ -2504,6 +3030,20 @@ export function applyWidgetWrite(
     // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
     // combo rejection, so a transient callback failure is re-read before any decision.
     acceptUnreadableComboOptions = false,
+    // #2143 — WHICH of several widgets sharing this name the caller addressed:
+    // `{index, of, label, widget}`, resolved once at the command boundary (graph_set_widget)
+    // from the "NAME[i]" / display-label form. Re-applied HERE against the LIVE widget list;
+    // the row object it carries is COMPARED, never followed, because an rgthree Fast Groups
+    // node rebuilds its toggle rows whenever the groups it matches change and a captured
+    // object can be detached from the node by write time.
+    occurrence = null,
+    // #2143 — OUT-param, filled with `valueWidget`: the widget object this write's value
+    // landed on. The caller's post-write flush (#1922) runs AFTER this function returns and
+    // can reorder the node's rows again, so the caller needs the written row itself both to
+    // verify retention against it and to re-resolve the reported address. Never a field on
+    // the returned reply: that reply is JSON-serialized to the orchestrator and a widget
+    // reaches the whole graph through `node.graph`.
+    out = null,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -2527,7 +3067,19 @@ export function applyWidgetWrite(
       // membership. Read below; NEVER re-derived by reading the option list again, since
       // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
-    });
+    }, occurrence);
+
+  // #2143 — WHICH same-named row this write resolved to, by widget IDENTITY. Captured here,
+  // before any mutation, as the FALLBACK for a row the write's own callback then removes;
+  // the reply prefers a fresh identity lookup taken after everything has run, because this
+  // number is an ADDRESS and a pre-write position can be stale by the time it is read. See
+  // the reply.
+  //
+  // Reported for the DIRECT target only. On a promoted subgraph write the value can land on
+  // the parent's rail rather than the inner widget (comfyui-mcp#1707's instance scope), so
+  // one index would have to describe two different widget lists; #366 already refuses a
+  // promoted write whose name is duplicated, so there is nothing here to disambiguate.
+  const preWriteOccurrence = promotedFrom ? null : widgetOccurrenceOf(targetNode, w);
 
   // The rail object captured before /object_info may be a stale inner Primitive
   // handle. Re-read the live host projections at write time so the store-backed
@@ -2904,7 +3456,11 @@ export function applyWidgetWrite(
   // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
   // If the live row shape cannot be bounded, refuse before invoking the action rather than
   // allowing it to mutate linked modes that this writer cannot restore.
-  const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
+  const fastBypasserModes = captureFastBypasserModeTransaction(
+    targetNode,
+    w,
+    fastBypasserAction?.authenticatedLinkedTargets,
+  );
   // #2146 — Fast Bypasser rows do not expose a widget.callback. Their supported UI action is
   // the row's own toggle(value), which mutates the row value and invokes doModeChange().
   // Bridge that canonical action instead of assigning the value and falsely reporting success.
@@ -2931,6 +3487,134 @@ export function applyWidgetWrite(
   // CAPTURED (not rethrown here) so that VERIFICATION runs AFTER afterChange has
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
+  // comfyui-mcp#2689 — REPAIR the collateral definition write instead of refusing the
+  // whole write.
+  //
+  // A rail that WRITES THROUGH to the inner widget is not the same failure as a rail whose
+  // value and the definition's are one store. The store the queue compiler reads is this
+  // wrapper's own entry (`store[input.widgetId]`), and the rail's setter landed the value
+  // there; what it ALSO did was assign the shared inner widget, which nothing asked it to
+  // do. Undoing exactly that second assignment leaves the write where it was addressed and
+  // the definition where it was — so `value_scope: "instance"` becomes a statement the code
+  // has OBSERVED rather than one it refused to make.
+  //
+  // That was the whole cost of the old refusal: on the reported frontends every promoted
+  // STRING rail writes through, so a promoted prompt could not be set AT ALL — not from the
+  // wrapper, and not by entering the subgraph (that path resolves to the same rail).
+  //
+  // FAIL CLOSED, still. The repair is accepted only when BOTH halves are verified after it:
+  // the shared definition is structurally back on its captured value, AND the rail (and
+  // every #477 display proxy) still holds the requested one. A shape that forwards in BOTH
+  // directions fails the second check — restoring the inner drags the rail back with it —
+  // and keeps the old refusal and the old rollback, unchanged.
+  //
+  // Stays TRUE for the rest of this call once a repair has landed, because the rollback
+  // still has to restore the inner widget if some LATER check fails: the rail's own restore
+  // forwards onto it a second time (#2132), and skipping the inner restore would leave the
+  // SHARED definition holding the rail's captured value.
+  let definitionRepaired = false;
+  // WHICH check blocked the repair — "rail" | "inner" | "display", or null when it was
+  // never attempted. The refusal names it. A single "the repair was attempted" flag let one
+  // message speak for three different situations: a separable rail whose #477 display proxy
+  // simply follows the definition is NOT a rail that is one store with it, and telling that
+  // caller to unpack the subgraph sends them to rebuild a graph over a projection that would
+  // have re-rendered.
+  let definitionRepairBlockedBy = null;
+  // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
+  //
+  // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value while
+  // its own `.value` does not (#2020), which is right for judging a write that has already
+  // landed. It is the wrong evidence for THIS decision: the repair spends that judgement
+  // erasing the only other copy of the value. A promoted rail's `.value` reads the
+  // per-widgetId store — the entry queue compilation reads — so a rail showing the value only
+  // in its textarea has not been shown to have landed it anywhere durable, and restoring the
+  // definition could leave the write nowhere at all. Such a rail keeps the old refusal instead
+  // of being repaired on weaker evidence, and — because the repair is never ATTEMPTED there —
+  // that refusal does not claim the two stores are inseparable when all that happened is the
+  // rail's own store did not take the value.
+  const strictlyRetained = (widget) => {
+    try {
+      return matchesExpected(widget?.value);
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * comfyui-mcp#2689 — undo the rail's collateral assignment to the SHARED definition.
+   *
+   * Runs INSIDE the write's own undo envelope (from its `finally`, before `safeAfter()`),
+   * for the reason #1533's number restore is there: `panel_set_widget` advertises "Undoable
+   * with Ctrl+Z", these hooks ARE litegraph's `graph.beforeChange`/`afterChange`, and the
+   * repair mutates the shared subgraph definition. Recorded as a SEPARATE transaction it
+   * would be strictly worse than not recording it at all — one Ctrl+Z would undo only the
+   * repair and reinstate the definition move while the instance rail kept the new value,
+   * i.e. hand the user a one-keystroke path to the very leak this exists to prevent. Inside,
+   * the write and its repair are one step: undo goes to the pre-write state, redo to the
+   * repaired one.
+   *
+   * Everything it reads and writes is captured before the envelope opens, and it is total —
+   * a throw here must never become the write's `threw`, which is attribution this module is
+   * careful about elsewhere.
+   *
+   * The accept decision is therefore taken BEFORE `afterChange` fires. That is a real
+   * narrowing and it is the right one: the alternative is a second transaction. A hook that
+   * re-moves the definition afterwards is still caught, by the LIVE `definitionMoved`
+   * re-classification after the envelope closes, which is what actually decides the verdict.
+   */
+  const repairSharedDefinitionWriteThrough = () => {
+    try {
+      if (!instanceScoped) return;
+      if (structurallyEqual(w.value, previousClone)) return;
+      if (!strictlyRetained(valueWidget)) return;
+      // What the WRITE left on the inner widget, so a repair that does not verify can be put
+      // back. Without this the failure path reports the REPAIR instead of the write: on a
+      // rail that is one store with the definition, restoring the inner widget drags the rail
+      // down with it, and the verdict flips from "ALSO changed the shared subgraph definition"
+      // (true, and actionable) to "did not retain the requested value" (false — the rail
+      // retained it; this code took it away). A repair that cannot be verified must leave
+      // EXACTLY the state the write left, so every verdict describes the write.
+      //
+      // Kept as BOTH the reference and a structural CLONE. The reference is what a restore
+      // must reinstate (this module restores prior REFERENCES everywhere, so a rollback hands
+      // back the object the node already had); the clone is what says whether that
+      // reinstatement actually reproduced the post-write value, because a widget whose setter
+      // mutates its current value object IN PLACE turns the captured reference into whatever
+      // was last assigned — including the pre-write value we just restored FROM.
+      const innerAfterWrite = w.value;
+      const innerAfterWriteClone = deepClone(innerAfterWrite);
+      try {
+        restoreWidgetValue(w, previous);
+      } catch {
+        /* the read-back below is authoritative */
+      }
+      const innerRestored = structurallyEqual(w.value, previousClone);
+      const railKeptValue = strictlyRetained(valueWidget);
+      const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
+      if (innerRestored && railKeptValue && displaysKeptValue) {
+        definitionRepaired = true;
+        return;
+      }
+      // Ordered by how fundamental the obstacle is: a rail dragged back with the definition
+      // is the two being one store; an inner widget that will not take its own value back is
+      // the definition being unrestorable; a stale display proxy is neither — the value
+      // stores separated fine and a parent-facing VIEW did not.
+      definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
+      try {
+        restoreWidgetValue(w, innerAfterWrite);
+      } catch {
+        /* the LIVE re-classification after the envelope decides, not what was attempted */
+      }
+      if (!structurallyEqual(w.value, innerAfterWriteClone)) {
+        try {
+          restoreWidgetValue(w, innerAfterWriteClone);
+        } catch {
+          /* still decided from the LIVE value */
+        }
+      }
+    } catch {
+      /* never let the repair become the write's throw; the verdict is taken from live state */
+    }
+  };
   let threw = null;
   // #976 (codex NO-SHIP round 2): a captured throw cannot be detected by testing
   // `threw` for truthiness — `throw undefined`, `throw null`, `throw 0`, `throw ""`
@@ -2969,7 +3653,10 @@ export function applyWidgetWrite(
     // here, so it needs no callback of its own.
     if (!instanceScoped) {
       if (fastBypasserAction) {
-        Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
+        // #2146 group row: `toggle(value)`. #2151 Fast Bypasser / Fast Muter row:
+        // `doModeChange(value)`. Both take the forced value as their first argument and both
+        // set the row's own value themselves, which is why nothing is assigned here.
+        Reflect.apply(fastBypasserAction.action, valueWidget, [fastBypasserAction.requested]);
       } else {
         assignWidgetValue(w, coerced);
       }
@@ -3053,7 +3740,13 @@ export function applyWidgetWrite(
     // editor + options.setValue path above is what serializes; read-back
     // still decides whether the write stuck.
     if (!fastBypasserAction && !liveCustomTextWrite) {
-      widgetCallback = valueWidget.callback;
+      // #1533 — callback observation and VHS callback guarding happen only AFTER all
+      // value assignments. A callback accessor is widget code, not a preflight gate:
+      // if it throws, the established post-assignment verification/warning path owns
+      // the receipt and the requested value is not undone merely because it was read.
+      guardVhsDimensionCallbacksOnNode(targetNode, valueWidget);
+      const guarded = guardVhsDimensionCallback(targetNode, valueWidget);
+      widgetCallback = guarded.matched ? guarded.callback : valueWidget.callback;
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
@@ -3085,6 +3778,11 @@ export function applyWidgetWrite(
     didThrow = true;
     threw = err;
   } finally {
+    // comfyui-mcp#2689 — inside this envelope, so the write and the undo of its collateral
+    // definition assignment are ONE undoable step. In the `finally` rather than at the end
+    // of the `try`, because the write-through happens during the value assignments: a
+    // callback that throws afterwards must not leave the shared definition moved.
+    repairSharedDefinitionWriteThrough();
     safeAfter();
   }
 
@@ -3129,8 +3827,14 @@ export function applyWidgetWrite(
       return UNREADABLE_PROPERTY;
     }
   };
+  // comfyui-mcp#2689 — classified from the LIVE definition value, AFTER afterChange, so an
+  // `afterChange` hook that re-assigns the shared inner widget is caught here even though
+  // the repair itself ran inside the envelope. `definitionRepaired` records that the repair
+  // landed at the time it ran; this line decides whether the definition is still whole now.
+  let definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
   // Read ONCE, after the envelope closed. Two reads of a stateful accessor can disagree,
-  // and the verdict and the message it prints must be the same observation.
+  // and the verdict and the message it prints must be the same observation. Taken after
+  // the #2689 repair so the one reading describes the state this call actually leaves.
   const boundPropertyActual = boundProperty?.reachable ? readBoundProperty() : undefined;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
@@ -3156,7 +3860,7 @@ export function applyWidgetWrite(
   // the write rolls back and says so instead of reporting an instance-scoped write it
   // did not perform. Compared structurally against the pre-mutation clone, so a
   // callback mutating a captured object in place is caught too.
-  const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
+  // (classified above, before the bound-property read, so the #2689 repair can clear it)
   if (!widgetMatchesExpected(valueWidget) && !normalization) {
     failure =
       `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
@@ -3181,7 +3885,16 @@ export function applyWidgetWrite(
       `${targetNode.id} (${JSON.stringify(previous)} → ${JSON.stringify(w.value)}). That value is ` +
       `read by every other instance of this subgraph, so the write is not scoped to the ` +
       `instance it was addressed to. Rolled back rather than report an instance-scoped write ` +
-      `that was not one (comfyui-mcp#1707).`;
+      `that was not one (comfyui-mcp#1707).` +
+      // comfyui-mcp#2689 — a write-through rail is REPAIRED, not refused, whenever undoing
+      // the collateral inner assignment leaves the rail holding the requested value. So
+      // reaching this branch after the repair ran means the two could not be separated:
+      // restoring the inner widget dragged the rail back with it, and the rail and the
+      // shared definition really are one store. Said ONLY when the repair was ATTEMPTED.
+      definitionRepairBlockedNote(definitionRepairBlockedBy, {
+        widgetName: w.name,
+        subgraphNodeId: node.id,
+      });
   } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
     // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
     // property did NOT. This is the read the old verification never took: `w.value` came
@@ -3470,20 +4183,6 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
-      // comfyui-mcp#1707 — restore the inner definition widget only when this write
-      // could have moved it: it was written (the definition-scoped path), or it moved
-      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
-      // write that left it alone must not assign it here either — the assignment is a
-      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
-      // write this path never made is exactly the shared-definition touch it avoided.
-      // The read-back below still compares it against the captured clone either way.
-      if (!instanceScoped || definitionMoved) {
-        try {
-          restoreWidgetValue(w, previous);
-        } catch {
-          /* restore best-effort; read-back below is authoritative */
-        }
-      }
       if (parentWidget) {
         try {
           restoreWidgetValue(parentWidget, previousParent);
@@ -3496,6 +4195,36 @@ export function applyWidgetWrite(
       for (let i = 0; i < displayWidgets.length; i++) {
         try {
           restoreWidgetValue(displayWidgets[i], previousDisplays[i]);
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+      // comfyui-mcp#1707 — restore the inner definition widget only when this write
+      // could have moved it: it was written (the definition-scoped path), or it moved
+      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
+      // write that left it alone must not assign it here either — the assignment is a
+      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
+      // write this path never made is exactly the shared-definition touch it avoided.
+      // The read-back below still compares it against the captured clone either way.
+      //
+      // #2132 — LAST, after the rail and every display proxy. The only way this branch
+      // is reached on the instance-scoped path is `definitionMoved`: a rail that writes
+      // THROUGH to the inner widget. Restoring the inner first therefore rolled it back
+      // and then the rail's own restore forwarded the rail's captured value straight
+      // back onto it — leaving the SHARED definition holding a value that was neither
+      // the requested one nor the one it started with, for every sibling instance and
+      // every instance created later. It only showed when the two had diverged before
+      // the write (`previousParent !== previous`), which is why it survived as the
+      // "Rollback of inner … did not take effect" partial state in #2132 rather than as
+      // an obvious failure. Ordering the shared value last makes the forwarding write
+      // an intermediate state the inner restore then overwrites, so both stores land on
+      // their own captured values. If a shape forwards in BOTH directions the two
+      // genuinely cannot both be restored, and the read-back below still reports that
+      // as the partial state it is — with the SHARED definition, not the single rail,
+      // as the one that is made whole.
+      if (!instanceScoped || definitionMoved || definitionRepaired) {
+        try {
+          restoreWidgetValue(w, previous);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
@@ -3717,6 +4446,24 @@ export function applyWidgetWrite(
   //
   // It NEVER decides this write's verdict: a throwing hook is disclosed on the success
   // result, the same containment the widget callback and #1282's refresh press get.
+  // #2143 — THE REPORTED INDEX IS AN ADDRESS, so it is resolved LAST and by IDENTITY.
+  //
+  // `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]" — that
+  // round trip is the whole point of matching `duplicate_widgets`. A position captured
+  // before the write is not that number: the write fires the widget's own callback, and a
+  // Fast Groups row action changes the groups its rows are derived FROM, so the node can
+  // reorder them. Reporting the pre-write position then names a row this write never
+  // touched, and re-using it writes that other row — the exact silent-wrong-row this issue
+  // exists to remove, reintroduced by the field added to prevent it.
+  //
+  // Unlike `verifiedName`/`verifiedValue` above, a fresh read is CORRECT here and a stale
+  // capture is not: #1519 keeps those pre-hook because a post-hook read would report a value
+  // nothing verified, whereas this is anchored to the written widget by identity, so it can
+  // only ever name that row — wherever the row has moved to.
+  //
+  // A row the callback REMOVED has no current address, so the pre-write capture is reported
+  // with `stale: true` rather than silently dropped: the caller still learns which row was
+  // written, and is told not to reuse the number.
   const verifiedValue = valueWidget.value;
   const verifiedName = valueWidget.name;
   const previousForHook = instanceScoped ? previousParent : previous;
@@ -3728,6 +4475,40 @@ export function applyWidgetWrite(
     afterChange,
     setDirty,
   });
+
+  // #2143 — RESOLVED AFTER THE LAST THING THAT CAN MOVE A ROW.
+  //
+  // "Last" is meant literally and is worth keeping that way: this pair of statements is the
+  // final executable code before the reply is built, so nothing inside this function can
+  // reorder, rebuild or rename a row after it. Anything added below must go ABOVE it, or the
+  // address goes stale again — which is how this landed here in the first place, one hook at
+  // a time (the widget callback, then `onWidgetChanged`, then its rename).
+  //
+  // `widget_occurrence.index` is an ADDRESS: the number a caller sends straight back as
+  // "NAME[i]", which is why it matches what `duplicate_widgets` publishes. Two hooks can
+  // reorder or rebuild `node.widgets` after the value lands — the widget's own callback,
+  // and then the node's `onWidgetChanged` (#1519) fired just above — so it is read here,
+  // after both, and by IDENTITY against the widget that was written. Reading it any
+  // earlier names a row this write never touched, and re-using that number writes that
+  // other row: the silent-wrong-row this issue exists to remove, reintroduced by the
+  // field added to prevent it.
+  //
+  // Unlike `verifiedName`/`verifiedValue`, a fresh read is CORRECT here and a stale capture
+  // is not: #1519 keeps those pre-hook because a post-hook read would report a value nothing
+  // verified, whereas this is anchored to the written widget, so it can only ever name that
+  // row — wherever the row has moved to. A row a hook REMOVED has no current address, so the
+  // pre-write capture is reported with `stale: true` rather than silently dropped: the caller
+  // still learns which row was written, and is told not to reuse the number.
+  if (out && typeof out === "object") {
+    out.valueWidget = valueWidget;
+    out.valueNode = valueNode;
+    out.preWriteOccurrence = preWriteOccurrence;
+  }
+  const liveOccurrence = promotedFrom
+    ? null
+    : widgetOccurrenceOf(valueNode, valueWidget, verifiedName);
+  const widgetOccurrence =
+    liveOccurrence ?? (preWriteOccurrence ? { ...preWriteOccurrence, stale: true } : null);
 
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).
@@ -3757,6 +4538,13 @@ export function applyWidgetWrite(
     widget: verifiedName,
     previous: parentWidget ? previousParent : previous,
     value: verifiedValue,
+    // #2143 — WHICH of the same-named rows this write landed on: `{index, of, label?}`,
+    // using the same ordinal and the same display label `panel_query_graph`'s
+    // duplicate_widgets reports, so the two halves of the surface agree. Present ONLY when
+    // the name is carried by more than one widget — which is the only case where "widget:
+    // RGTHREE_TOGGLE_AND_NAV" does not identify what was written — so every node with unique
+    // widget names replies exactly as it did before.
+    ...(widgetOccurrence ? { widget_occurrence: widgetOccurrence } : {}),
     // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
     // inferring it from the rejection that led here. `options.values` is a callback and
     // can answer differently per call: the final attempt may well have been admitted by
@@ -3881,6 +4669,26 @@ export function applyWidgetWrite(
             // path — the failure branch above rolls back rather than let "instance" stand
             // for a write that moved the definition.
             value_scope: valueScope,
+            // comfyui-mcp#2689 — the rail's setter ALSO assigned the shared definition's
+            // inner widget, and that assignment was undone and verified undone before this
+            // result was built. Emitted as DATA so a caller does not have to read prose to
+            // learn that the definition was touched and put back, and ONLY on the path that
+            // actually did it — every rail that does not write through replies exactly as it
+            // always did. `value_scope` stays "instance" because that is what was OBSERVED:
+            // the wrapper's own store entry holds the value and the definition is structurally
+            // identical to its pre-write clone.
+            ...(definitionRepaired
+              ? {
+                  shared_definition_write_through: true,
+                  shared_definition_write_through_note: sharedDefinitionWriteThroughNote({
+                    widgetName: w?.name,
+                    innerNodeId: targetNode?.id,
+                    innerNodeType: targetNode?.type,
+                    innerValue: previous,
+                    subgraphNodeId: node?.id,
+                  }),
+                }
+              : {}),
             // #1492 — the side effects this write did NOT run, stated as DATA next to
             // the scope decision that caused it. Emitted ONLY when a callback was
             // actually observed on the shared inner widget (or could not be read at
@@ -3905,6 +4713,85 @@ export function applyWidgetWrite(
         }
       : {}),
   };
+}
+
+/**
+ * comfyui-mcp#2689 — say WHY the repair could not be accepted, when one was attempted.
+ *
+ * The repair undoes the rail's collateral assignment to the shared definition and accepts the
+ * write only if the definition came back AND every parent-facing projection kept the requested
+ * value. Three different things can block that, and they have three different remedies — so
+ * the refusal names the one that actually happened rather than asserting the most dramatic:
+ *
+ *   "rail"     restoring the inner widget dragged the rail back, so the two are one store.
+ *   "inner"    the shared definition would not take its own value back at all.
+ *   "display"  the stores separated fine; a parent-facing VIEW of the definition did not.
+ *
+ * Returns "" when no repair was attempted, so a refusal that never ran the check cannot be
+ * read as reporting its outcome.
+ */
+export function definitionRepairBlockedNote(blockedBy, { widgetName, subgraphNodeId } = {}) {
+  if (blockedBy === "rail") {
+    return (
+      ` Restoring the inner widget on its own did not separate the two — the rail came back ` +
+      `with it — so this rail and the shared definition are one store here ` +
+      `(comfyui-mcp#2689). Edit this widget inside the subgraph definition if every instance ` +
+      `should take the value, or unpack the subgraph to give this instance its own copy.`
+    );
+  }
+  if (blockedBy === "inner") {
+    return (
+      ` The rail kept the requested value, but the shared definition's inner widget would not ` +
+      `take its own value back, so the write could not be separated from it ` +
+      `(comfyui-mcp#2689).`
+    );
+  }
+  if (blockedBy === "display") {
+    return (
+      ` The two value stores DID separate — the rail kept the requested value and the shared ` +
+      `definition came back — but subgraph node ${subgraphNodeId}'s parent-facing display ` +
+      `widget for "${widgetName}" reads the definition, so undoing the write there would ` +
+      `leave the wrapper rendering the OLD value (comfyui-mcp#2689). This is a stale ` +
+      `PROJECTION, not a shared store: reopening the workflow rebuilds it.`
+    );
+  }
+  return "";
+}
+
+/**
+ * comfyui-mcp#2689 — say that the shared subgraph definition was written THROUGH and put back.
+ *
+ * On the reported frontends the parent rail for a promoted STRING does not only write this
+ * wrapper's own promoted-value store — its setter also assigns the shared definition's inner
+ * widget. That second assignment is nobody's intent: an on-canvas edit of the promoted control
+ * never performs it, and every sibling instance reads the widget it lands on. So the write
+ * undoes it and verifies the definition is structurally back on its captured value before
+ * reporting anything.
+ *
+ * WORDED FOR WHAT IS ESTABLISHED. It says the definition was assigned and restored — both
+ * OBSERVED — and does not claim the inner widget's own callback did or did not run during the
+ * rail's write-through: that is the rail's code, not this module's, and nothing here can see
+ * it. What this module can and does state separately (`inner_callback_not_invoked`) is that it
+ * never invoked that callback itself.
+ */
+export function sharedDefinitionWriteThroughNote({
+  widgetName,
+  innerNodeId,
+  innerNodeType,
+  innerValue,
+  subgraphNodeId,
+} = {}) {
+  const inner = `node ${innerNodeId}${innerNodeType ? ` (${innerNodeType})` : ""}`;
+  return (
+    `The value IS in effect on subgraph node ${subgraphNodeId}: it was written to this ` +
+    `instance's own promoted-value store, which is what serializes at queue time. This ` +
+    `frontend's promoted rail ALSO assigned the shared subgraph definition's inner widget ` +
+    `"${widgetName}" on ${inner} — an assignment every sibling instance would have inherited, ` +
+    `and one an on-canvas edit of the promoted control never makes. It was undone: that widget ` +
+    `was verified structurally back on ${JSON.stringify(innerValue)} after the rail kept the ` +
+    `requested value, which is why this write is reported as instance-scoped. Sibling ` +
+    `instances, and instances created later from this definition, are unaffected.`
+  );
 }
 
 /**

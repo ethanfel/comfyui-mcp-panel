@@ -87,6 +87,106 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
   return activeWorkflowNodeCount(activeWorkflow) > 0;
 }
 
+function workflowLoadedFileNodeCount(activeWorkflow) {
+  try {
+    const raw = activeWorkflow?.originalContent;
+    if (typeof raw !== "string" || !raw) return 0;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.nodes) ? parsed.nodes.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function leftoverArchivedCanvasAgainstOpenFile({ liveNodeCount, activeWorkflow }) {
+  if (activeWorkflow?.isModified === true) return false;
+  const fileCount = workflowLoadedFileNodeCount(activeWorkflow);
+  if (!(fileCount > 0)) return false;
+  return Number(liveNodeCount) < fileCount;
+}
+
+/**
+ * #1215 recurrence — after a tab switch the ACTIVE pointer (and the session
+ * fence) can already name the new workflow while the live root is still the
+ * PREVIOUS tab's graph. That is the inverse of `graphReadDesynced`: the canvas
+ * is nonempty, not empty.
+ *
+ * Missing current state alone is NOT leftover evidence. Extracted graph_query
+ * fixtures, a first observation, and #618's unreadable tracker all look like
+ * "live nodes + no activeState" and must fail OPEN. Refuse when last-open
+ * leftover proof is present:
+ *   - `switchRepaintUnproven`: this session's last open moved the pointer and
+ *     could not prove the canvas rebound (the safe-repaint failure). A TARGET
+ *     tracker that still serializes is not an exception — that is the poisoned
+ *     already-open tab;
+ *   - another still-open workflow's current state AGREES with the live root
+ *     while THIS tab has no comparable current state, so the mounted graph is
+ *     that previous tab's, not the named one;
+ *   - or a CLEAN already-open tab whose loaded file (`originalContent`) is
+ *     LARGER than the live canvas: the tracker can agree with a leftover
+ *     4-node archive while last-open names the 69-node file. Dirty tabs fail
+ *     OPEN (a user can delete nodes). Missing/unreadable file bytes fail OPEN.
+ *
+ * A well-formed empty `nodes: []` is the shape guard's job. A TARGET uuid on
+ * the leftover canvas is not an exception (#1639). `panel_set_workflow_target`
+ * does not clear this — it re-points the session, it does not rebind the canvas.
+ */
+export function graphRootUnprovenAgainstActiveState({
+  liveNodeCount,
+  activeWorkflow,
+  rootGraph = null,
+  others = null,
+  switchRepaintUnproven = false,
+  inSubgraph = false,
+} = {}) {
+  if (inSubgraph) return false;
+  if (!activeWorkflow) return false;
+  if (!(Number(liveNodeCount) > 0)) return false;
+  if (switchRepaintUnproven === true) return true;
+  if (leftoverArchivedCanvasAgainstOpenFile({ liveNodeCount, activeWorkflow })) return true;
+  if (activeWorkflowCurrentState(activeWorkflow) != null) return false;
+  if (!rootGraph || !Array.isArray(others)) return false;
+  for (const other of others) {
+    if (!other) continue;
+    try {
+      const otherState = activeWorkflowCurrentState(other);
+      if (otherState == null) continue;
+      if (graphRootAgreesWithActiveState(rootGraph, otherState)) return true;
+    } catch {
+      // An unreadable twin is not leftover proof.
+    }
+  }
+  return false;
+}
+
+/**
+ * True when ComfyUI's load-time missing-node store positively reports missing
+ * nodes. The store is independent from both LiteGraph's live graph and the
+ * workflow ChangeTracker, so it is useful evidence specifically in the
+ * recurrence where those two other surfaces both look empty. A malformed
+ * store is not evidence: preserve the existing fail-open behavior unless the
+ * frontend explicitly says it has missing nodes and carries either a count or
+ * a record we can observe.
+ */
+export function missingNodeStateReportsNodes(missingNodeState) {
+  try {
+    if (!missingNodeState?.hasMissingNodes) return false;
+    if (Number(missingNodeState.missingNodeCount) > 0) return true;
+    const raw = missingNodeState.missingNodesError;
+    // Match collectMissingAssets' parser exactly: an object whose selected
+    // record array is present but empty is absence, not positive evidence.
+    const records = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === "object"
+        ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+        : [];
+    return records.length > 0;
+  } catch {
+    // An unreadable optional store cannot prove a mismatch.
+  }
+  return false;
+}
+
 /**
  * The active workflow's OWN current-state node count, or `null` when that state
  * is absent/malformed. Unlike activeWorkflowNodeCount this NEVER falls back to
@@ -186,11 +286,18 @@ export function graphEmptyBindingUnproven({
   activeWorkflow,
   activeWorkflowUuid,
   graphLoading = false,
+  missingNodeState = null,
 } = {}) {
   if (!!rootGraph && graph && graph !== rootGraph) return false; // subgraph scope
   const live = rootGraph?._nodes;
   if (!Array.isArray(live) || live.length !== 0) return false; // populated or unobservable
   if (!activeWorkflow) return false; // no workflow service — legacy availability
+  // A positive load-time missing-node report is independent evidence that the
+  // empty canvas is not a clean, authoritative read. This must run before the
+  // identity-tag/proven-empty relaxations: a reused root can still carry the
+  // active tag while the loaded workflow's missing-node state names content the
+  // live graph does not contain (#389 recurrence).
+  if (missingNodeStateReportsNodes(missingNodeState)) return true;
   if (activeWorkflowProvenEmpty(activeWorkflow)) return false; // PROVEN empty — truthful 0
   if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false; // positively bound
   // #833 — both sides provably content-free. The clause above cannot fire on a blank
@@ -2230,6 +2337,19 @@ function abortedRestoreClause(observed = {}) {
       `byte-identical, which is why the content stays unconfirmed rather than applied`
     );
   }
+  const impactSwitchSlotFailure = failures.every((failure) => {
+    const type = String(failure?.type ?? "");
+    const error = String(failure?.error ?? "");
+    return type === "ImpactSwitch" && /find(Input|Output)Slot is not a function/.test(error);
+  });
+  if (impactSwitchSlotFailure) {
+    return (
+      `. AND THE RESTORE DID NOT RUN TO COMPLETION: ${failures.length} ImpactSwitch node(s) ` +
+      `are still at CONSTRUCTION DEFAULTS after a post-load retry — ${named}` +
+      (failures.length > 10 ? `, and ${failures.length - 10} more` : "") +
+      `. Do not re-open to heal them: persist/rebind the path stamp when identity matches`
+    );
+  }
   return (
     `. AND THE RESTORE DID NOT RUN TO COMPLETION: the panel watched this load and ` +
     `${failures.length} node(s) are still at CONSTRUCTION DEFAULTS after a post-load retry — ` +
@@ -2397,6 +2517,35 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // A reply that says two opposite things about one observation is the defect #1623 was
     // reported for, one level down.
     if (compared && observed.contentLoadRanToCompletion === false) {
+      const restoreFailures = Array.isArray(observed.contentRestoreFailures)
+        ? observed.contentRestoreFailures
+        : [];
+      const impactSwitchSlotFailure =
+        restoreFailures.length > 0 &&
+        restoreFailures.every((failure) => {
+          const type = String(failure?.type ?? "");
+          const error = String(failure?.error ?? "");
+          return (
+            type === "ImpactSwitch" &&
+            /find(Input|Output)Slot is not a function/.test(error)
+          );
+        });
+      if (impactSwitchSlotFailure) {
+        // #2194 — identity is proven; another open/restore of these defaulted
+        // ImpactSwitch nodes is the dead end the save-path recovery used to
+        // recommend. Persist/rebind the path stamp when uuid matches; fail
+        // closed if it does not.
+        return (
+          `workflow_open RAN and the canvas IS bound to ${workflow} — identity is proven — but ` +
+          `ImpactSwitch restore left node(s) at CONSTRUCTION DEFAULTS after t.findInputSlot is not ` +
+          `a function.${because} Do NOT re-open this tab to heal it: another restore of those ` +
+          `broken defaulted nodes is the same dead end. Identity is settled, so persist/rebind ` +
+          `extra.comfyui_mcp.workflow_path onto this file without requiring those nodes to ` +
+          `configure cleanly, then save. If the canvas uuid does NOT match this tab, fail closed ` +
+          `— that is a foreign graph and must not overwrite ${workflow}.` +
+          FENCE_NOT_REFRESHED
+        );
+      }
       return (
         `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the ` +
         `RESTORE ITSELF DID NOT FINISH, so the graph on the canvas is not what was loaded. This is ` +
@@ -2998,6 +3147,9 @@ export function resolveGraphBindingVerdict({
   requireDirtyMutationBinding = false,
   postReconnectWindow = false,
   graphLoading = false,
+  missingNodeState = null,
+  others = null,
+  switchRepaintUnproven = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -3092,7 +3244,32 @@ export function resolveGraphBindingVerdict({
       ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
-  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading })) {
+  // #1215 — leftover previous canvas after a switch that could not repaint.
+  // Missing current state alone is not enough (graph_query fixtures, #618).
+  if (
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: nodeCount,
+      activeWorkflow,
+      rootGraph,
+      others,
+      switchRepaintUnproven,
+      inSubgraph,
+    })
+  ) {
+    return {
+      reason: "root-state-unreadable",
+      expected: null,
+      live: nodeCount,
+    };
+  }
+  if (missingNodeStateReportsNodes(missingNodeState) && !inSubgraph && nodeCount === 0) {
+    return {
+      reason: "empty-graph-missing-nodes",
+      expected: activeWorkflowNodeCount(activeWorkflow),
+      live: nodeCount,
+    };
+  }
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading, missingNodeState })) {
     return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
   }
   return null;
@@ -3131,6 +3308,27 @@ export function graphBindingRefusalMessage(verdict) {
       `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
       `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
+    );
+  }
+  if (verdict.reason === "root-state-unreadable") {
+    const live = Number(verdict.live);
+    const liveText = Number.isFinite(live) ? `${live} node(s)` : "nodes";
+    return (
+      `[root-state-unreadable] The live canvas shows ${liveText}, but the active workflow has no ` +
+      `comparable serialized state, so this command was NOT applied as authoritative. After a tab ` +
+      `switch the canvas can still be the previous workflow while the active pointer and session ` +
+      `fence already name the new one. Re-open the active workflow tab (panel_open_workflow) or ` +
+      `load it from disk (panel_load_workflow). That REPLACES the canvas. Re-targeting with ` +
+      `panel_set_workflow_target is NOT a remedy for this — it re-points the session, it does ` +
+      `not rebind the canvas.`
+    );
+  }
+  if (verdict.reason === "empty-graph-missing-nodes") {
+    return (
+      `[empty-graph-missing-nodes] The live root canvas reads EMPTY while the active session reports ` +
+      `missing node state, so node_count 0 is not a trustworthy clean graph read. This command ` +
+      `was NOT applied as authoritative. Re-open the active workflow tab (panel_open_workflow) ` +
+      `or reload the panel, then retry once the loaded graph and missing-node state agree.`
     );
   }
   // #606 — name the firing predicate honestly, and order the remedies by which

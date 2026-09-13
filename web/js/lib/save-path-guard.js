@@ -59,14 +59,27 @@
 // So the guard also refuses a write whose state is PROVABLY stale, on two conjuncts,
 // both required:
 //
-//   * upstream POSITIVELY says the pre-save capture was skipped (its own
-//     `changeCount` / `_restoringState` / `isLoadingGraph` conditions), and
+//   * upstream POSITIVELY says no pre-save capture happened — either it names a
+//     suppression window it is inside right now (its own `changeCount` /
+//     `_restoringState` / `isLoadingGraph` conditions), or its OWN comparator
+//     (`ChangeTracker.graphEqual`, the test `captureCanvasState` uses to decide
+//     whether to replace `activeState`) still reports a difference after a refresh
+//     was requested — and
 //   * the live root does not reproduce the state about to be written.
 //
 // Neither alone: a suppressed capture on a canvas that already equals the snapshot
 // loses nothing, and a content difference alone cannot be told from ordinary tracker
 // lag on a frontend whose fields this panel does not recognise. Requiring both keeps
 // an unknown frontend on today's behaviour instead of refusing every save on it.
+//
+// panel#2133 — the second reading of the first conjunct is why "no capture happened"
+// is no longer the same sentence as "a suppression window is open NOW". The shipped
+// frontend (1.49.6) has FIVE early returns in `captureCanvasState`, not three:
+// `!app.graph` and `!isActiveTracker(this)` are invisible to the flag model, and
+// `prepareForSave()` is itself only `isActiveTracker(this) && captureCanvasState()`,
+// so the refresh can be a complete no-op with nothing to observe. A capture swallowed
+// a moment earlier also leaves every flag back to false by write time. Both shapes
+// reported `saved:true` over a file missing three nodes and a group.
 //
 // Dependency-light: path normalization is imported; the store reads stay in the caller.
 // Unit-testable with plain fixtures.
@@ -129,6 +142,33 @@ export function decideWorkflowSaveVerdict({
 }
 
 /**
+ * #2194 — restamp a leftover nested `workflow_path` when graph identity is THIS
+ * tab's, so save does not require `panel_open_workflow` (whose restore can leave
+ * ImpactSwitch nodes at construction defaults).
+ *
+ * Fail closed unless both uuids are non-empty strings and equal: a missing or
+ * disagreeing identity is the #1667 foreign-canvas case and must not overwrite.
+ *
+ * Mutates `state.extra.comfyui_mcp.workflow_path` only. Returns true when the
+ * stamp now names the destination.
+ */
+export function rebindForeignStampIfIdentityMatches({
+  state,
+  destinationPath,
+  destinationUuid,
+} = {}) {
+  if (typeof destinationUuid !== "string" || !destinationUuid) return false;
+  if (typeof destinationPath !== "string" || !destinationPath) return false;
+  const extra = state?.extra?.comfyui_mcp;
+  const stampedUuid = extra?.workflow_uuid;
+  if (typeof stampedUuid !== "string" || !stampedUuid) return false;
+  if (stampedUuid !== destinationUuid) return false;
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) return false;
+  extra.workflow_path = destinationPath;
+  return true;
+}
+
+/**
  * The refusal a blocked save throws. States what was compared, what was NOT written,
  * both readings of the evidence (stale canvas vs deliberate copy), and the recovery.
  * Deliberately does not claim which reading is true — the panel cannot tell them apart;
@@ -143,13 +183,16 @@ export function workflowSaveRefusalError(verdict) {
       `REFUSED to save: the state this save would write to "${dest}" is BEHIND the live ` +
         `canvas, so the file would be missing changes the canvas already has. ComfyUI saves ` +
         `the ChangeTracker snapshot rather than the graph on screen, and it refreshes that ` +
-        `snapshot first — but that refresh is skipped while a workflow is loading, while an ` +
-        `undo is restoring, or inside an open change transaction, and one of those is true ` +
-        `right now. NOTHING was written; the canvas is intact. This clears by itself once the ` +
-        `load/undo/transaction finishes — wait a moment and save again. If it persists, ` +
-        `reload the ComfyUI tab (panel_reload) and re-open the workflow ` +
-        `(panel_open_workflow); do NOT close the tab first, closing discards the canvas that ` +
-        `holds the only copy of those changes (panel#1563).`,
+        `snapshot first — but that refresh is silently skipped while a workflow is loading, ` +
+        `while an undo is restoring, inside an open change transaction, and whenever the ` +
+        `tracker is not the active workflow's, and one of those swallowed it. NOTHING was ` +
+        `written; the canvas is intact. RECOVERY, in order — each one re-runs the capture ` +
+        `WITHOUT touching the canvas, so none of them can lose the changes: wait a moment and ` +
+        `save again (a still-open load/undo/transaction clears by itself); then nudge the ` +
+        `canvas so ComfyUI captures it — any panel graph mutation, or a click/drag on the ` +
+        `canvas, refreshes the snapshot — and save again. Do NOT close the tab, and do NOT ` +
+        `re-open the workflow from disk: both replace the canvas that holds the only copy of ` +
+        `those changes (panel#1563, panel#2133).`,
     );
   }
   const stamped = typeof verdict?.stampedPath === "string" && verdict.stampedPath
@@ -162,8 +205,11 @@ export function workflowSaveRefusalError(verdict) {
       `belong to it — this is the #1667 stale-canvas data-loss guard, and NOTHING was written. ` +
       `Either this tab's canvas is stale (mounted from another workflow — reload the file from ` +
       `disk before losing it), or you deliberately built this content under a copied identity. ` +
-      `If the canvas really is what you want in "${dest}", re-bind the tab first — open the ` +
-      `workflow via panel_open_workflow so its identity is re-verified against the file — then ` +
-      `save again.`,
+      `If the canvas uuid already matches this tab, persist by restamping extra.comfyui_mcp.workflow_path ` +
+      `to "${dest}" — that rebind does not require a clean restore of ImpactSwitch nodes that throw ` +
+      `findInputSlot and stay at construction defaults. Do NOT open-then-restore as the only path: ` +
+      `panel_open_workflow can report identity match, leave those nodes unrestored, and then forbid ` +
+      `save (panel#2194). If the canvas uuid does NOT match this tab, fail closed — that is a ` +
+      `foreign graph and must not overwrite "${dest}".`,
   );
 }

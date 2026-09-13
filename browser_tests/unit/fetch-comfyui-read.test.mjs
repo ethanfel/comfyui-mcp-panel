@@ -73,7 +73,7 @@ async function rejection(promise, code) {
   });
 }
 
-test("#2283: the allowed operations use only their fixed same-origin routes", async () => {
+test("#2196/#2283: the allowed operations use only their fixed same-origin routes", async () => {
   const apiURLCalls = [];
   const fileURLCalls = [];
   const apiCalls = [];
@@ -83,6 +83,7 @@ test("#2283: the allowed operations use only their fixed same-origin routes", as
     system_stats: '{"system":{"os":"windows"},"devices":[]}',
     logs: "ERROR: render failed\n",
     object_info: '{"KSampler":{"input":{"required":{}}}}',
+    workflow_templates: '{"templates":[]}',
   };
   for (const operation of Object.keys(bodies)) {
     const result = await fetchComfyUIReadForMcp(
@@ -118,9 +119,9 @@ test("#2283: the allowed operations use only their fixed same-origin routes", as
     });
   }
 
-  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info"]);
+  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
   assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
   assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
   for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
@@ -129,6 +130,58 @@ test("#2283: the allowed operations use only their fixed same-origin routes", as
     assert.equal(init.redirect, "manual");
     assert.ok(init.signal instanceof AbortSignal);
   }
+});
+
+test("#2228: apiURL and fileURL keep the Comfy API object as this when they read this.api_base", async () => {
+  function apiURL(path) {
+    return `${this.api_base}${path}`;
+  }
+  function fileURL(path) {
+    return `${this.api_base}${path}`;
+  }
+  const api = {
+    api_base: "https://panel.test/comfy/api",
+    apiURL,
+    fileURL,
+    fetchApi: async () => response({ body: '{"prompt-1":{"status":{"status_str":"success"}}}' }),
+  };
+
+  const history = await fetchComfyUIReadForMcp(
+    { operation: "history" },
+    { expectedOrigin: "https://panel.test", api },
+  );
+  assert.equal(history.operation, "history");
+  assert.equal(history.body, '{"prompt-1":{"status":{"status_str":"success"}}}');
+
+  const logs = await fetchComfyUIReadForMcp(
+    { operation: "logs" },
+    {
+      expectedOrigin: "https://panel.test",
+      api: { ...api, api_base: "https://panel.test/comfy" },
+      fetchImpl: async (url) => {
+        assert.equal(url, "https://panel.test/comfy/internal/logs/raw");
+        return response({ body: "ERROR: render failed\n", url });
+      },
+    },
+  );
+  assert.equal(logs.operation, "logs");
+  assert.equal(logs.body, "ERROR: render failed\n");
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "system_stats" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          api_base: "https://evil.test/api",
+          apiURL,
+          fetchApi: async () => { throw new Error("must not fetch"); },
+        },
+        fetchImpl: async () => { throw new Error("must not fetch"); },
+      },
+    ),
+    "invalid_origin",
+  );
 });
 
 test("#2283: logs raw transport retains origin, redirect, and body-size fences", async () => {
@@ -164,10 +217,59 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
   );
 });
 
+test("#2511: models inventory operations use only their fixed same-origin /models routes", async () => {
+  const apiURLCalls = [];
+  const apiCalls = [];
+  const bodies = {
+    models: '["checkpoints","loras","diffusion_models"]',
+    "models/checkpoints": '["remote-ckpt.safetensors"]',
+    "models/loras": '["remote-lora.safetensors"]',
+    "models/diffusion_models": '["remote-unet.safetensors"]',
+  };
+  for (const operation of Object.keys(bodies)) {
+    const result = await fetchComfyUIReadForMcp(
+      { operation },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => {
+            apiURLCalls.push(path);
+            return `https://panel.test/comfy/api${path}`;
+          },
+          fileURL: () => { throw new Error("models must not use fileURL"); },
+          fetchApi: async (path, init) => {
+            apiCalls.push({ path, init });
+            return response({ body: bodies[operation] });
+          },
+        },
+        fetchImpl: async () => { throw new Error("models must not use raw fetch"); },
+      },
+    );
+    assert.deepEqual(result, {
+      operation,
+      body: bodies[operation],
+      contentType: "application/json",
+      bytes: new TextEncoder().encode(bodies[operation]).byteLength,
+    });
+  }
+  assert.deepEqual(apiURLCalls, ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
+  for (const { init } of apiCalls) {
+    assert.equal(init.method, "GET");
+    assert.equal(init.cache, "no-store");
+    assert.equal(init.credentials, "include");
+    assert.equal(init.redirect, "manual");
+  }
+});
+
 test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
   const invalid = [
     {},
     { operation: "unknown" },
+    { operation: "models/" },
+    { operation: "models/../object_info" },
+    { operation: "models/foo/bar" },
+    { operation: "models/checkpoints?q=1" },
     { operation: "object_info", path: "/admin" },
     { operation: "history", path: "/admin" },
     { operation: "history", url: "https://evil.test" },

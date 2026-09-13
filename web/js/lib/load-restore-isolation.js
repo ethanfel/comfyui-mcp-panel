@@ -70,6 +70,28 @@ function graphLinkEntries(graph) {
   return [];
 }
 
+function missingLinkEndpointSlotMethod(graph, node, link, direction, serializedType) {
+  const isImpactSwitch =
+    node?.type === "ImpactSwitch" || node?.comfyClass === "ImpactSwitch" || serializedType === "ImpactSwitch";
+  const requiredMethod = direction === 2 ? "findOutputSlot" : direction === 1 ? "findInputSlot" : null;
+  if (!isImpactSwitch || !requiredMethod) return null;
+  const nodeId = node?.id;
+  if (nodeId == null || !link || typeof graph?.getNodeById !== "function") return null;
+  const nodeIsOrigin = sameNodeId(link.origin_id, nodeId);
+  const nodeIsTarget = sameNodeId(link.target_id, nodeId);
+  const farId = nodeIsOrigin ? link.target_id : nodeIsTarget ? link.origin_id : null;
+  if (farId == null) return null;
+  try {
+    const far = graph.getNodeById(farId);
+    if (far == null) return null;
+    if (typeof far[requiredMethod] !== "function") return requiredMethod;
+  } catch {
+    // A graph or endpoint that cannot be inspected is not evidence. The
+    // callback is allowed to run and any resulting throw is handled below.
+  }
+  return null;
+}
+
 function hasBrokenLinkEndpoint(graph, node, err) {
   const nodeId = node?.id;
   if (nodeId == null || typeof graph?.getNodeById !== "function") return false;
@@ -176,6 +198,87 @@ export function verifyNodeRestore(node, info) {
   }
 }
 
+/**
+ * #2194 — apply a node's serialized restore payload WITHOUT `configure()`.
+ *
+ * ImpactSwitch (and the same LiteGraph link-restore path) can throw
+ * `t.findInputSlot is not a function` while `configure` is still applying
+ * saved widgets/properties. Re-invoking `configure` repeats that throw and
+ * leaves the node at construction defaults. Copying the snapshot onto the
+ * already-created node does not call the slot lookup, so a later
+ * `verifyNodeRestore` can accept the saved values.
+ *
+ * Widget callbacks are silenced for the assignment: ImpactSwitch's `select`
+ * callback is the same hook that throws.
+ */
+export function applySerializedNodeState(node, info) {
+  if (!node || !info || typeof info !== "object") return false;
+  try {
+    if (Array.isArray(info.pos)) node.pos = info.pos.slice();
+    if (Array.isArray(info.size)) node.size = info.size.slice();
+    if (info.mode != null) node.mode = info.mode;
+    if (typeof info.title === "string") node.title = info.title;
+    if (Object.prototype.hasOwnProperty.call(info, "color")) node.color = info.color;
+    if (Object.prototype.hasOwnProperty.call(info, "bgcolor")) node.bgcolor = info.bgcolor;
+    if (info.flags && typeof info.flags === "object") {
+      node.flags = cloneSerializedValue(info.flags);
+    }
+    if (info.properties && typeof info.properties === "object") {
+      node.properties = cloneSerializedValue(info.properties);
+    }
+    if (info.widgets_values_named && typeof info.widgets_values_named === "object") {
+      node.widgets_values_named = cloneSerializedValue(info.widgets_values_named);
+    }
+    const values = info.widgets_values;
+    if (Array.isArray(values)) {
+      node.widgets_values = cloneSerializedValue(values);
+      const widgets = Array.isArray(node.widgets)
+        ? node.widgets.filter((widget) => widget && widget.serialize !== false)
+        : [];
+      for (let index = 0; index < Math.min(values.length, widgets.length); index += 1) {
+        const widget = widgets[index];
+        const callback = widget.callback;
+        try {
+          widget.callback = undefined;
+          widget.value = cloneSerializedValue(values[index]);
+        } finally {
+          widget.callback = callback;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoveredRestoreReceipt(failure, verification) {
+  const ownerGraphToken = failure.ownerGraphToken ?? graphIdentityToken(failure.ownerGraph);
+  return {
+    restored: { id: failure.id, type: failure.type },
+    recovered: {
+      id: failure.id,
+      type: failure.type,
+      ...(ownerGraphToken != null ? { ownerGraphToken } : {}),
+      linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
+    },
+  };
+}
+
+function recoverBySerializedState(node, failure) {
+  const infoHasWidgets = Array.isArray(failure?.info?.widgets_values) && failure.info.widgets_values.length > 0;
+  const liveWidgets = Array.isArray(node?.widgets)
+    ? node.widgets.filter((widget) => widget && widget.serialize !== false)
+    : [];
+  // serialize() after a throwing configure is not proof (#1668). Snapshot
+  // recovery is only for a node that still has live widgets to copy onto.
+  if (infoHasWidgets && liveWidgets.length === 0) return null;
+  if (!applySerializedNodeState(node, failure.info)) return null;
+  const verification = verifyNodeRestore(node, failure.info);
+  if (!verification.verified) return null;
+  return recoveredRestoreReceipt(failure, verification);
+}
+
 function waitForLinkStateToSettle() {
   return new Promise((resolve) => {
     let settled = false;
@@ -240,8 +343,73 @@ export function installNodeConfigureIsolation(LG, graph = null) {
       // An uncloneable payload cannot be safely verified after a throw.
       serializedSnapshot = null;
     }
+    const callback = this?.onConnectionsChange;
+    const hasOwnCallback = Object.prototype.hasOwnProperty.call(this ?? {}, "onConnectionsChange");
+    const ownCallback = hasOwnCallback ? this.onConnectionsChange : undefined;
+    let containedCallbackFailure = null;
+    let containedCallbackEvidence = false;
+    let callbackWrapper = null;
+    if (typeof callback === "function") {
+      callbackWrapper = function (...args) {
+        const missingSlotMethod = missingLinkEndpointSlotMethod(
+          this?.graph ?? graph,
+          this,
+          args?.[3],
+          args?.[0],
+          info?.type,
+        );
+        if (missingSlotMethod) {
+          // ImpactSwitch's restore callback can call a string-slot connect on a
+          // plain/stale far endpoint. That call would invoke a missing
+          // findInputSlot/findOutputSlot API. Leave the serialized link records
+          // untouched and verify the completed node instead of making the call.
+          containedCallbackFailure ??= new TypeError(
+            `link restore callback skipped: far endpoint lacks ${missingSlotMethod}`,
+          );
+          containedCallbackEvidence = true;
+          return undefined;
+        }
+        try {
+          return callback.apply(this, args);
+        } catch (err) {
+          // Impact Pack's dynamic-slot hook can call a LiteGraph slot lookup on
+          // a stale/plain far endpoint while configure is restoring links. Only
+          // contain the exact crash when the live graph proves that endpoint is
+          // broken; absent graph APIs remain fail-closed and propagate into the
+          // normal configure-failure record below.
+          if (!isLinkDisconnectCrash(err) || !hasBrokenLinkEndpoint(this?.graph ?? graph, this, err)) {
+            throw err;
+          }
+          containedCallbackFailure ??= err;
+          containedCallbackEvidence = true;
+          return undefined;
+        }
+      };
+      try {
+        this.onConnectionsChange = callbackWrapper;
+      } catch {
+        callbackWrapper = null;
+      }
+    }
     try {
-      return original.call(this, info);
+      const result = original.call(this, info);
+      if (containedCallbackFailure) {
+        const ownerGraph = this?.graph ?? null;
+        const evidenceGraph = this?.graph ?? graph ?? null;
+        failures.push({
+          id: info?.id ?? this?.id ?? null,
+          type: info?.type ?? this?.type ?? null,
+          error: errorText(containedCallbackFailure),
+          linkDisconnectCrash: true,
+          linkDisconnectEvidence:
+            containedCallbackEvidence || hasBrokenLinkEndpoint(evidenceGraph, this, containedCallbackFailure),
+          callbackContained: true,
+          ownerGraph,
+          ownerGraphToken: graphIdentityToken(ownerGraph),
+          info: serializedSnapshot,
+        });
+      }
+      return result;
     } catch (err) {
       const ownerGraph = this?.graph ?? null;
       const evidenceGraph = this?.graph ?? graph ?? null;
@@ -260,7 +428,23 @@ export function installNodeConfigureIsolation(LG, graph = null) {
         // retain an independent serialized snapshot for the retry/verification.
         info: serializedSnapshot,
       });
+      // #2194 — a findInputSlot throw aborts configure after construction. Copy
+      // the snapshot now so later nodes are not the only ones restored, and so
+      // the retry can verify instead of re-entering the throwing connect path.
+      if (isLinkDisconnectCrash(err) && serializedSnapshot) {
+        applySerializedNodeState(this, serializedSnapshot);
+      }
       return undefined;
+    } finally {
+      if (callbackWrapper && this.onConnectionsChange === callbackWrapper) {
+        try {
+          if (hasOwnCallback) this.onConnectionsChange = ownCallback;
+          else delete this.onConnectionsChange;
+        } catch {
+          // A frontend-defined non-configurable callback remains installed; it
+          // is safer to leave that state than to replace somebody else's hook.
+        }
+      }
     }
   };
   proto.configure = wrapped;
@@ -378,6 +562,34 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       });
       continue;
     }
+    if (linkDisconnectCrash && failure.callbackContained === true) {
+      // The node configure completed; only its link callback was contained.
+      // Do not invoke that callback again after isolation has been removed. A
+      // strict snapshot check is the only safe way to accept this path.
+      const verification = verifyNodeRestore(node, failure.info);
+      if (verification.verified) {
+        const receipt = recoveredRestoreReceipt(failure, verification);
+        restored.push(receipt.restored);
+        recovered.push(receipt.recovered);
+        continue;
+      }
+      const snapshotRecovery = recoverBySerializedState(node, failure);
+      if (snapshotRecovery) {
+        restored.push(snapshotRecovery.restored);
+        recovered.push(snapshotRecovery.recovered);
+        continue;
+      }
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: failure.error ?? "link-disconnect restore failure",
+        ...(verification.differences.length ? { widgetDifferences: verification.differences } : {}),
+        ...(verification.linkDrivenWidgetDifferences.length
+          ? { linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences }
+          : {}),
+      });
+      continue;
+    }
     let retryInfo;
     try {
       // configure may mutate its input too; keep the failure's independent
@@ -394,23 +606,30 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       retryError = err;
     }
     if (linkDisconnectCrash) {
-      // The initial crash makes the retry worth attempting, but ANY exception
-      // from that retry means configure still failed. Serialization after a
-      // throwing configure is not proof that the node was restored.
+      // The initial crash makes the retry worth attempting. If configure throws
+      // the same findInputSlot shape again, do not dead-end: apply the snapshot
+      // without the throwing connect path and verify (#2194).
       if (retryError) {
+        const snapshotRecovery = isLinkDisconnectCrash(retryError) ? recoverBySerializedState(node, failure) : null;
+        if (snapshotRecovery) {
+          restored.push(snapshotRecovery.restored);
+          recovered.push(snapshotRecovery.recovered);
+          continue;
+        }
         failed.push({ id: failure.id, type: failure.type, error: errorText(retryError) });
         continue;
       }
       const verification = verifyNodeRestore(node, failure.info);
       if (verification.verified) {
-        restored.push({ id: failure.id, type: failure.type });
-        const ownerGraphToken = failure.ownerGraphToken ?? graphIdentityToken(failure.ownerGraph);
-        recovered.push({
-          id: failure.id,
-          type: failure.type,
-          ...(ownerGraphToken != null ? { ownerGraphToken } : {}),
-          linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
-        });
+        const receipt = recoveredRestoreReceipt(failure, verification);
+        restored.push(receipt.restored);
+        recovered.push(receipt.recovered);
+        continue;
+      }
+      const snapshotRecovery = recoverBySerializedState(node, failure);
+      if (snapshotRecovery) {
+        restored.push(snapshotRecovery.restored);
+        recovered.push(snapshotRecovery.recovered);
         continue;
       }
       failed.push({

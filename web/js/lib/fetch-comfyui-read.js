@@ -14,8 +14,30 @@ const READ_OPERATIONS = new Map([
   ["system_stats", "/system_stats"],
   ["logs", "/internal/logs"],
   ["object_info", "/object_info"],
+  ["workflow_templates", "/workflow_templates"],
 ]);
 const LOGS_TRANSPORT_PATH = "/internal/logs/raw";
+// Same closed folder grammar MCP uses for `models/<folder>` (comfyui-mcp#2511).
+const MODELS_FOLDER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ALLOWED_OPERATION_NOTE =
+  "operation must be one of history, system_stats, logs, object_info, workflow_templates, models, or models/<folder>";
+
+function resolveReadOperation(operation) {
+  if (typeof operation !== "string") return null;
+  if (READ_OPERATIONS.has(operation)) {
+    return { operation, path: READ_OPERATIONS.get(operation) };
+  }
+  if (operation === "models") {
+    return { operation, path: "/models" };
+  }
+  if (operation.startsWith("models/")) {
+    const folder = operation.slice("models/".length);
+    if (MODELS_FOLDER_RE.test(folder)) {
+      return { operation, path: `/models/${folder}` };
+    }
+  }
+  return null;
+}
 
 function readTimeoutMs(operation) {
   return operation === "object_info"
@@ -72,10 +94,11 @@ export function validateFetchComfyUIReadArgs(args) {
   if (!hasOwn(args, "operation")) {
     throw invalidInput("operation is required");
   }
-  if (typeof args.operation !== "string" || !READ_OPERATIONS.has(args.operation)) {
-    throw invalidInput("operation must be one of history, system_stats, logs, object_info");
+  const resolved = resolveReadOperation(args.operation);
+  if (!resolved) {
+    throw invalidInput(ALLOWED_OPERATION_NOTE);
   }
-  return { operation: args.operation, path: READ_OPERATIONS.get(args.operation) };
+  return resolved;
 }
 
 function pageOrigin() {
@@ -96,7 +119,7 @@ function resolveSameOriginUrl(api, path, expectedOrigin = pageOrigin()) {
   const transportPath = useFileUrl ? LOGS_TRANSPORT_PATH : path;
   let rawUrl;
   try {
-    rawUrl = resolver(transportPath);
+    rawUrl = resolver.call(api, transportPath);
   } catch (error) {
     throw readError(
       "api_unavailable",

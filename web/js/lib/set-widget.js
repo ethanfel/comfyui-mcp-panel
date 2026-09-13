@@ -33,6 +33,7 @@ import {
   resolveEnclosingPromotedWrite,
   followPromotionToConcrete,
   collectPromotionIntermediates,
+  liveTextEditorHolds,
 } from "./widget-write.js";
 import { reconcileUnknownWidgetNames } from "./asset-staleness.js";
 import {
@@ -47,18 +48,23 @@ import {
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { isPromotedContainer, linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import { refreshCustomGeneratedWidgetsAfterWrite } from "./custom-generated-widgets-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
+  uploadConfigOf,
+  inventoryHasExactValue,
+  applyComboInventory,
   addComboOption,
   serverDeclaresEmptyComboOptions,
   serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
 import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
+import { widgetOccurrenceOf, widgetAtOccurrence } from "./widget-occurrence.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -169,9 +175,32 @@ function hasValueSetter(widget) {
   return false;
 }
 
-function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
+/**
+ * The widget a `(name, occurrence)` address names on the LIVE node, never throwing.
+ *
+ * #2143 — the address matters here for the same reason it matters at the write: on a node
+ * with several widgets sharing one name, `find(w => w.name === n)` answers about the FIRST
+ * row whichever row was written. For the timeout readback below that is not merely
+ * imprecise — another row's value can equal the requested one while the row the write
+ * targeted never changed, and the ack would then report "applied and verified" about a
+ * write whose outcome is genuinely unknown.
+ *
+ * `widgetAtOccurrence` is SHARED with the write's own resolution, deliberately: these two
+ * must name the same widget or the readback reports on a row the write never touched, and
+ * two local implementations of "the i-th one" is exactly how they came to disagree.
+ */
+function liveWidgetAt(node, widgetName, occurrence = null) {
+  const widgets = node?.widgets;
+  if (!Array.isArray(widgets)) return undefined;
+  if (occurrence) {
+    return widgetAtOccurrence(node, widgetName, occurrence.index, occurrence) ?? undefined;
+  }
+  return widgets.find((candidate) => candidate?.name === widgetName);
+}
+
+function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrence = null) {
   try {
-    const widget = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const widget = liveWidgetAt(node, widgetName, occurrence);
     return widget?.type === "custom" || hasValueSetter(widget);
   } catch {
     return false;
@@ -181,12 +210,25 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
+ * #2143 — `occurrence` is the pin the address resolved to: `{index, of, label, widget}`,
+ * where `index` is the widget's POSITION on the node (the number `duplicate_widgets`
+ * publishes). A row that moved reads as NOT FOUND, which downgrades the ack to the honest
+ * outcome-unknown rather than verifying against a row nobody addressed. Without it, the
+ * behaviour is the first-match read it has always been.
  */
-export function readLiveWidgetValue(node, widgetName) {
+export function readLiveWidgetValue(node, widgetName, occurrence = null) {
   try {
-    const live = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const live = liveWidgetAt(node, widgetName, occurrence);
     if (!live) return { found: false, value: undefined };
-    return { found: true, value: live.value };
+    let value;
+    try {
+      value = live.value;
+    } catch {
+      value = undefined;
+    }
+    // `widget` is returned so the caller can attribute the read to the row it came from by
+    // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
+    return { found: true, value, widget: live };
   } catch {
     return { found: false, value: undefined };
   }
@@ -223,6 +265,7 @@ export function readLiveWidgetValue(node, widgetName) {
 export async function awaitSetWidgetAck(writePromise, {
   node,
   widget,
+  occurrence = null,
   requested,
   timeoutMs,
   timers,
@@ -256,13 +299,20 @@ export async function awaitSetWidgetAck(writePromise, {
   captured.then((settled) => {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
-  const live = readLiveWidgetValue(node, widget);
+  const live = readLiveWidgetValue(node, widget, occurrence);
+  // #2233 — a live multiline editor is what query_graph reads. A lagging Vue
+  // `.value` getter must not turn an already-committed text write into a hang.
+  const editorHolds = liveTextEditorHolds(live.widget, requested);
   const verified = widgetWriteTimeoutReadback({
     requested,
-    actual: live.value,
-    found: live.found,
+    actual: editorHolds ? requested : live.value,
+    found: live.found || editorHolds,
     node_id: node?.id,
     widget,
+    // #2143 — this receipt stands in for the write's own reply, so it must carry the same
+    // row attribution. Derived from the widget that was actually READ (by identity), not
+    // from the requested ordinal, so it describes the row this readback saw.
+    widget_occurrence: live.widget ? widgetOccurrenceOf(node, live.widget) : null,
     delivered,
   });
   // Only short-circuit when the live widget already equals the request. A
@@ -399,7 +449,7 @@ const ACK_STATE = Symbol("set-widget-ack-state");
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
     const ackState = { abandoned: false };
-    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName);
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName, opts.occurrence ?? null);
     return awaitSetWidgetAck(
       runSetWidgetBody(node, widgetName, value, {
         ...opts,
@@ -409,6 +459,8 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
       {
         node,
         widget: widgetName,
+        // #2143 — the ack's own readback must consult the SAME row the write targeted.
+        occurrence: opts.occurrence ?? null,
         requested: value,
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
@@ -457,6 +509,13 @@ async function runSetWidgetBody(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
+    // #2222 — live connected-ComfyUI upload-file inventory for LoadImage/LoadVideo
+    // (and any other upload combo). `upload_image` verifies the stored filename
+    // against a fresh `/object_info/<Type>` listing; panel_set_widget used to
+    // revalidate against the page-load widget snapshot (or a burst-cached whole
+    // map that predates the upload). This hook MUST bypass that cache and return
+    // `{ values, config }` from the same inventory, or null when it cannot.
+    fetchUploadComboInventory,
     // #1223 × #1126 — WHERE the schema `getFreshObjectInfo` answered with actually came
     // from. Read as a FUNCTION, at the moment of decision, because the answer is only known
     // AFTER the oracle has run.
@@ -540,11 +599,31 @@ async function runSetWidgetBody(
     awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
     [ACK_STATE]: ackState,
     clear,
+    // #2143 — WHICH of several widgets sharing `widgetName` the caller addressed, resolved
+    // at the command boundary from the "NAME[i]" / display-label form. `widgetName` itself is
+    // always the widget's REAL name by the time it reaches here, so every name-keyed
+    // classifier, refusal and readback on this path keeps working unchanged; this ordinal is
+    // the only thing that says which row. Null for every address that is not explicitly
+    // occurrence-scoped, which is every call that existed before #2143.
+    occurrence = null,
   } = {},
 ) {
   const assertNotAbandoned = () => {
     if (ackState?.abandoned) throw widgetWriteOutcomeUnknownError();
   };
+  // #2031 recurrence: graphToPrompt wrap is too late. Vue/widget-store flush
+  // after panel_set_widget re-assigns the DynamicCombo parent, rebuilds dotted
+  // children from spec defaults, then panel_query_graph reads the default
+  // while the receipt still says applied:true. Wrap before the write so a
+  // same-value parent assign restores the live children.
+  const preserveDynamicComboChildren = () => {
+    try {
+      wrapGraphDynamicComboSetters(node?.graph ?? { _nodes: [node] });
+    } catch {
+      /* a hostile node must not block the write */
+    }
+  };
+  preserveDynamicComboChildren();
   if (clear !== undefined && clear !== true && clear !== false) {
     throw new Error("panel_set_widget clear must be a boolean");
   }
@@ -1050,7 +1129,17 @@ async function runSetWidgetBody(
             `${err.message}`,
         );
 
-  const write = (extra = {}) => {
+  // #2143 — what each write ATTEMPT landed on, keyed by the reply it produced: the widget
+  // object, its node, and the occurrence captured before the write. `retainVerifiedWrite`
+  // below awaits a frontend flush, and that flush can reorder or rebuild the node's rows
+  // AFTER applyWidgetWrite resolved the reported address — so both the retention re-read and
+  // the address in the reply have to be re-answered from the written row itself. Per attempt,
+  // because `rewrite()` re-enters this closure and a rebuild between the two can hand the
+  // retry a different row. A WeakMap rather than a reply field: the reply is JSON-serialized
+  // to the orchestrator and a widget reaches the whole graph through `node.graph`.
+  const writtenWidgets = new WeakMap();
+
+  const writeAttempt = (extra, writeOut) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
@@ -1113,6 +1202,9 @@ async function runSetWidgetBody(
     // shared write path is not on offer, and pretending otherwise is what cost a round.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
     try {
+      // After the object-info await, wrap the LIVE combo again so a Vue remount
+      // during the fetch cannot leave the parent setter unwrapped for this write.
+      preserveDynamicComboChildren();
       const set = applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
@@ -1121,8 +1213,11 @@ async function runSetWidgetBody(
         setDirty,
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
+        occurrence,
+        out: writeOut,
         ...extra,
       });
+      preserveDynamicComboChildren();
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
       // landed on, inside the SAME synchronous stretch (no await since the fence, so
       // the press cannot interleave with a workflow switch or another command frame).
@@ -1224,6 +1319,27 @@ async function runSetWidgetBody(
     }
   };
 
+  /**
+   * #2143 — REGISTER THE WRITTEN ROW AGAINST THE OBJECT THE CALLER ACTUALLY RECEIVES.
+   *
+   * `writeAttempt` does not always return applyWidgetWrite's own reply: the #1282 dynamic-input
+   * press and the #1932 generated-widget rebuild each SPREAD it into a new object to attach
+   * their disclosure. Keying the WeakMap inside, on the pre-spread reply, therefore pinned an
+   * object nobody downstream ever holds — retention looked the row up, missed, and fell back
+   * to a position that a reordering `Update inputs` callback had already invalidated, refusing
+   * an applied write. Registering out here, on whatever comes back, is immune to that: it
+   * cannot be defeated by a spread added later, because there is exactly one place the value
+   * leaves this function.
+   */
+  const write = (extra = {}) => {
+    const writeOut = {};
+    const result = writeAttempt(extra, writeOut);
+    if (result && typeof result === "object" && writeOut.valueWidget) {
+      writtenWidgets.set(result, writeOut);
+    }
+    return result;
+  };
+
   const flushFrontendWidgets =
     typeof awaitFrontendWidgetFlushInjected === "function"
       ? awaitFrontendWidgetFlushInjected
@@ -1250,8 +1366,62 @@ async function runSetWidgetBody(
     const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
     const prefer = hosts.filter((host) => host.id === set?.node_id);
     const rest = hosts.filter((host) => host.id !== set?.node_id);
+    // #2143 — WHICH row, when the name is carried by more than one. `find` by name answers
+    // about the FIRST, so a verified write to row 1 was checked against row 0's value: the
+    // retention check would see a mismatch it could not fix, retry the write, see it again,
+    // and REFUSE — reporting "nothing was applied" about a mutation that had landed twice.
+    // The occurrence comes off the write's own reply, so it names the row the write actually
+    // reached (including the bare-name case, where row 0 was chosen implicitly) rather than
+    // the ordinal the request asked for. Absent for every unique name, where `find` is exact.
+    //
+    // IDENTITY FIRST, because the index CAN be stale by the time this runs. It is resolved
+    // at the end of applyWidgetWrite, and the flush awaited just above happens after that —
+    // long enough for the node to reorder its rows again. Re-reading by position then
+    // verifies a row nothing wrote to, or, when its value differs, retries and refuses an
+    // already-applied write. Only while the row is still ATTACHED: a rebuild that detached it
+    // leaves an object whose `.value` reads a widget the canvas no longer draws.
+    const written = writtenWidgets.get(set);
+    if (written?.valueWidget) {
+      for (const host of [...prefer, ...rest]) {
+        if (Array.isArray(host.widgets) && host.widgets.includes(written.valueWidget)) {
+          try {
+            return { found: true, value: written.valueWidget.value };
+          } catch {
+            return { found: false, value: undefined };
+          }
+        }
+      }
+    }
+    // NAME AND POSITION — the fallback once the written row is gone. Two things are
+    // deliberately NOT required here, for different reasons:
+    //
+    //   * the pinned LABEL adds nothing. `set.widget_occurrence` is resolved AFTER the write
+    //     (see widget-write.js), so its label is already the post-write reading and a
+    //     comparison against the live row is a tautology. It is left out because it would
+    //     assert a check it does not perform, not because it would be harmful — that was
+    //     true while the occurrence was captured pre-write, and stopped being true when the
+    //     reported index became a live address.
+    //   * requiring IDENTITY here would refuse every rebuild that CARRIES THE VALUE FORWARD,
+    //     which is the ordinary thing a rebuild does. From this vantage "the row I wrote was
+    //     replaced by one already holding the value" and "the rebuild kept my value" are the
+    //     same observation, and the second is the common case — so refusing would report
+    //     failure for a command whose asked-for effect is on the canvas at the address the
+    //     caller gave.
+    //
+    // What this check answers is #1922's question — is the value in effect on the row the
+    // node now draws there — not a question about causation. The retry is not left
+    // unguarded: `rewrite()` goes back through applyWidgetWrite, whose pin refuses a row
+    // that MOVED, and refuses outright when a rebuild left rows nothing can tell apart.
+    //
+    // And the one thing this cannot establish is not swallowed: when the verdict came from a
+    // row that is NOT the one that was written, `withLiveOccurrence` has already found the
+    // written row detached, so the reply carries `widget_occurrence.stale`. The caller is
+    // told the index no longer names the row they addressed — as data, not prose.
+    const occurrence = set?.widget_occurrence;
     for (const host of [...prefer, ...rest]) {
-      const live = host.widgets?.find((candidate) => candidate?.name === set?.widget);
+      const live = occurrence
+        ? widgetAtOccurrence(host, set?.widget, occurrence.index)
+        : host.widgets?.find((candidate) => candidate?.name === set?.widget);
       if (live) return { found: true, value: live.value };
     }
     return { found: false, value: undefined };
@@ -1269,17 +1439,58 @@ async function runSetWidgetBody(
    * write once more (the init has now run, which is why the reporter's second
    * call stuck); if it still does not hold, refuse.
    */
+  /**
+   * #2143 — RE-RESOLVE THE REPORTED ADDRESS AFTER THE FLUSH.
+   *
+   * `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]".
+   * applyWidgetWrite resolves it as the last thing it does, but the flush below happens
+   * after that and the node can reorder or rebuild its rows in that window — so the number
+   * that reaches the caller has to be answered again, from the written row, at the moment
+   * the reply is formed. Same rule applyWidgetWrite uses: a live position when the row
+   * still has one, otherwise the pre-write capture flagged `stale` so the caller knows
+   * which row was written without being handed a number to reuse.
+   *
+   * Applied on retainVerifiedWrite's OWN returns rather than at each ack site. There are
+   * two of those — the ordinary success and the stale/unreadable-combo recovery — and the
+   * recovery one was missed when this lived at the call site, which is the whole argument
+   * for putting it where the flush is instead of where the reply is.
+   */
+  const withLiveOccurrence = (set) => {
+    const written = writtenWidgets.get(set);
+    if (!written?.valueWidget || !set || typeof set !== "object") return set;
+    const live = widgetOccurrenceOf(written.valueNode, written.valueWidget, set.widget);
+    const next =
+      live ?? (written.preWriteOccurrence ? { ...written.preWriteOccurrence, stale: true } : null);
+    if (next === null) {
+      if (!("widget_occurrence" in set)) return set;
+      const { widget_occurrence: _dropped, ...rest } = set;
+      return rest;
+    }
+    return { ...set, widget_occurrence: next };
+  };
+
+  function liveTextEditorRetainsWrite(set) {
+    if (typeof value !== "string") return false;
+    const written = writtenWidgets.get(set);
+    return !!(written?.valueWidget && liveTextEditorHolds(written.valueWidget, value));
+  }
+
   async function retainVerifiedWrite(set, rewrite) {
+    // #2233 — a live textarea that already holds the committed string is the
+    // receipt. Waiting on rAF after that is how a backgrounded tab lost the
+    // graph_set_widget ack while query_graph already showed the write. A
+    // just-added primitive with no editor still takes the #1922 flush.
+    if (liveTextEditorRetainsWrite(set)) return withLiveOccurrence(set);
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(set)) return set;
+    if (widgetStillHolds(set)) return withLiveOccurrence(set);
     assertNotAbandoned();
     const retried = rewrite();
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(retried)) return retried;
+    if (widgetStillHolds(retried)) return withLiveOccurrence(retried);
     const live = readLiveWritten(retried);
     throw new WidgetWriteError(
       `Widget "${retried?.widget}" on node ${retried?.node_id} (${node?.type}) did not retain the ` +
@@ -1289,6 +1500,17 @@ async function runSetWidgetBody(
     );
   }
 
+  /**
+   * #2143 — RE-RESOLVE THE REPORTED ADDRESS AFTER THE FLUSH.
+   *
+   * `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]".
+   * applyWidgetWrite resolves it as the last thing it does, but `retainVerifiedWrite` then
+   * awaits a frontend flush, and the node can reorder or rebuild its rows in that window —
+   * so the number that reaches the caller has to be answered again, from the written row,
+   * at the moment the reply is actually formed. Same rule applyWidgetWrite uses: a live
+   * position when the row still has one, otherwise the pre-write capture flagged `stale`
+   * so the caller knows which row was written without being handed a number to reuse.
+   */
   async function succeedWrite(extra = {}, extraResult = {}) {
     const set = await retainVerifiedWrite(write(extra), () => write(extra));
     return withWarning(honestWidgetAck({ set, ...extraResult }));
@@ -1440,9 +1662,7 @@ async function runSetWidgetBody(
     // of THIS input's upload kind (e.g. an image extension for an image_upload combo),
     // never a stray `.txt` the LoadImage combo would never list.
     if (!uploadInputAccepts(cfg, value)) return false;
-    const uploadWidget = (resolvedTargetNode?.widgets ?? []).find(
-      (w) => w?.name === (writeTargetWidgetName ?? widgetName),
-    );
+    const uploadWidget = findUploadWidget();
     if (!uploadWidget) return false;
     let exists = false;
     try {
@@ -1455,6 +1675,47 @@ async function runSetWidgetBody(
     // not add an option to the captured widget after that switch (#718).
     assertTargetStillCurrentNow();
     return addComboOption(uploadWidget, value);
+  };
+
+  const uploadWidgetName = () => writeTargetWidgetName ?? widgetName;
+  const uploadDefInputName = () => concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+  const findUploadWidget = () =>
+    (resolvedTargetNode?.widgets ?? []).find((w) => w?.name === uploadWidgetName());
+
+  // #2222: a TOP-LEVEL upload the live connected inventory already lists, but the
+  // widget (and the burst-cached whole /object_info used by refreshCombos) does not.
+  // `upload_image` verifies against that inventory; rejecting here without asking it
+  // is the split-brain the issue reports. Exact filename match only.
+  const tryLiveUploadInventory = async () => {
+    if (typeof fetchUploadComboInventory !== "function") return false;
+    const type = authTarget?.type;
+    const defName = uploadDefInputName();
+    if (!type || !defName) return false;
+    // A readable NON-upload spec (ckpt_name, sampler_name, …) must not spend a
+    // live inventory fetch. Snapshot-only maps have no input spec, so they fall
+    // through and ask — LoadImage after upload_image is that case.
+    const knownSpec =
+      (freshDefs?.[type]?.input?.required && freshDefs[type].input.required[defName]) ??
+      (freshDefs?.[type]?.input?.optional && freshDefs[type].input.optional[defName]);
+    if (Array.isArray(knownSpec) && !uploadConfigOf(knownSpec[1])) return false;
+    let inventory = null;
+    try {
+      inventory = await fetchUploadComboInventory({
+        type,
+        widgetName: defName,
+        value,
+      });
+    } catch {
+      return false;
+    }
+    const values = inventory?.values;
+    const cfg = uploadConfigOf(inventory?.config) ?? uploadInputConfig(freshDefs ?? undefined, type, defName);
+    if (!cfg || !uploadInputAccepts(cfg, value)) return false;
+    if (!inventoryHasExactValue(values, value)) return false;
+    const uploadWidget = findUploadWidget();
+    if (!uploadWidget) return false;
+    assertTargetStillCurrentNow();
+    return applyComboInventory(uploadWidget, values);
   };
 
   try {
@@ -1530,6 +1791,22 @@ async function runSetWidgetBody(
         // Still a combo miss after the refresh — keep the freshest reason and try the
         // upload-asset fallback below.
         latest = retryErr;
+      }
+    }
+
+    // #2222: live input-file inventory from the connected ComfyUI (same listing
+    // upload_image consults). Applied BEFORE the /view existence probe so a
+    // top-level filename the server already enumerates is not rejected against
+    // a stale 462-item widget snapshot.
+    if (await tryLiveUploadInventory()) {
+      try {
+        return await succeedWrite({}, { refreshed: true });
+      } catch (invErr) {
+        if (!(invErr instanceof WidgetWriteError)) throw invErr;
+        if (!invErr.combo) {
+          throw refusalFrame(invErr, " after refreshing the upload-file inventory");
+        }
+        latest = invErr;
       }
     }
 

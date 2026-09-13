@@ -34,6 +34,13 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 import { withTimeout } from "./bounded-step.js";
 import { scrubSecretShapedText } from "./http-failure.js";
 import { installQueuePromptScopeAdapter } from "./queue-prompt-scope-adapter.js";
+// #2203 — a thrown /prompt fetch can still have been accepted. Stamp a client
+// dispatch id onto extra_data and reconcile it against /queue + /history.
+import {
+  mintDispatchId,
+  recoverPromptIdAfterDispatch,
+  stampPromptDispatchOptions,
+} from "./prompt-dispatch-correlation.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -676,15 +683,186 @@ function ideogramQueueTimeDerivedInput(node) {
   }
 }
 
+/**
+ * comfyui-mcp#2712 — DaSiWa_SeedControl rolls its seed by patching
+ * `app.graphToPrompt` ITSELF, so it is invisible to every signal above and it
+ * defeats retrying by construction.
+ *
+ * MEASURED, not guessed, against the pack's own source
+ * (darksidewalker/ComfyUI-DaSiWa-Nodes@main:js/dasiwa_seed_control.js):
+ *
+ *   app.graphToPrompt = async function (...args) {
+ *     dasiwaSeedControlPrepareAll();          // rolls every random-mode node
+ *     return originalGraphToPrompt(...args);
+ *   };
+ *
+ * and the roll writes exactly two serialized inputs:
+ *
+ *   node.__dasiwaSeedPrepareSeed = () => {
+ *     if (dasiwaSeedControlHasExternalSeed() || controlState?.mode !== "random") return;
+ *     ... widget.value = value;               // seed_value
+ *     ... dasiwaSeedControlEmit();            // seed_control_state {mode,last_seed,recent}
+ *   };
+ *
+ * WHY RETRYING CANNOT WIN, and why this must be an exclusion. `fingerprintOnce`
+ * builds the stamp by calling `app.graphToPrompt()` — the very function the pack
+ * wraps. So OUR OWN STAMP rolls a seed, and the dispatch's serialization rolls a
+ * different one. The two hashes disagree on an idle canvas, deterministically,
+ * forever. That is why the orchestrator's #2120 re-issues (dispatches 1-3) all
+ * lost: a retry budget cannot converge against a roller that fires once per
+ * serialization. Only removing the pair from the compared content can.
+ *
+ * NARROW BY CONSTRUCTION, mirroring the pack's own gates one for one:
+ *  - exact registered class on `comfyClass`, and ONLY `comfyClass` (codex gate r1,
+ *    P1). The pack's dispatcher is
+ *    `if (DASIWASEED_NODE_TYPES.has(node.comfyClass)) node.__dasiwaSeedPrepareSeed?.()`,
+ *    so a node carrying the registered `type` while its `comfyClass` is missing or
+ *    different is NOT rolled by the pack. Falling back to `type` would drop both
+ *    seed inputs from the hash for a node that never mutates, silently retiring
+ *    drift coverage on it — the one direction this signal must never fail;
+ *  - the pack's own roll function present on this node (see below), which is what
+ *    proves `dasiwaSeedControlInstall` ran to completion with both backing widgets;
+ *  - the state widget present, because its value IS the mode we read;
+ *  - a LINKED `seed` input rolls nothing (`dasiwaSeedControlHasExternalSeed`),
+ *    so an externally-driven node keeps full drift coverage;
+ *  - `mode === "fixed"` rolls nothing, exactly like the `value === "fixed"` gate
+ *    the stock control_after_generate carrier already uses.
+ *
+ * `mode` IS READ THE WAY THE PACK READS IT, and that asymmetry is the point:
+ * `dasiwaSeedControlParseState` normalises with
+ * `state.mode = state.mode === "fixed" ? "fixed" : "random"`, so ONLY the literal
+ * string "fixed" suppresses the roll. An absent, empty, or unparseable state
+ * widget is RANDOM and does roll — a freshly-dropped node is the common case.
+ * Testing for `mode === "random"` instead would have left exactly those nodes
+ * refused, which is the bug.
+ *
+ * DELIBERATELY NO MUTE/BYPASS GATE, unlike the rgthree signal.
+ * `dasiwaSeedControlPrepareAll` iterates every node in the graph tree and
+ * `__dasiwaSeedPrepareSeed` checks neither `mode` nor bypass, so a muted node
+ * still rolls. (Its inputs also drop out of both serializations, so the pair is
+ * moot there either way — but keying on bypass would be a false claim about
+ * someone else's code.)
+ *
+ * BOTH NAMES OR NEITHER. The roll rewrites `seed_value` and the `last_seed` /
+ * `recent[]` fields inside `seed_control_state` together, so excluding one alone
+ * would still refuse the run. Conversely a fixed-mode node excludes NEITHER, so a
+ * real mid-window mode flip is still drift — the same judgment the orchestrator's
+ * #2120 classifier makes when it refuses `seed_control_state` on its own.
+ *
+ * KNOWN RESIDUAL, stated rather than hidden (codex r2, P1). The pack decides with a
+ * CLOSURE (`controlState`), and we can only read the widget it persists that closure
+ * into. The two agree on every path the pack itself drives — it writes the widget on
+ * every state change and re-reads it on graph load — but a write that bypasses the
+ * pack (a direct `seed_control_state` set that never re-runs its install) can desync
+ * them until the next load. Both directions are bounded and neither is silent-wrong
+ * output: widget=fixed / closure=random restores exactly the refusal this fixes (safe,
+ * visible, re-reportable); widget=random / closure=fixed costs drift coverage on these
+ * two inputs of this one node class and nothing else. The closure is not reachable from
+ * here, so the widget is the only observable signal; narrowing further is not possible
+ * without the pack exposing its state.
+ *
+ * Defensive like its neighbours: an unreadable node yields no names, which fails
+ * TOWARD detecting drift.
+ */
+const DASIWA_QUEUE_ROLLING_SEED_TYPES = new Set(["DaSiWa_SeedControl"]);
+const DASIWA_SEED_VALUE_INPUT = "seed_value";
+const DASIWA_SEED_STATE_INPUT = "seed_control_state";
+
+function dasiwaQueueTimeSeedInputs(node) {
+  try {
+    if (!DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.comfyClass)) return [];
+    const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+    const stateWidget = widgets.find((w) => w?.name === DASIWA_SEED_STATE_INPUT);
+    // The STATE widget only, and only because its value is the mode we must read
+    // (codex r3, P1). The pack checks BOTH widgets when it INSTALLS; re-checking
+    // them here would be a second, stricter gate the pack does not apply at roll
+    // time, so a seed_value widget removed after a successful install would stop
+    // our exclusion while the pack kept rolling — reinstating the refusal. The
+    // install check is already covered, exactly once, by the roll function below.
+    // Belt-and-braces with the catch below, which would turn the resulting
+    // TypeError into the same empty result — so a mutation deleting this line
+    // survives the suite. Kept explicit anyway: reaching the fail-safe by way of
+    // a thrown property access would make the outcome depend on the breadth of
+    // that catch, and the next person to narrow it would silently change this.
+    if (!stateWidget) return [];
+    // codex r2, P1 — the ROLL ITSELF, not a proxy for it. `dasiwaSeedControlInstall`
+    // sets `__dasiwaSeedInstalled = true` BEFORE it checks for the two widgets and
+    // returns, and that flag then makes every later install a no-op. So a node that
+    // was installed while a widget was still missing never gets `__dasiwaSeedPrepareSeed`
+    // — even if both widgets appear afterwards. Inferring the roll from the widgets
+    // alone would exclude two inputs on a node the pack will never touch, which
+    // silently retires drift coverage on it. Requiring the function is the same
+    // shape as the Ideogram signal requiring a live `serializeValue`, and it fails
+    // in the SAFE direction: if the pack ever renames this internal we stop
+    // excluding, the original refusal comes back, and it gets reported.
+    if (typeof node?.__dasiwaSeedPrepareSeed !== "function") return [];
+    // `node.inputs?.find(i => i.name === "seed")?.link != null` — external seed.
+    const seedInput = (Array.isArray(node?.inputs) ? node.inputs : []).find(
+      (i) => i?.name === "seed",
+    );
+    if (seedInput?.link != null) return [];
+    if (dasiwaSeedControlModeIsFixed(stateWidget.value)) return [];
+    return [DASIWA_SEED_VALUE_INPUT, DASIWA_SEED_STATE_INPUT];
+  } catch {
+    return [];
+  }
+}
+
+/** True ONLY for the literal "fixed", matching dasiwaSeedControlParseState. */
+function dasiwaSeedControlModeIsFixed(raw) {
+  let parsed = null;
+  if (typeof raw === "string") {
+    if (!raw.trim()) return false; // empty state → the pack defaults to random
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return false; // unparseable → the pack defaults to random
+    }
+  } else if (raw && typeof raw === "object") {
+    parsed = raw;
+  }
+  // SPREAD, not a direct read (codex r3, P2). The pack computes its state with
+  // `{ mode: "random", ... , ...parsed }`, and a spread copies only ENUMERABLE OWN
+  // properties — so a non-enumerable or inherited `mode` is dropped there and the
+  // node stays random. Reading `parsed.mode` would see that key, call the node
+  // fixed, and reinstate the refusal on a node that does roll.
+  const spread = parsed && typeof parsed === "object" ? { ...parsed } : {};
+  return spread.mode === "fixed";
+}
+
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
-  const seen = new Set();
   const addPair = (execId, name) => {
     if (name != null) pairs.add(`${execId} ${String(name)}`);
   };
+  // comfyui-mcp#2699 — the ANCESTOR PATH, not a visited set. See the walk.
+  const onPath = new Set();
   const walk = (graph, prefix) => {
-    if (!graph || seen.has(graph)) return;
-    seen.add(graph);
+    // comfyui-mcp#2699 — the walk MUST NOT dedup by graph object. ComfyUI's
+    // subgraph INSTANCES share one definition object, and every pair emitted
+    // here is prefixed with the INSTANCE's execId — so a `seen.has(graph)`
+    // guard walked a twice-instantiated definition once, under the FIRST
+    // instance's prefix, and left every other instance with NO exclusions.
+    // Measured on a MiniMax H3 graph whose second-pass subgraph is a second
+    // instance of the first pass's definition: the #1331 leftover link-driven
+    // `model` widget was excluded at `100:29` and hashed at `135:29`, so every
+    // scoped run was refused as "the graph CHANGED" naming exactly
+    // `135:29 model` — deterministically, on an idle canvas, retry included.
+    // use-everywhere-links.js states this same constraint for its own walk.
+    //
+    // Termination is therefore a CYCLE guard on the current ancestor path, not
+    // a fixed depth cap (codex gate r1, P1): ComfyUI documents subgraph nesting
+    // far deeper than any cap worth writing, and a cap that trips would silently
+    // drop exclusions in the deepest subgraph — reintroducing exactly the
+    // permanent "graph CHANGED" refusal this fix removes, one level further
+    // down. A definition cannot legally contain itself, so a definition already
+    // on its OWN path is malformed and stops there; every other nesting shape
+    // is a finite DAG whose expansion is the flattened prompt. The walk visits
+    // one entry per flattened prompt node — the same size canonicalizePrompt
+    // already iterates — so per-instance re-walking costs nothing this path was
+    // not already paying.
+    if (!graph || onPath.has(graph)) return;
+    onPath.add(graph);
     for (const node of graph._nodes ?? []) {
       if (!node || node.id == null) continue;
       const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
@@ -771,8 +949,19 @@ export function collectVolatileInputs(rootGraph) {
       // backed input drift-covered.
       const ideogramDerivedInput = ideogramQueueTimeDerivedInput(node);
       if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
+      // comfyui-mcp#2712 — THE SEVENTH VOLATILITY SIGNAL. DaSiWa_SeedControl
+      // wraps `app.graphToPrompt` and rolls a random-mode seed on EVERY call,
+      // so it rolls once for our stamp and again for the dispatch. Unlike every
+      // race above, no retry budget can converge on it. Exactly two inputs, on a
+      // node that self-identifies and is armed in random mode with no external
+      // seed; a fixed-mode or externally-driven node keeps full drift coverage.
+      for (const name of dasiwaQueueTimeSeedInputs(node)) addPair(execId, name);
       if (node.subgraph) walk(node.subgraph, execId);
     }
+    // Leave the path so a SIBLING instance of this same definition is still
+    // walked — dropping this line turns the cycle guard back into the
+    // once-per-definition dedup that caused comfyui-mcp#2699.
+    onPath.delete(graph);
   };
   walk(rootGraph, "");
   // #1273 — THE THIRD VOLATILITY SIGNAL. cg-use-everywhere's queuePrompt patch
@@ -1385,6 +1574,24 @@ export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
 }
 
 /**
+ * #2203 — the dispatch-failure sibling that DID reconcile: queue/history had
+ * no row for this request's dispatch id, so a retry will not double-render.
+ */
+export function scopeDispatchAbsentError({ toNodeId, detail, verified, batch }) {
+  return (
+    `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
+    `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
+    `confirmed queued before the failure. This one was NOT found in the ComfyUI ` +
+    `queue or history in the reads that followed. That is the strongest evidence ` +
+    `available without a server-side receipt, but it is a BOUNDED observation: a ` +
+    `request ComfyUI is still processing could appear after those reads, so a ` +
+    `retry can still duplicate it. Check the queue first if the render is ` +
+    `expensive. What IS certain: the request carried the run-to-node scope, ` +
+    `so no full-graph dispatch occurred (#2203).`
+  );
+}
+
+/**
  * #1504 — node_errors on an ACCEPTED (200) reply are dropped outputs, not a refusal.
  *
  * ComfyUI's `validate_prompt` validates each output independently and keeps the ones
@@ -1505,6 +1712,11 @@ export function createRunFetchInterceptor({
   onRejection = null,
   onPromptId = null,
   onAcceptedNodeErrors = null,
+  // #2203 -- the post-dispatch recovery poll sleeps between attempts. Injectable
+  // so a unit test can drive it with no real timer: a pending 40ms timer that
+  // outlives the runner is reported as "Promise resolution is still pending but
+  // the event loop has already resolved", which cancels the whole file.
+  recoverDelayMs = undefined,
 } = {}) {
   const state = { posted: 0, inFlight: 0, missingPromptIds: 0 };
   const interceptor = async function runFetchInterceptor(route, options) {
@@ -1519,25 +1731,73 @@ export function createRunFetchInterceptor({
     } catch {
       isPost = false;
     }
+    let dispatchId = null;
+    let forwardOptions = options;
     if (isPost) {
       state.posted++;
       state.inFlight++;
+      dispatchId = mintDispatchId();
+      try {
+        forwardOptions = stampPromptDispatchOptions(options, dispatchId);
+      } catch {
+        forwardOptions = options;
+      }
     }
+    const recoverLostReceipt = async () => {
+      if (!dispatchId) return false;
+      const recovered = await recoverPromptIdAfterDispatch({
+        fetchApi: origFetchApi,
+        dispatchId,
+        ...(recoverDelayMs === undefined ? {} : { delayMs: recoverDelayMs }),
+      });
+      if (recovered.status !== "recovered") return false;
+      try {
+        onPromptId?.(recovered.promptId);
+      } catch {
+        /* capture must not hide the original fetch outcome */
+      }
+      return true;
+    };
     try {
-      const res = await origFetchApi(route, options);
+      const res = await origFetchApi(route, forwardOptions);
       if (isPost) {
         if (res) {
+          let captured = false;
+          let rejected = false;
+          let missingReceipt = false;
           await captureRunResponse(res, {
-            onRejection,
-            onPromptId,
+            onRejection: (r) => {
+              rejected = true;
+              onRejection?.(r);
+            },
+            onPromptId: (p) => {
+              captured = true;
+              onPromptId?.(p);
+            },
             onAcceptedNodeErrors,
-            onMissingPromptId: () => state.missingPromptIds++,
+            // Do NOT bank the increment here: recovery has not run yet. A receipt
+            // that is missing from the RESPONSE but recovered from the queue is an
+            // acceptance, and leaving the count raised reported it as
+            // `queued_unknown` instead. The unscoped branch below already ordered
+            // this correctly; this one did not.
+            onMissingPromptId: () => {
+              missingReceipt = true;
+            },
           });
+          if (!captured && !rejected) {
+            const recovered = await recoverLostReceipt();
+            if (recovered) missingReceipt = false;
+          }
+          if (missingReceipt) state.missingPromptIds++;
         } else {
-          state.missingPromptIds++;
+          const recovered = await recoverLostReceipt();
+          if (!recovered) state.missingPromptIds++;
         }
       }
       return res;
+    } catch (err) {
+      if (isPost) await recoverLostReceipt();
+      throw err;
     } finally {
       if (isPost) state.inFlight--;
     }
@@ -1590,6 +1850,7 @@ export function createScopedRunGuard({
   onPromptId = null,
   onAcceptedNodeErrors = null,
   onScopeDropped = null,
+  recoverDelayMs = undefined,
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
@@ -1720,6 +1981,28 @@ export function createScopedRunGuard({
       // overrun. The reservation is taken here, synchronously, before the await,
       // so a second concurrent post sees the slot already taken.
       state.inFlight++;
+      const dispatchId = mintDispatchId();
+      try {
+        forwardOptions = stampPromptDispatchOptions(forwardOptions, dispatchId);
+      } catch {
+        /* unstamped: recovery then falls back to this run's unique queue mark */
+      }
+      const recoverLostReceipt = async () =>
+        recoverPromptIdAfterDispatch({
+          fetchApi: origFetchApi,
+          dispatchId,
+          queueMark,
+          ...(recoverDelayMs === undefined ? {} : { delayMs: recoverDelayMs }),
+        });
+      const applyRecovered = (recovered) => {
+        if (recovered?.status !== "recovered") return false;
+        try {
+          onPromptId?.(recovered.promptId);
+        } catch {
+          /* capture must not hide the original fetch outcome */
+        }
+        return true;
+      };
       let res;
       try {
         res = await origFetchApi(route, forwardOptions);
@@ -1735,17 +2018,37 @@ export function createScopedRunGuard({
           // Record BEFORE the post, so a retry that throws is still disclosed as having
           // been attempted rather than vanishing into the dispatch-failure message.
           state.prunedRetry = { namedNode: retry.namedNode, removed: retry.removed };
-          res = await origFetchApi(route, { ...forwardOptions, body: retry.text });
+          const retryOptions = stampPromptDispatchOptions(
+            { ...forwardOptions, body: retry.text },
+            dispatchId,
+          );
+          res = await origFetchApi(route, retryOptions);
         }
       } catch (err) {
-        // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
-        // after ComfyUI already received and queued the prompt — a reset while
-        // reading the response looks identical to one before the request left.
-        // Treating the throw as proof of non-arrival is this cluster's defect
-        // class exactly, and acting on it re-dispatches a branch that may
-        // already be rendering. So the slot stays CONSUMED and the outcome is
-        // recorded as unknown, which is what it is.
+        // INDETERMINATE, not "never arrived" (codex gate r6) — unless #2203
+        // reconciles the stamped dispatch id against queue/history. A unique
+        // match is an acceptance receipt; a well-formed miss is safe to retry;
+        // anything else stays unknown, because a throw after ComfyUI queued is
+        // indistinguishable from one before the request left.
+        const recovered = await recoverLostReceipt();
         state.inFlight--;
+        if (applyRecovered(recovered)) {
+          state.observed++;
+          notify();
+          throw err;
+        }
+        if (recovered.status === "absent") {
+          if (state.failed == null) {
+            state.failed = scopeDispatchAbsentError({
+              toNodeId,
+              detail: `the /prompt request itself threw (${String(err?.message ?? err)})`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
+          notify();
+          throw err;
+        }
         state.indeterminate++;
         if (state.failed == null) {
           state.failed = scopeDispatchError({
@@ -1767,21 +2070,36 @@ export function createScopedRunGuard({
       // definite outcome. A malformed response keeps the slot consumed on
       // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
       // on that uncertainty is how a branch gets rendered twice. "Could not
-      // determine whether it queued" is not "determined it did not".
+      // determine whether it queued" is not "determined it did not" — unless
+      // queue/history then produces a unique dispatch-id match (#2203).
       state.inFlight--;
       if (verdict === "accepted") {
         state.observed++;
       } else if (verdict === "rejected") {
         state.rejected++;
       } else {
-        state.indeterminate++;
-        if (state.failed == null) {
-          state.failed = scopeDispatchError({
-            toNodeId,
-            detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
-            verified: state.observed,
-            batch: maxBatch,
-          });
+        const recovered = await recoverLostReceipt();
+        if (applyRecovered(recovered)) {
+          state.observed++;
+        } else if (recovered.status === "absent") {
+          if (state.failed == null) {
+            state.failed = scopeDispatchAbsentError({
+              toNodeId,
+              detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
+        } else {
+          state.indeterminate++;
+          if (state.failed == null) {
+            state.failed = scopeDispatchError({
+              toNodeId,
+              detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
         }
       }
       notify();

@@ -6,10 +6,252 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.182] - 2026-09-07
+
 ### Fixed
+
+- interactive ask/question cards now retain their URL+epoch correlation across a same-session reconnect, replay the pending answer only to that proven session, and withdraw mismatched cards without painting duplicates (#2218)
+
+## [0.15.181] - 2026-09-07
+
+### Fixed
+- the link-id repair now reads the LEGACY link store too, so it applies on older LiteGraph builds (#2108). highestLinkId read only `_links`, the modern private Map; older builds expose the plain record as `links`, which the rest of the panel already handles (disconnect-verify, connect-verify). On those builds the helper returned null, so `adjusted` was false and the stale counter was never raised — the overwrite this fix exists to prevent survived it, silently, because "no links" and "no store" gave the same answer. Adds execution tests that mint an id after the repair and assert it is free, rather than only reading the bundle for call sites. Found by the Copilot review on the PR
+- panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
+- panel_paste_nodes raises the counter too — it was the one allocating path still
+- the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
+- the VARIATION SELECTOR removal now covers every shipped web/js file rather than the main bundle alone. This drops U+FE0F only, which affects text-default glyphs such as the U+26A0 warning sign; it does NOT remove the panel emoji-font dependency, since 44 emoji-presentation-default characters remain in web/js and 16 more in each of the 12 shipped locale catalogues (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
+- the CivitAI sign-in timeout no longer recommends a setting that cannot sign the browser in (#2044). It pointed at the CivitAI API token setting; `py/civitai_proxy.py` authenticates the browser solely from its OAuth token file and never reads CIVITAI_API_TOKEN — the name occurs there only inside a docstring — so the advice named a remedy for a different subsystem. The message now names --enable-cors-header, whose absence installs the origin-only middleware that produces the 403, and says the token setting will not help. It also no longer rides the 3.5s toast default: it is the only explanation the user gets after a four-minute wait
+- CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
+- the sign-in timeout notice names the token setting by REFERENCE, not by copying its
+- the unknown-staleness hint no longer recommends a save that can destroy the change it warns about (#2139). Both arms said "save first"; classifyInPlaceOverwrite returns "skip" for a tab already isPersisted, so an ordinary save of a persisted tab overwrites in place WITHOUT reading disk — and this branch exists precisely because the on-disk contents could not be established, so the advice could clobber an external edit. Both arms now point at a NEW path, which keeps both versions. The arm test also pinned only the presence of both strings, so a negated condition would have swapped dirty and clean advice undetected; it now pins the mapping. Found by the Copilot review on the PR
+- panel_run keeps keyed completion output buffered when lifecycle-start, prompt-receipt, or subsequent prompt-start frames are delayed, including output that arrives after the bounded queue dispatch returns, so timer, queue-idle, sequential-start, and terminal-before-receipt paths cannot emit an unkeyed fallback before the keyed replay; legacy unkeyed orphan salvage remains unchanged (#365)
+
+- a stale socket flag refused every panel_run while everything else worked (#2248)
+
+
+## [0.15.180] - 2026-09-07
+
+### Fixed
+- Dynamic widget recovery now preserves same-value relocation cleanup and re-resolves shallow-to-deep live widgets during queue restore; panel_run seals DynamicCombo setters before restore and resolves detached children to their live replacements (#2033/#2140)
+- panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2273)
+
+## [0.15.179] - 2026-09-05
+
+### Fixed
+- panel_set_widget combo refusals list the live options for generic enums (device/precision) instead of applying the private filename/path redaction to every combo (#2265, #2271)
+
+## [0.15.178] - 2026-09-05
+
+### Fixed
+- fetch_image no longer sends `/view` through ComfyUI `api.fetchApi`, which prefixes `/api` so local media became `/api/view` and failed with `Failed to fetch` after headless ECONNREFUSED. `/view` uses origin-validated `fileURL` + same-origin fetch (and `Comfy-User` when the API object has a user). History / system_stats keep `fetchApi` so cloud auth headers and 401 remint stay intact (comfyui-mcp#2884, #2261)
+
+
+## [0.15.177] - 2026-09-05
+
+### Fixed
+- panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
+- Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- panel_run no longer refuses forever on a STALE socket flag (#2854). ComfyUI arms comfyBackendSocketDown from a failed _pollQueue during a long GPU-bound render, and `reconnected` never fires because the websocket never left OPEN -- so the flag never cleared. Every other panel_* path asks comfyBackendIsDown(), whose #1325 rule is that flagged-down over an OPEN socket is stale rather than down; the run-dispatch identity read the raw flag instead, so it alone reported "backend socket down" and refused every dispatch while reads, edits and the ComfyUI queue all worked. Fail-closed directions are unchanged: the flag with a non-OPEN or unreadable readyState still refuses
+
+## [0.15.176] - 2026-09-05
+
+### Fixed
+
+- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215, #2255)
+
+
+## [0.15.175] - 2026-09-05
+
+### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252, #2253)
+
+
+## [0.15.174] - 2026-09-04
+
+### Fixed
+
+- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #2250, #1215)
+
+
+## [0.15.173] - 2026-09-04
+
+### Fixed
+- panel_get_errors no longer reports a clean graph when missing models are still named on a promoted native-subgraph host rail: the load-time store blames the inner locator, and the inner widget may hold an on-disk fallback while the host still names the absent file. The live combo scan now also walks nested subgraphs from the bound root, so inner loaders are judged even when the user is looking at the root canvas (#984, #2245)
+
+
+## [0.15.172] - 2026-09-04
+
+### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181, #2243)
+
+
+## [0.15.171] - 2026-09-04
+
+### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203, #2215)
+- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203, #2215)
+- Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201, #2214)
+- the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201, #2214)
+
+
+## [0.15.170] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215, #2238)
+
+
+## [0.15.169] - 2026-09-04
+
+### Fixed
+- graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
+- Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
+
+## [0.15.168] - 2026-09-04
+
+### Fixed
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057, #2231)
+
+
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
+## [0.15.166] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow reopens a modified subgraph, promoted width/height/seed host rails rebind onto the unique inner input-rail slots and graph_get_subgraph publishes a complete promoted-terminal witness, so panel_set_widget can write those widgets instead of refusing an unresolved mapping. panel_refresh_nodes runs the same rebind. A stale properties.proxyWidgets pair from the file is not a veto once the live parent rail is authenticated (#2225, #2226)
+
+
+## [0.15.165] - 2026-09-04
+
+### Fixed
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222, #2223)
+
+
+## [0.15.164] - 2026-09-03
+
+### Fixed
+- The agent TODO tray can be collapsed from its Plan header (and re-expanded) so a forgotten panel_set_todo no longer pins up to 9rem of the chat column; empty panel_set_todo still clears it (#2165, #2219)
+
+
+## [0.15.163] - 2026-09-03
+
+### Fixed
+- A custom video save node no longer looks like a preview-only run: a `{filename, subfolder, type:"output"}` MP4 under an unrecognised key (NKDVideoViewer's `nkd_video`) is collected as saved output, so panel_run completion names the file instead of saying "no saved output node ran … Add a SaveImage node" while describing the preview taps. CompareFrames temp dumps and a genuinely preview-only run are unchanged (#2128)
+- graph_get_subgraph no longer caps its inner node list at MAX_STATE_NODES, so a large subgraph's ownership envelope stays `truncated:false` with `node_count === nodes.length` and panel_set_widget can dispatch a promoted write instead of treating the listing cap as an incomplete witness (#2057)
+
+
+## [0.15.162] - 2026-09-03
+
+### Fixed
+- After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
+- panel_show_media splits a combined `video/<file>` output filename into `/view`'s `subfolder` + basename so a valid history reference no longer 404s (#2193)
+
+
+## [0.15.161] - 2026-09-03
+
+### Fixed
+- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194, #2206)
+
+## [0.15.160] - 2026-09-03
+
+### Fixed
+- fetch_comfyui_read now admits the closed `models` and `models/<folder>` inventory operations so list_local_models can relay a reachable remote ComfyUI through the live panel instead of dying on the diagnostics-only allowlist (comfyui-mcp#2511)
+
+- admit models inventory through fetch_comfyui_read (#2198)
+- panel_get_errors stops reporting validation errors the live graph disagrees with (#2195)
+
+
+## [0.15.159] - 2026-09-02
+
+### Fixed
+- rehydrate loaded node defs before run (#2188)
+
+
+## [0.15.158] - 2026-09-02
+
+### Fixed
+- panel_create_subgraph and panel_subgraph_group now preflight the full transitive upstream chain for detached nodes and refuse before ComfyUI's conversion can throw or partially mutate the live graph; graph-ownership and cycle guards preserve valid downstream and unlinked selections, while measured throw verdicts remain in place (#1463, #2186)
+
+
+## [0.15.157] - 2026-09-02
+
+### Fixed
+- panel_set_widget on rgthree Fast Bypasser/Muter rows now applies the requested mode idempotently through the forced-value path, authenticates row-to-node closures, and journals all reachable mode changes for fail-closed rollback (#2151)
+
+
+## [0.15.156] - 2026-09-02
+
+### Fixed
+- panel_add_node reuses the freshly fetched node definition when repairing stale registered schemas, so a stale-bundle refusal on a second whole-schema refresh cannot block LoadImage (#2124, #2181)
+
+
+## [0.15.155] - 2026-09-02
+
+### Fixed
+- panel_search_nodes keeps serialized browser transport failures classified and diagnosable when ComfyUI-Manager mappings returns no HTTP response (#2024)
+
+
+## [0.15.154] - 2026-09-02
+
+### Fixed
+- allow workflow template reads
+- prioritize live error scans in get_errors
+
+
+## [0.15.153] - 2026-09-02
+
+### Fixed
+- make restore callback preflight directional
+- prevent ImpactSwitch restore callback crash
+
+
+## [0.15.152] - 2026-09-02
+
+### Fixed
+- retain current promoted DOM rails (#1707)
+
+
+## [0.15.151] - 2026-09-02
+
+### Fixed
+- The panel stops flooding ComfyUI's log ring buffer with bridge advertisements. The orchestrator re-POSTs `/comfyui_mcp_panel/advertise_bridge` on a deliberate 5 s heartbeat and again on every panel hello (it self-heals an advertise lost across a pod-side ComfyUI restart, which otherwise leaves a stale token no browser refresh can recover from), and the pack logged `secure bridge advertised` / `local bridge advertised` for every accepted POST. That is ~1440 lines an hour into the size-capped deque ComfyUI serves from `GET /internal/logs`: a reporter diagnosing a `LoadImageOutput` node fetched 25,006 characters that were 100% panel heartbeat, with every startup, model-load and traceback line already evicted, on a remote Colab instance with no filesystem fallback. The advertisement is now announced on a CHANGE only - first establish, a new tunnel, or a reconnect that moves the loopback port - which also collapses the seven-deep bursts a fresh connection emitted within ~10 ms. The heartbeat itself is untouched; it is load-bearing and belongs to the orchestrator. Separately, EVERY panel log line now costs one ring entry instead of two: ComfyUI's `LogInterceptor` appends one timestamped entry per `sys.stdout.write()` call, and `print()` writes the text and the newline separately - so each line was stored unterminated, with the following entry's timestamp visibly concatenated onto it (`...trycloudflare.com/2026-09-01T19:07:18.981112 - `), followed by a second, empty entry. `print(..., end="")` does not fix that (it still writes the empty terminator as a second call); the line is now emitted in a single write (#2162)
+- panel_run(to_node_id) stops refusing every scoped run on a workflow containing a random-mode DaSiWa_SeedControl. That node rolls its seed by wrapping `app.graphToPrompt` itself, and the panel's pre-dispatch graph stamp builds its fingerprint BY calling `app.graphToPrompt` — so the stamp rolled one seed and the dispatch rolled a different one, and the two serializations disagreed on `seed_value` and `seed_control_state` every time, on a completely idle canvas. The panel refused with `the workflow graph CHANGED after the run was queued. The differing entries: 2739 seed_control_state; 2739 seed_value` and queued nothing; because the roll fires once per serialization, neither the panel's own restamp nor the orchestrator's re-issues could ever converge, so all three dispatches lost and run-to-node was unusable on those graphs. The queue-time volatile-input walk now recognizes this pack as a seventh volatility signal, alongside rgthree (#1124), cg-use-everywhere (#1273), VHS (#2099) and Ideogram (#2130). The gates mirror the pack's own source one for one: the exact node class, both backing widgets present, no external `seed` link, and a mode that is not the literal `"fixed"` — an absent, empty or unparseable state widget is RANDOM and does roll, which is the freshly-dropped node. Drift coverage is otherwise unchanged: a fixed-mode or externally-driven SeedControl keeps both inputs hashed, and any other edit in the same window (including on the same node) is still detected and still named (comfyui-mcp#2712)
+- panel_reload({scope:"frontend"}) now acknowledges a successful soft reload before cache-busted navigation, with a final fail-closed workflow fence so stale-bundle recovery does not time out on the socket it is replacing (#584)
+- panel_set_widget on an rgthree `Fast Bypasser (rgthree)` / `Fast Muter (rgthree)` row no longer INVERTS the linked node it was asked to set. These are not the group rows #2146 covers: they are plain toggles, one per node wired into the changer's inputs, named `Enable <linked node title>` — which is how the reported row "Enable LC Film Stock (B&W)" is addressed on a Fast Bypasser retitled "LC Bypasser". The pack gives each row `widget.callback = () => widget.doModeChange()`, with NO arguments, and `doModeChange` derives its new value from the LINKED NODE'S CURRENT MODE when none is passed — so the row's callback is a toggle, not a setter, and the ordinary assign-then-fire-the-callback path ignored the value that had just been written. Whenever the requested value already agreed with the row, the write flipped the graph the other way: asking to disable an effect that was already bypassed set that node back to ALWAYS, and the read-back then failed and rolled the ROW value back while nothing rolled the node's MODE back — so the caller was told the write failed while the effect they asked to disable was live, and the next queued render ran it. Asking to enable an already-enabled row bypassed it, the same way. The write now drives the pack's own forced-value entry point, `doModeChange(value)` — the one `forceWidgetOn`/`forceWidgetOff` use — so setting a row to the value it already holds is an idempotent no-op that also repairs a linked node whose mode had drifted (bypassing a node on canvas moves its mode while the row keeps its old value, because the pack re-syncs a row only when its NAME changes). The modes the action can reach are journalled first — the nodes on the changer's inputs, through Reroute/Node Combiner/Node Collector, into subgraphs, and onward through a Mute / Bypass Repeater's propagation — so a write that fails verification restores every mode it moved instead of leaving the graph half-switched; a boundary that cannot be established refuses BEFORE the action runs rather than mutating modes this writer could not put back. The row's own value is no longer assigned by the writer at all, which is what makes the read-back evidence that the action ran: `doModeChange` sets it itself, on the line after it changes the mode. A `toggleRestriction` of "max one"/"always one" is left to the node to enforce exactly as a click would, and a row it refuses to switch off is reported as a failed write rather than claimed as applied. Every other widget on those nodes, and the Fast Groups Bypasser/Muter rows, are unchanged (#2151)
+
+- retain VHS dimensions across format updates (#2167)
+- refuse empty graph reads with missing-node state (#2166)
+- treat DaSiWa_SeedControl's queue-time seed roll as volatility, not graph drift (#2163)
+- classify and MEASURE a failed workflow switch instead of asserting it (#2159)
+
+### Changed
+- pin the #2148 repair on a promoted MULTILINE rail (#2160)
+- a missing completion receipt is not only an old orchestrator (#2156)
+
+
+## [0.15.150] - 2026-09-01
+
+### Fixed
+- panel_run now rechecks reconnect, bridge-route, workflow, and run-to-node identity after preflight and across queue dispatch, refusing before an unstable dispatch and returning `queued_unknown` with the concrete prompt receipt when a handoff crosses an accepted run (#166)
+- panel_run(to_node_id) stops refusing every scoped run on a workflow that instantiates one subgraph definition more than once. ComfyUI subgraph instances share a single definition object, and the queue-time volatile-input walk that keeps a scoped run's graph stamp stable deduped by graph OBJECT — so a definition used twice was walked once, and every exclusion landed on the FIRST instance's exec-id prefix only. On a MiniMax H3 graph whose second pass is a second instance of the first pass's subgraph, the #1331 leftover link-driven `model` widget was excluded at `100:29` and still hashed at `135:29`, so the panel reported `the workflow graph CHANGED after the run was queued. The differing entry: 135:29 model` on an idle canvas, for the first dispatch and the post-settle retry alike, and queued nothing. The walk now runs once per INSTANCE, carrying that instance's prefix, guarded against a cycle on its own ancestor path rather than by graph identity — no depth cap, because a cap that tripped would drop the deepest subgraph's exclusions and reintroduce this same permanent refusal one level further down. Drift coverage is unchanged per input: an edit inside the second instance is still detected, and still named at the instance that changed (comfyui-mcp#2699)
 - panel_add_node no longer refuses with "the active workflow or graph view changed" on a frontend that exposes no active workflow: absent-at-both-ends is unchanged, not a tab switch, so the mutation runs on the same canvas the reads already succeeded on (#2125)
 - A SaveAudio render is reported instead of dropped: ComfyUI's `audio` output bag is collected, so an audio player is painted in chat and the run's completion frame names the files rather than telling the agent the run "produced no image or video output" and that no output node produced a file. Audio is named, never attached — the agent still cannot hear it (#2126)
 - A run whose result is a 3D model no longer reports the opposite: ComfyUI's two 3D output shapes are collected (`SaveGLB`'s `3d` descriptors, and the bare path string `Save3DAdvanced` / `SaveGaussianSplat` / `SavePointCloud` / `Preview3D` put in `result`), so a workflow ending in `Save3DAdvanced` names the `.glb` it wrote instead of saying "no saved output node ran ... Add a SaveImage node". The completion note no longer infers that claim from the image set alone, so a preview-tapped audio run stops making it too; a genuinely preview-only run still gets the original advice. 3D is named, never attached (#2128)
+- panel_save_workflow no longer reports `saved:true` over a file that is missing what the canvas has: the stale-snapshot save guard used to require one of ComfyUI's suppression flags to still be set at write time, so a capture swallowed a moment earlier — or by one of the two early returns the flag model cannot see (`!app.graph`, and the `isActiveTracker` check that also makes `prepareForSave()` a silent no-op) — let the write through. It now also accepts ComfyUI's own `ChangeTracker.graphEqual`, the comparator the capture itself uses, still reporting a difference after the refresh was requested. Presentation-only drift (a dragged node) and frontends without that comparator save exactly as before (#2133)
+- panel_restart_comfyui no longer refuses with "this is a ComfyUI Desktop instance, and no Desktop relaunch path ... is available" on an instance that is not Desktop: the #1999 guard proved Desktop with `isEmbeddedDesktopShell`, whose `Electron/` User-Agent arm answers a question about the browser, so an ordinary ComfyUI viewed through any Electron-embedded browser was refused a Manager reboot that would have worked. Desktop is now proven by the injected `electronAPI` bridge — the same evidence ComfyUI's own frontend uses, which never sniffs the User-Agent. The bridge is also read from every candidate global instead of the first non-nullish one, so a bridge carrying no restore function can no longer mask a later one that has `restartCore` / `restartApp` / `relaunchApp`. A real Desktop shell with no relaunch path still refuses before the stop, unchanged (#2134)
+- A prompt build no longer silently resets a nested DynamicCombo value, and a dynamic-widget serializer throw now names a node. The reconcile that runs before every `graphToPrompt` restored a dynamic root's dotted children from one lookup table built before the restore began, but restoring the shallowest child drives the frontend's native rebuild, which REPLACES every widget below it — so each deeper value was written to a widget the node was no longer carrying. SaveVideo's `format.codec.encoding.crf` was reset to the schema default by an ordinary run, and for a dynamic child the write drove a detached accessor, whose rebuild deletes the group's rows and their widget-store entries before it checks that it is still attached. That is also what separated the two recoveries in the report: a same-value `panel_set_widget` runs this restore and did not recover the node, a real `mp4 → mkv → mp4` round trip skips it and did. Each name is now re-resolved against the live widget list immediately before it is written. Separately, `Dynamic widget doesn't exist on node` used to reach the caller as a bare string whenever there was no orphan and no typed PrimitiveNode to name — `panel_get_errors` is clean for this failure, so there was nothing to bisect from. It now names any DynamicCombo root whose selected option declares a child row the node is not carrying (or a duplicated dotted row), and falls back to listing the graph's dynamic-combo nodes as candidates rather than naming nothing (#2140)
+- panel_set_widget can now address one of several widgets that share a name, and says which one it wrote. An rgthree Fast Groups Bypasser/Muter names every group-toggle row `RGTHREE_TOGGLE_AND_NAV`; `panel_query_graph`'s `duplicate_widgets` has reported each row with a stable index and its own label since #1402, but the write resolved by name alone and always took the FIRST — so the second group's toggle had no address at all, and on a Bypasser that row's action is what changes the modes of its group's nodes. Two addresses now reach a specific row, both carried by the existing `widget` string: `RGTHREE_TOGGLE_AND_NAV[1]` (composing with sub-fields as `[1].toggled`), and the display label when exactly one widget on the node carries it. The number in brackets is the widget's position in the node — the same `index` `duplicate_widgets` publishes — so a reported index pastes straight back as an address. An out-of-range index and an ambiguous label are refused by name rather than falling back to the first row, and every successful write to a duplicated name now reports `widget_occurrence: {index, of, label}`, whose index is the row’s position AFTER the write so it can be sent straight back as an address (flagged `stale` when the write’s own callback removed the row) — including the receipt a write that lands after the caller's timeout comes back with. Exact spelling still wins, so a widget genuinely named `foo[1]` is unaffected, and a duplicated widget whose own name contains dots (`foo.bar[1]`) is addressable too. A row that MOVED between the address being resolved and the write is refused rather than written over: the row object is pinned by identity, which catches a reorder even when the rows carry identical labels or none, and the label decides only when a rebuild has replaced the objects — if the label cannot say which row is which, the write is refused rather than landing on a coin flip. A promoted subgraph write refuses rather than dropping the index, and the deferred (`defer_until_idle`) path refuses an occurrence- or label-addressed write because its replay re-resolves by name (#2143, #1465, #524)
+- panel_set_widget can set a promoted subgraph STRING widget again. On the reported frontends the parent rail for a promoted prompt writes this wrapper's own promoted-value store — the entry queue compilation reads — and then ALSO assigns the shared subgraph definition's inner widget, which an on-canvas edit of the same control never does. The #1707 fence saw the definition move and rolled the whole write back rather than report an instance-scoped write that was not one, so a promoted `CLIPTextEncode.text` could not be written at all: not from the wrapper, and not by entering the subgraph, since that path resolves to the same rail. The collateral assignment is now UNDONE instead of the write being refused, and the result is only reported once both halves have been observed — the shared definition structurally back on its captured value, AND the rail and every parent-facing display proxy still holding the requested one. A rail that is genuinely one store with the definition fails that check (restoring the inner widget drags the rail back with it) and is refused exactly as before; so is an inner widget that will not take the restore, and a rail whose own store did not take the value but whose textarea shows it — the repair is judged on the per-widgetId store queue compilation reads, never on a DOM editor, so it can never erase the definition on evidence that the write landed nowhere durable. The refusal now names WHICH check blocked the repair, because the three have different remedies: a rail that came back with the definition is one store (unpack or edit the definition), an inner widget that will not take its own value back is an unrestorable definition, and a stale parent-facing display proxy is a PROJECTION a reopen rebuilds — not a shared store. A repair that cannot be verified leaves precisely the state the write left, so the refusal still describes the write rather than the repair. A successful repair reports `shared_definition_write_through: true` next to `value_scope: "instance"`, so a caller is told the definition was touched and put back rather than having to infer it. Every rail that does not write through replies exactly as it did before (comfyui-mcp#2689)
+- A refused promoted-widget write no longer leaves the SHARED subgraph definition holding the wrong value: on a frontend whose promoted rail writes through to the inner widget, the rollback restores the shared inner widget LAST, so the rail restore can no longer forward its own captured value back onto the definition every sibling instance reads. It was visible only when the rail and the definition had diverged, and was reported as "Rollback of inner ... did not take effect ... the graph may be in a partial state" (#2132)
+- panel_free_vram no longer reports `freed:true` with `branch: verified_system_stats` over occupancy it re-read and watched NOT move. ComfyUI's `POST /free` sets the `unload_models` / `free_memory` flags on its prompt queue and returns 200 immediately; the unload itself runs afterwards on the prompt-worker thread, which does not read those flags until the prompt it is currently executing finishes. The panel read `/system_stats` on the next line after that 200, so it raced the worker and photographed the pre-free numbers — the report's `before_mb 9426 → after_mb 9426, freed_mb 0` on a card a health call found at 10.7/12.0 GB free moments later. The reply now settles before it claims: occupancy is re-sampled every 250 ms for up to 5 s, the verified branch is reached only once it actually drops, and `waited_ms` / `samples` say what was watched. When the budget expires with occupancy unchanged the reply is `freed:false, outcome:"pending", branch:"unload_not_observed"` and explains why — a /free issued during a render is queued behind that render — explicitly separating it from the still-pinned device that would justify panel_restart_comfyui, and noting that /free is idempotent so re-issuing is safe. An occupancy read that MISSES still degrades to a receipt rather than failing a free that landed; a missed before-read is now `after_only_occupancy` rather than being labelled verified. The panel's own chat row stops saying "Unloaded models — freed VRAM" for a pending unload. Because those numbers now decide `freed`, they are compared per DEVICE rather than as a cross-device total: occupancy is matched by ComfyUI's `type:index` device identity (falling back to `name`) and summed only over the devices present, uniquely, in both readings, so a device that stops answering between the two reads can no longer shrink a total and look like an unload — with `cuda:0` at 8000 MB and `cuda:1` at 2000 MB before, and only `cuda:0` answering after, the reply is pending with `freed_mb: 0` instead of claiming 2000 MB freed. It takes one flaky row, not a removed GPU, since a device whose counters are unreadable is dropped from the reading — and a counter is now only read when it is actually numeric, so `vram_free: null` is an unreadable device rather than a fully occupied card. A `freed:false` reply also stops the orchestrator re-reading occupancy for its own pinned-device diagnosis (#1866/#1887 only runs when the panel claimed `freed:true`), so the panel now makes that call itself on the server its tab fronts: `/system_stats` carries `torch_vram_total` / `torch_vram_free` per device — THIS instance's allocator, unlike the device-global counters — so an unchanged reading whose torch pool is at least 1 GiB and at most 20% free is reported as `branch: torch_pool_pinned` naming those devices and pointing at panel_restart_comfyui, rather than as a pending unload to wait out. An empty or unknown torch pool stays pending, and the verified branch is untouched because the orchestrator's check still runs there. That pin reading is taken only on device types that actually report a torch allocator pool (`cuda`/`xpu`/`npu`/`mlu`): on `cpu` and `mps` ComfyUI fills `torch_vram_total` / `torch_vram_free` from `psutil.virtual_memory()`, so a CPU-only or Apple-Silicon install on a machine merely low on RAM would otherwise have been told to restart ComfyUI over another process's memory (#2144)
+
+- repair a promoted rail's write-through instead of refusing the write (#2148)
+- address a duplicated widget name by occurrence or label, and say which row was written (#2145)
+
 
 ## [0.15.149] - 2026-08-30
 

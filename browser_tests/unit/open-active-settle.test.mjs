@@ -24,11 +24,17 @@ import {
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "../../web/js/lib/live-canvas-capture-gate.js";
 import {
+  graphCommandBindingBar,
   graphRootMatchesState,
   graphRootStructureExtendsActiveWorkflow,
   graphRootWorkflowUuidMatches,
   graphRootWorkflowUuidMismatches,
+  resolveGraphBindingVerdict,
 } from "../../web/js/lib/graph-binding.js";
+import {
+  classifyOpenSwitchFailure,
+  openSwitchFailureMessage,
+} from "../../web/js/lib/open-switch-failure.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -151,6 +157,12 @@ function productionExecutor(methodName, environment) {
     POINTER_WATCH_UNAVAILABLE_NOTICE,
     workflowOpenReadinessRefusalError,
     readWorkflowOpenReadinessRefusal,
+    // #2158 — the shipped switch-failure classifier. A `new Function` scope has no module
+    // bindings, so an import the executor body now references is an undefined identifier
+    // here; without these the native-failure path throws a TypeError out of its own catch
+    // and the open walks on down the success path.
+    classifyOpenSwitchFailure,
+    openSwitchFailureMessage,
     graphRootMatchesState,
     graphRootWorkflowUuidMatches,
     graphRootWorkflowUuidMismatches,
@@ -632,6 +644,10 @@ test("#887 production workflow_open native failure retires proof before its nega
       },
     },
     activeWorkflowRef: () => previous,
+    // #2158 — the executor now MEASURES the pointer in its native-failure catch, so this
+    // scenario needs a real comparator. Without one the measurement degrades to
+    // "not observable" and the clean negative this test exists to pin is unreachable.
+    sameWorkflowObject,
     workflowTabId: (workflow) => `wf:${workflow.path}`,
     workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
     noteOpenAttempt: (entry) => {
@@ -651,14 +667,236 @@ test("#887 production workflow_open native failure retires proof before its nega
     MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
   });
 
-  await assert.rejects(panel.method({ path: target.path, rid: "native-failure" }), nativeError);
+  // #2158 — the rejection now CARRIES the original rather than BEING it. The raw browser
+  // string was what the report could not act on, so the thrown error is the classified
+  // one and the cause chain keeps the original for anyone who wants it verbatim.
+  const failure = await panel.method({ path: target.path, rid: "native-failure" }).then(
+    () => assert.fail("a native switch failure must reject"),
+    (err) => err,
+  );
+  assert.equal(failure.cause, nativeError, "the original error is preserved as the cause");
+  assert.match(failure.message, /native switch rejected after partial work/, "and quoted verbatim");
   assert.deepEqual(panel.proofs(), {
     active: 3,
     post: 3,
   });
   assert.equal(panel.guard(), null, "native failure must release the production reload guard");
+  // The pointer never left `previous` in this scenario, and the executor MEASURED that,
+  // so the clean negative this test exists to pin still holds — it is now earned rather
+  // than asserted.
   assert.equal(journal.at(-1)?.applied, false, "the native failure remains a clean negative reply");
   assert.match(journal.at(-1)?.error ?? "", /native switch rejected/);
+  // #2158 — and the receipt now names WHICH workflow it is about. The orchestrator's
+  // correlator rejects a receipt whose resolved path does not match the request before it
+  // reads `applied` at all, so a null here made the verdict above unreachable.
+  assert.equal(journal.at(-1)?.resolved?.path, target.path);
+  assert.equal(journal.at(-1)?.resolved?.routing_key, `wf:${target.path}`);
+});
+
+test("#2158 production workflow_open MEASURES a transport failure instead of asserting a negative", async () => {
+  // The reported failure, executed: switching between two saved workflows when the
+  // frontend's `/userdata` read throws the browser's transport error.
+  const previous = { path: "workflows/VR180 Restoration - 1s Trim Proof.json" };
+  const target = {
+    path: "workflows/VR180 SeedVR2 Benchmark Runner.json",
+    filename: "VR180 SeedVR2 Benchmark Runner.json",
+    isModified: false,
+  };
+  // Firefox's wording, which is what the reporter saw.
+  const nativeError = new Error("NetworkError when attempting to fetch resource.");
+  const journal = [];
+  // The store pushes the path into its open-tab list BEFORE the read that throws, so the
+  // tab really is listed afterwards. That is the residue the old message denied.
+  const openWorkflows = [];
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      canvas: {},
+      extensionManager: {
+        workflow: {
+          openWorkflows,
+          workflows: [target],
+          getWorkflowByPath: () => target,
+          openWorkflow: async () => {
+            openWorkflows.push(target); // the store's pre-read mutation
+            throw nativeError; // ...and then the fetch fails
+          },
+        },
+      },
+    },
+    activeWorkflowRef: () => previous, // the pointer never moves
+    sameWorkflowObject,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Proof",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => ({ token: 1 }),
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+  });
+
+  const failure = await panel.method({ path: target.path, rid: "transport-failure" }).then(
+    () => assert.fail("a transport failure must reject"),
+    (err) => err,
+  );
+
+  // 1. The symptom: the bare browser string now arrives classified and routed.
+  assert.match(failure.message, /NetworkError when attempting to fetch resource/, "verbatim");
+  assert.match(failure.message, /TRANSPORT failure/);
+  assert.match(failure.message, /GET \/userdata/);
+  assert.match(failure.message, /no HTTP status or response body to report/);
+  assert.match(failure.message, /VR180 SeedVR2 Benchmark Runner\.json/);
+
+  // 2. The measurement, which is the part that used to be an assertion.
+  assert.match(failure.message, /MEASURED, NOT ASSUMED/);
+  assert.match(failure.message, /the switch did not happen/);
+  assert.match(failure.message, /VR180 Restoration - 1s Trim Proof\.json/, "names the workflow still active");
+  assert.match(failure.message, /re-issuing panel_open_workflow is safe/);
+
+  // 3. The residue the old "nothing was applied" denied — OBSERVED here, because the
+  //    fake store performs the same pre-read push the real one does.
+  assert.ok(openWorkflows.includes(target), "the store really did list the tab before throwing");
+  assert.match(failure.message, /now listed among the open workflow tabs/);
+
+  // 4. The receipt keeps the accurate clean negative, so the orchestrator still tells the
+  //    caller it is safe to retry — earned from the pointer read, not hardcoded.
+  assert.equal(journal.at(-1)?.applied, false);
+  assert.equal(journal.at(-1)?.resolved?.path, target.path);
+});
+
+test("#2158 production workflow_open still REJECTS when its own diagnosis throws", async () => {
+  // The hazard the extraction harness surfaced. Diagnosis runs inside a catch block, and
+  // a throw raised there lands in this executor's OUTER handler — which reads it as a
+  // disk-read warning, leaves `openFailed` null, and lets the open continue down its
+  // SUCCESS path. A workflow switch that threw would be reported as one that worked.
+  const previous = { path: "workflows/previous.json" };
+  const target = { path: "workflows/target.json", filename: "target.json", isModified: false };
+  const nativeError = new Error("NetworkError when attempting to fetch resource.");
+  const journal = [];
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      canvas: {},
+      extensionManager: {
+        workflow: {
+          openWorkflows: [target],
+          workflows: [],
+          getWorkflowByPath: () => target,
+          openWorkflow: async () => {
+            throw nativeError;
+          },
+        },
+      },
+    },
+    activeWorkflowRef: () => previous,
+    sameWorkflowObject,
+    // The diagnosis itself is broken. Whatever else happens, the FAILURE must survive.
+    openSwitchFailureMessage: () => {
+      throw new TypeError("openSwitchFailureMessage is not a function");
+    },
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Previous",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => ({ token: 1 }),
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+  });
+
+  const failure = await panel.method({ path: target.path, rid: "diagnosis-throws" }).then(
+    (ok) => assert.fail(`a failed switch must never resolve as success: ${JSON.stringify(ok)}`),
+    (err) => err,
+  );
+  // The raw failure is kept rather than lost — degraded, but never silently successful.
+  assert.equal(failure, nativeError);
+  assert.match(journal.at(-1)?.error ?? "", /NetworkError/);
+  assert.equal(panel.guard(), null, "and the reload guard is still released");
+});
+
+test("#2158 production workflow_open refuses the clean negative when the pointer DID move", async () => {
+  // The hazard the hardcoded `false` was hiding. `openWorkflow` assigns
+  // `activeWorkflow.value` and only THEN writes `comfyApp.canvas.bg_tint`, so a throw
+  // after the pointer moved is reachable — and "confirmed not applied, safe to retry" is
+  // then a claim about a canvas that has already become the target's.
+  const previous = { path: "workflows/previous.json" };
+  const target = { path: "workflows/target.json", filename: "target.json", isModified: false };
+  const nativeError = new Error("Cannot set properties of null (setting 'bg_tint')");
+  const journal = [];
+  let active = previous;
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      canvas: {},
+      extensionManager: {
+        workflow: {
+          openWorkflows: [target],
+          workflows: [],
+          getWorkflowByPath: () => target,
+          openWorkflow: async () => {
+            active = target; // the pointer moved...
+            throw nativeError; // ...and the very next line threw
+          },
+        },
+      },
+    },
+    activeWorkflowRef: () => active,
+    sameWorkflowObject,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Previous",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => ({ token: 1 }),
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+  });
+
+  const failure = await panel.method({ path: target.path, rid: "moved-pointer" }).then(
+    () => assert.fail("the failure must still reject"),
+    (err) => err,
+  );
+
+  // The verdict degrades, so the orchestrator says "inspect before retrying" instead of
+  // "confirmed not applied".
+  assert.equal(journal.at(-1)?.applied, "unknown", "a moved pointer is never a clean negative");
+  assert.match(failure.message, /the active workflow IS now "workflows\/target\.json"/);
+  assert.match(failure.message, /Re-read the graph/);
+  assert.doesNotMatch(failure.message, /the switch did not happen/);
 });
 
 test("#1898 production workflow_open accepts a settled readable outline after normalization races", async () => {
@@ -1548,6 +1786,141 @@ test("#1215 production workflow_open refuses when the load leaves the previous t
   );
   assert.equal(root._nodes[0].widgets_values[0], "previous-value", "the leftover canvas is still SOURCE");
   assert.equal(panel.guard(), null, "the refused open still releases its reload guard");
+});
+
+test("#1215 production workflow_open that cannot repaint does not let outline/query serve the previous canvas", async () => {
+  const sourceUuid = "krea-118-0000-4000-8000-00000000000a";
+  const targetUuid = "remove-bg-0000-4000-8000-00000000000b";
+  const previousNodes = Array.from({ length: 118 }, (_, i) => ({ id: i + 1, type: "KSampler" }));
+  const root = {
+    _nodes: previousNodes.map((node) => ({ ...node })),
+    extra: {},
+  };
+  const previous = {
+    path: "workflows/image_krea.json",
+    changeTracker: { activeState: { nodes: previousNodes, links: [], groups: [] } },
+  };
+  const target = {
+    path: "workflows/remove_bg_workflow.json",
+    filename: "remove_bg_workflow.json",
+    isModified: false,
+  };
+  let active = previous;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async () => {
+      throw new Error("a target with no complete state must not reach loadGraphData");
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [previous, target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "remove_bg_workflow",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    decideLiveCanvasCapture: decideLiveCanvasCapture,
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => false,
+    graphRootReproducesStateContent: () => ({ proven: false, presentationOnly: false, normalizedOnly: false }),
+    graphRootStructureExtendsActiveWorkflow,
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: () => ({ status: "unproven" }),
+    describeOpenRebindOutcome: () => "could not prove rebound",
+    OPEN_REBIND_STATUS: { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" },
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 118 }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => targetUuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  await assert.rejects(
+    panel.method({ path: "remove_bg_workflow.json", rid: "safe-repaint-previous-canvas" }),
+    /safe repaint/,
+    "the open must refuse rather than paint TARGET's fence over SOURCE's canvas",
+  );
+  assert.equal(active, target, "the pointer has already moved, as in the recurrence");
+  assert.equal(root._nodes.length, 118, "the live canvas is still the previous graph");
+  assert.equal(panel.guard(), null);
+
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: root,
+      rootGraph: root,
+      activeWorkflow: target,
+      activeWorkflowUuid: targetUuid,
+      liveNodeCount: root._nodes.length,
+      others: [previous],
+      switchRepaintUnproven: true,
+      ...graphCommandBindingBar(cmd),
+      includeBaselineReadGuard: true,
+    });
+    assert.equal(
+      verdict?.reason,
+      "root-state-unreadable",
+      `${cmd} must refuse after set_workflow_target current — the fence names TARGET, the canvas is still SOURCE`,
+    );
+  }
 });
 
 test("#1639 production workflow_open remembers a switch-away-and-back during an awaited open step", async () => {

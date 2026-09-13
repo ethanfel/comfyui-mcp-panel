@@ -50,6 +50,44 @@ import {
 // enrich the note; a stall cannot beat the grace.
 export const STILLS_METADATA_TIMEOUT_MS = 1000;
 
+// #2234 — overlapping compose() calls for the SAME video record (a 20 s sweep
+// that re-enters while the first sample is still encoding) must share one
+// pipeline, not mint a second identity. WeakMap so a finished record does not
+// keep the promise alive; the durable reuse lives on the record itself.
+const inFlightStoryboards = new WeakMap();
+
+function reusedStoryboardSegment(v) {
+  if (!v || typeof v !== "object") return null;
+  const ref = v.storyboardRef;
+  const note = v.storyboardNote;
+  if (!ref || typeof note !== "string" || !note) return null;
+  const segment = { ref, note };
+  if (typeof v.storyboardNoteWhenBlind === "string" && v.storyboardNoteWhenBlind) {
+    segment.noteWhenBlind = v.storyboardNoteWhenBlind;
+  }
+  return segment;
+}
+
+function ensureStoryboardIdentity(v) {
+  if (!v || typeof v !== "object") return createStoryboardIdentity();
+  if (typeof v.storyboardIdentity !== "string" || !v.storyboardIdentity) {
+    v.storyboardIdentity = createStoryboardIdentity();
+  }
+  return v.storyboardIdentity;
+}
+
+function persistStoryboardSegment(v, storyboardIdentity, segment) {
+  if (!v || typeof v !== "object") return;
+  if (typeof storyboardIdentity === "string" && storyboardIdentity) {
+    v.storyboardIdentity = storyboardIdentity;
+  }
+  if (segment?.ref) v.storyboardRef = segment.ref;
+  if (typeof segment?.note === "string" && segment.note) v.storyboardNote = segment.note;
+  if (typeof segment?.noteWhenBlind === "string" && segment.noteWhenBlind) {
+    v.storyboardNoteWhenBlind = segment.noteWhenBlind;
+  }
+}
+
 /**
  * Build and send the single consolidated completion frame for one finished
  * prompt. Resolves to the frame that was sent (for tests), or null when the
@@ -188,18 +226,29 @@ export async function composeRunCompletionFrame(
   // over the payload, so hoisting them costs nothing and awaits nothing.
   const audioRefs = (Array.isArray(audio) ? audio : []).filter((m) => m && m.filename);
   const model3dRefs = (Array.isArray(models3d) ? models3d : []).filter((m) => m && m.filename);
+  const videoRefs = (Array.isArray(videos) ? videos : []).filter((v) => {
+    const m = v && typeof v === "object" ? (v.m ?? v) : null;
+    return m && m.filename && m.type === "output";
+  });
   // #2128 — what `buildStillsSegment` is missing when it decides whether a saved
   // output node ran. It only ever sees IMAGES, so a run whose real output is a
-  // `.glb` (or a `.flac`) with `PreviewImage` taps upstream looked identical to a
-  // preview-only run: it told the agent "no saved output node ran … Add a SaveImage
-  // node" while a 16 MB mesh sat in `output/3D/`. All three claims were false, and
-  // the advice cannot work — a SaveImage node cannot persist a `FILE_3D_GLB`.
+  // `.glb` (or a `.flac`, or an MP4 under a custom key) with `PreviewImage` taps
+  // upstream looked identical to a preview-only run: it told the agent "no saved
+  // output node ran … Add a SaveImage node" while the file sat on disk. All three
+  // claims were false, and the advice cannot work — a SaveImage node cannot persist
+  // a `FILE_3D_GLB` or an MP4.
   //
   // Passed as KINDS rather than a bare boolean so the note can name what actually
-  // ran instead of gesturing at "something else".
+  // ran instead of gesturing at "something else". Videos belong here too: a
+  // VHS/NKD save with preview taps is the same false inference from the image set.
   const nonImageOutputKinds = [];
   if (model3dRefs.length) nonImageOutputKinds.push({ kind: "3D model", count: model3dRefs.length });
   if (audioRefs.length) nonImageOutputKinds.push({ kind: "audio", count: audioRefs.length });
+  if (videoRefs.length) nonImageOutputKinds.push({ kind: "video", count: videoRefs.length });
+  const withheldSaved = withheldSavedOutputCount(withheld);
+  if (withheldSaved > 0) {
+    nonImageOutputKinds.push({ kind: "saved file", count: withheldSaved });
+  }
 
   // ── Stills + video segments in PARALLEL ────────────────────────────────
   // #1610 — these used to be sequential: stills metadata (HEAD + Image decode,
@@ -513,6 +562,22 @@ function summariseNonImageOutputs(kinds) {
 }
 
 /**
+ * How many withheld descriptors are SAVED (`type:"output"`), not preview temps.
+ *
+ * CompareFrames dumps hundreds of `type:"temp"` PNGs; those must not suppress
+ * the genuine preview-only "Add a SaveImage node" advice. A custom save node
+ * that parked a real file under an unrecognised key (#2128 NKDVideoViewer)
+ * reports `type:"output"` and must.
+ */
+function withheldSavedOutputCount(withheld) {
+  if (!withheld || !(withheld.count > 0)) return 0;
+  if (withheld.outputCount > 0) return withheld.outputCount;
+  const types = Array.isArray(withheld.types) ? withheld.types : [];
+  if (types.includes("output") && !types.includes("temp")) return withheld.count;
+  return 0;
+}
+
+/**
  * Still-image portion: classify final-vs-preview, compose the note, and gather
  * per-final metadata. Returns { images, note, metadata } — never sends a frame.
  *
@@ -738,6 +803,16 @@ async function buildVideoSegment(v, deps) {
   if (!videoStoryboardEnabled) {
     return { ref: null, note: noteOnly("storyboard preview is turned off in panel settings") };
   }
+  // #2234 — a refused retry of THIS finished record must not sample or upload
+  // again. The artifact cannot change; a fresh identity would only mint another
+  // temp filename. A genuinely new completion is a different `v` (and usually a
+  // different prompt id), so #1718 / #1834 cache-busting is unchanged.
+  const reused = reusedStoryboardSegment(v);
+  if (reused) return reused;
+  if (v && typeof v === "object") {
+    const inFlight = inFlightStoryboards.get(v);
+    if (inFlight) return inFlight;
+  }
   // The storyboard pipeline (sample → upload → HEAD) contains at least one
   // UNBOUNDED step (uploadBlobToInput does a fetch with no timeout). Bound the
   // whole pipeline: on timeout, degrade to the note-only fallback so a stalled
@@ -764,7 +839,13 @@ async function buildVideoSegment(v, deps) {
       // Give the source fetch and every derived artifact one attempt identity so
       // neither the browser nor ComfyUI's filename-based temp ref can return the
       // previous run's pixels.
-      const storyboardIdentity = v?.storyboardIdentity || createStoryboardIdentity();
+      //
+      // #2234 — write that identity back onto THIS record immediately, before
+      // any await. A refused retry of the same finished run (or a sweep that
+      // overlaps this produce) must reuse it; minting here would fill temp/
+      // with unique storyboard_*.png names. A new completion still mints,
+      // because it is a different record.
+      const storyboardIdentity = ensureStoryboardIdentity(v);
       const sourceUrl =
         v?.videoUrl || appendStoryboardCacheBust(imageViewUrl(m), storyboardIdentity);
       // The video's own byte size is wanted only for the note's metadata line.
@@ -909,7 +990,7 @@ async function buildVideoSegment(v, deps) {
       // variant says so AFFIRMATIVELY (an explicit prohibition is reliable; a
       // merely-absent request is not) — the sheet is still painted for the user
       // above, so only the agent is blind.
-      const header = `📽️ ${sheetHead} of ${videoKind} — `;
+      const header = `📽 ${sheetHead} of ${videoKind} — `;
       const note =
         header +
         `frames run top-left→bottom-right = start→end. ` +
@@ -921,14 +1002,23 @@ async function buildVideoSegment(v, deps) {
         `Blind mode is ON, so the storyboard was NOT sent to you (it is shown to the user). ` +
         `Do not comment on motion, sharpness, or visual quality — acknowledge completion and the metadata below only.` +
         metaSuffix(sizeStr, frames);
-      return { ref, note, noteWhenBlind };
+      const segment = { ref, note, noteWhenBlind };
+      persistStoryboardSegment(v, storyboardIdentity, segment);
+      return segment;
     } catch (err) {
       warn("[cmcp] storyboard pipeline failed:", err);
       return { ref: null, note: noteOnly("its storyboard preview failed to build") };
     }
   };
+  const work = produce();
+  if (v && typeof v === "object") {
+    inFlightStoryboards.set(v, work);
+    void work.finally(() => {
+      if (inFlightStoryboards.get(v) === work) inFlightStoryboards.delete(v);
+    });
+  }
   return withTimeout(
-    produce(),
+    work,
     videoStoryboardTimeoutMs,
     () => {
       warn("[cmcp] storyboard: timed out for", m?.filename);
